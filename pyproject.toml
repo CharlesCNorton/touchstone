@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "touchstone-prover"
+version = "1.9.2"
+description = "An SMT-based verifier for Python with a machine-checked trust base."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "CharlesCNorton" }]
+keywords = ["verification", "smt", "z3", "cvc5", "formal-methods", "type-inference", "contracts"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = ["z3-solver==4.16.0", "cvc5==1.3.4"]
+
+[project.scripts]
+touchstone = "touchstone.cli:main"
+touchstone-lsp = "touchstone.lsp:main"
+touchstone-mcp = "touchstone.mcp:main"
+
+[project.entry-points.pytest11]
+touchstone = "touchstone.pytest_plugin"
+
+[project.urls]
+Repository = "https://github.com/CharlesCNorton/touchstone"
+
+[tool.setuptools]
+packages = ["touchstone", "touchstone._generated"]
+# `import touchstone_prover` aliases `touchstone`, so the install name (touchstone-prover) and the import
+# name converge; the canonical package stays `touchstone`.
+py-modules = ["touchstone_prover"]
+
+# The committed Rocq JSON extraction ships with the package so the stock-install audit can hold each
+# _generated/*.py equal to its proof image (committed_extraction_audit) with no Coq toolchain.
+[tool.setuptools.package-data]
+"touchstone._generated" = ["*.json"]
+
+# The companion proofs in proofs/ use a separate, non-Python toolchain pinned in
+# proofs/toolchain.lock (Rocq 9.0 for three files; Coq 8.20 + SMTCoq + cvc4 for the fourth).

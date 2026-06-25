@@ -1,0 +1,24 @@
+# Touchstone PR gate. Copy to .github/workflows/ in your repository. On every pull request it verifies
+# that each changed function preserves its properties (an @ensure contract if present, otherwise its
+# behavior), reporting a counterexample for any regression and failing the check, and uploads a
+# re-checkable proof bundle for the verified changes so the review carries its own evidence.
+name: touchstone gate
+on: pull_request
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                       # need the base branch to diff against
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install touchstone-prover
+      - name: Verify the diff preserves each function's properties
+        run: touchstone gate . --base "origin/${{ github.base_ref }}" --bundle proofs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: touchstone-proofs
+          path: proofs/

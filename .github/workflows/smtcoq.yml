@@ -1,0 +1,31 @@
+name: smtcoq
+# The SMTCoq certificate check (proofs/touchstone_smtcoq.v) re-validates each integer obligation's
+# proof certificate inside Coq's kernel. It needs Coq 8.20 + coq-smtcoq + veriT, which the Rocq 9.0
+# proofs job does not carry, so there it skips. This job provisions that toolchain in a Docker image
+# (proofs/Dockerfile.smtcoq) and runs the check for real -- so it runs in standard CI rather than being
+# skipped everywhere. The toolchain layers are cached, so a run that does not touch them is quick.
+on:
+  push:
+    branches:
+      - '**'        # branch pushes only; a release tag's commit is already validated via its branch push
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smtcoq:
+    name: SMTCoq certificate check (Coq 8.20)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build the SMTCoq toolchain image (Coq 8.20 + coq-smtcoq + veriT)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: proofs/Dockerfile.smtcoq
+          tags: touchstone-smtcoq:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: re-check the integer certificates in Coq's kernel
+        run: docker run --rm touchstone-smtcoq:ci
