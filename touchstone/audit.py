@@ -291,13 +291,10 @@ def differential_check(verdict, impl_src, spec_src, repo=None, samples=64, seed=
 
 def exhaustive_check(verdict, impl_src, spec_src, repo=None, bound=12, max_inputs=200000) -> int:
     """Cross-check a verify_equiv verdict against concrete runs over EVERY integer input in the bounded box
-    [-bound, bound] per parameter -- the whole box, not a random sample. A PROVED that agrees on every point
-    of the box is exhaustively confirmed there: a proof of the verdict over that box, the strongest guarantee
-    the differential method gives short of the symbolic proof, and stronger than the sampled differential_check.
-    A single disagreement raises SoundnessError; agreement is trap-aware (both trapping counts as agreement).
-    Returns the number of inputs checked, or 0 when the box would exceed max_inputs (too many parameters or
-    too wide a bound to enumerate). Runs the subject, so it is gated behind ALLOW_SUBJECT_EXECUTION at the
-    call site exactly like the sampled checks."""
+    [-bound, bound] per parameter -- the whole box, not a random sample. A PROVED that agrees on every point of
+    the box is a proof of the verdict over that box. A single disagreement raises SoundnessError; agreement is
+    trap-aware (both trapping counts as agreement). Returns the number of inputs checked, or 0 when the box would
+    exceed max_inputs. Runs the subject, so it is gated behind ALLOW_SUBJECT_EXECUTION like the sampled checks."""
     import itertools
     repo = repo or {}
     args = _argnames(impl_src)
@@ -2330,10 +2327,9 @@ def run_self_tests(fast=False):
     assert check("def f(o):\n    i = 0\n    while i < 3:\n        i = i + 1\n    return o.x\n").status == PROVED
     # SOUNDNESS: isinstance on a guessed-scalar parameter must not statically prune the non-matching branch. The
     # value engine answers isinstance on a z3 scalar from its sort, so isinstance(v, str) on a usage-inferred str
-    # (or isinstance(n, int) on the default int) reads as unconditionally true and would kill the else branch --
-    # but the type was guessed, not declared, and a trap waiting there (1 // 0 on a non-str / non-int input) must
-    # not be hidden, so the value engine abstains rather than proving total. A DECLARED type is a real
-    # precondition the pruning honours: the same body with `v: str` proves (the else is genuinely unreachable).
+    # reads as unconditionally true and would kill the else branch -- but the type was guessed, not declared, so
+    # a trap waiting there (1 // 0 on a non-str input) must not be hidden: the value engine abstains. A DECLARED
+    # type is a real precondition the pruning honours, so `v: str` proves (the else is genuinely unreachable).
     assert check("def f(v):\n    if isinstance(v, str):\n        return v.encode()\n    return 1 // 0\n").status == UNKNOWN
     assert check("def f(v):\n    if isinstance(v, str):\n        return v.encode()\n    return 1 // len(v)\n").status == UNKNOWN
     assert check("def f(n):\n    d = {}\n    d[0] = n\n    if isinstance(n, int):\n        return d[0]\n    return 1 // 0\n").status == UNKNOWN
@@ -2343,12 +2339,11 @@ def run_self_tests(fast=False):
     # container parameter keep their precise PROVED -- the abstention is scoped to the guessed-scalar name itself.
     assert check("def f(n):\n    x = n\n    d = {}\n    d[0] = x\n    if isinstance(x, int):\n        return d[0]\n    return 1 // 0\n").status == UNKNOWN
     assert check("def f(n):\n    x = n + 1\n    d = {}\n    d[0] = x\n    if isinstance(x, int):\n        return d[0]\n    return 1 // 0\n").status == PROVED
-    # SOUNDNESS: a value with no decidable truth -- an object field (`if o.x:`, whose runtime type may be a
-    # str/list/None, not the int it duck-types as in arithmetic), a dict-get / getattr / callable / hasattr /
-    # unmodeled-call result -- must NOT read as truthy (Python's default object truth), which would prune the
-    # else and hide its traps. It becomes a fresh bool (both branches live) and over-approximates the path, so a
-    # trap in the assumed-false branch abstains rather than false-proving. A z3 int / container / string keeps
-    # its exact truthiness, and the field stays numeric in arithmetic (`1 // o.x` still refutes).
+    # SOUNDNESS: a value with no decidable truth -- an object field (`if o.x:`), a dict-get / getattr / callable /
+    # hasattr / unmodeled-call result -- must NOT read as truthy (Python's default object truth), which would
+    # prune the else and hide its traps. It becomes a fresh bool (both branches live), so a trap in the
+    # assumed-false branch abstains. A z3 int / container / string keeps its exact truthiness, and the field
+    # stays numeric in arithmetic (`1 // o.x` still refutes).
     assert check("def f(o):\n    if o.x:\n        return 0\n    return 1 // 0\n").status == UNKNOWN
     assert check("def f(o):\n    if getattr(o, 'flag', False):\n        return 0\n    return 1 // 0\n").status == UNKNOWN
     assert check("def f(d):\n    if d.get(0):\n        return 0\n    return 1 // 0\n").status == UNKNOWN
@@ -2366,11 +2361,9 @@ def run_self_tests(fast=False):
     assert check("def f(xs):\n    s = 0\n    for x in xs:\n        s = s + x // 2\n    return s\n").status == PROVED       # // by a constant: trap free
     assert check("def f(xs):\n    s = 0\n    for x in xs:\n        s = s + x * x\n    return s\n").status == PROVED        # no division
     assert check("def f(xs):\n    s = 0\n    for x in xs:\n        if x != 0:\n            s = s + 10 // x\n    return s\n").status == PROVED   # guarded
-    # .pop() on a container parameter mutated exactly once is modeled against the same stable length / membership
-    # the c[i] / d[k] checks use: list.pop() / pop(i) is an IndexError on an empty list or an out-of-range index,
-    # dict.pop(k) a KeyError unless k is a provable key, and pop(k, default) never raises; a len() / `in` guard
-    # proves it. The single-mutation gate keeps it sound -- a container popped twice, or popped and otherwise
-    # mutated, is excluded (the stable length cannot capture the post-pop state), so it abstains, never a false PROVED.
+    # .pop() on a container parameter mutated exactly once, against the stable length/membership the c[i]/d[k]
+    # checks use: list.pop()/pop(i) is an IndexError on empty/out-of-range, dict.pop(k) a KeyError unless k is a
+    # provable key, pop(k, default) never raises; a len()/`in` guard proves it. Two mutations: excluded (abstains).
     assert check("def f(xs: list):\n    return xs.pop()\n").status == REFUTED                    # pop() on a possibly-empty list
     assert check("def f(xs: list):\n    if xs:\n        return xs.pop()\n    return 0\n").status == PROVED   # truthiness guard
     assert check("def f(xs: list):\n    return xs.pop(0)\n").status == REFUTED                    # pop(i) out of range on empty
@@ -2378,7 +2371,7 @@ def run_self_tests(fast=False):
     assert check("def f(d: dict, k):\n    if k in d:\n        return d.pop(k)\n    return 0\n").status == PROVED
     assert check("def f(d: dict):\n    return d.pop('k', 0)\n").status == PROVED                  # a default never raises
     assert check("def f(xs: list):\n    if len(xs) >= 1:\n        a = xs.pop()\n        b = xs.pop()\n"
-                 "        return a + b\n    return 0\n").status == UNKNOWN   # popped twice: abstains, not a false PROVED
+                 "        return a + b\n    return 0\n").status == UNKNOWN   # popped twice: abstains
     assert check("def f(xs: list):\n    x = xs.pop()\n    xs.append(x)\n    return x\n").status == UNKNOWN   # pop + append: excluded
     # list.index(x) / list.remove(x) raise ValueError when x is not present, against the sequence's stable
     # membership predicate, so an `x in xs` guard proves them; that guard now connects to the length too (a
@@ -2578,10 +2571,9 @@ def run_self_tests(fast=False):
     _facok = "def f(n):\n    if not isinstance(n, int):\n        raise ValueError('a')\n    if n <= 0:\n        return 1\n    return n * f(n - 1)\n"
     assert verify_recursive("facok", "f", _facok, lambda S: z3.BoolVal(True), lambda S, r: z3.BoolVal(True)).status == PROVED
 
-    # a recursive REFUTED carries a replayable witness recovered by bounded symbolic unrolling -- NO
-    # execution -- and the same unrolling upgrades a nonlinear recursive UNKNOWN the inductive (Spacer) engine
-    # cannot close to a witness-backed REFUTED. The witness genuinely violates the postcondition (replayed
-    # here), and a true recursive postcondition is still PROVED (the unrolling never invents a counterexample).
+    # a recursive REFUTED carries a replayable witness recovered by bounded symbolic unrolling (NO execution),
+    # and the same unrolling upgrades a nonlinear recursive UNKNOWN the inductive (Spacer) engine cannot close
+    # to a witness-backed REFUTED. The witness is replayed here; a true recursive postcondition still PROVES.
     _sb21, _ae21 = core.SANDBOX_SUBJECT, core.ALLOW_SUBJECT_EXECUTION
     core.SANDBOX_SUBJECT = False; core.ALLOW_SUBJECT_EXECUTION = False        # force the symbolic path, no sandbox
     try:
@@ -2598,9 +2590,8 @@ def run_self_tests(fast=False):
         core.SANDBOX_SUBJECT, core.ALLOW_SUBJECT_EXECUTION = _sb21, _ae21
 
     # a recursive callee the inliner cannot unfold is summarized at the call site by its @ensure contract, so a
-    # caller verifies modularly: it assumes require(args) -> ensure(args, result). The callee meets its own
-    # contract (checked separately). Sound -- a PROVED follows from the contract, the unpinned result withholds
-    # REFUTED -- and only PROVED for what the contract implies.
+    # caller verifies modularly: it assumes require(args) -> ensure(args, result), with the callee checked
+    # against its own contract separately. The unpinned result withholds REFUTED; only the contract is PROVED.
     _gc = "@ensure('result >= 0')\ndef g(n):\n    if n <= 0:\n        return 0\n    return g(n - 1) + 1\n"
     assert verify_contracts(_gc, target="g").status == PROVED                            # the callee meets its contract
     assert prove("def f(x):\n    return g(x) + 1\n", "result >= 1", repo={"g": _gc}).status == PROVED    # modular caller
@@ -3716,9 +3707,8 @@ def run_self_tests(fast=False):
     assert prove(_sum, "result >= 1", requires="all(x >= 0 for x in xs)", target="f").status == REFUTED  # empty list -> 0
     # object state mutated inside a loop is verifiable for a single non-aliased local object whose class has a
     # no-argument constant-attribute __init__: `o = C()` and every `o.attr` are rewritten to plain accumulator
-    # variables, so o.count over the loop relates to len(xs). The rewrite is sound because it declines any
-    # object that ESCAPES -- aliased, passed, returned, or with a method called on it -- so an escape stays
-    # UNKNOWN rather than becoming a false PROVED; an arg-taking __init__ is declined too.
+    # variables, so o.count over the loop relates to len(xs). An object that ESCAPES -- aliased, passed,
+    # returned, or with a method called on it -- is declined (UNKNOWN); an arg-taking __init__ too.
     _objc = "class C:\n    def __init__(self):\n        self.count = 0\ndef f(xs: list):\n    o = C()\n    for x in xs:\n        o.count = o.count + 1\n    return o.count\n"
     assert prove(_objc, "result == len(xs)", target="f").status == PROVED
     assert prove(_objc, "result == len(xs) + 1", target="f").status == REFUTED
@@ -3886,7 +3876,7 @@ def run_self_tests(fast=False):
     # for j in range(n)) -- written in `prove` itself is compiled into the quantified-spec engines' callback
     # (verify_map_comprehension for a map return, verify_array_loop_auto for an array-write loop), so a forall
     # the general CHC engine leaves UNKNOWN is decided. The body is translated by the engines' own _ev_arr /
-    # q_forall, so a false universal is never a spurious PROVED.
+    # q_forall.
     assert prove("def f(xs: list):\n    return [x * x for x in xs]\n",
                  "all(e >= 0 for e in result)", target="f").status == PROVED              # every squared element >= 0
     assert prove("def f(xs: list):\n    return [x * 2 for x in xs]\n",
@@ -4191,6 +4181,13 @@ def run_self_tests(fast=False):
     assert check("import math\ndef f(x: float):\n    if math.isfinite(x):\n        return math.sin(x)\n    return 0.0\n",
                  target="f").status == PROVED
     assert check("import math\ndef f(x: float):\n    return math.exp(x)\n", target="f").status == REFUTED      # overflow
+    # SOUNDNESS: verify_no_raise models a float parameter as z3.Int (x != x always false), so it abstains on one
+    # and check decides via the value engine over z3.FP: a NaN-only trap REFUTES, a total float function proves.
+    assert check("def f(x: float):\n    if x != x:\n        return 10 // 0\n    return 0\n", target="f").status == REFUTED
+    assert check("def f(x: float):\n    if x == x:\n        return 0\n    return 10 // 0\n", target="f").status == REFUTED
+    assert verify_no_raise("nrfp", "f", "def f(x: float):\n    if x != x:\n        return 10 // 0\n    return 0\n",
+                           lambda S: z3.BoolVal(True)).status == UNKNOWN      # the CHC engine abstains on a float param
+    assert check("def f(x: float):\n    return x + 1.0\n", target="f").status == PROVED            # a total float function still proves
     # the broader math module: floor / ceil / trunc (a non-finite argument is a domain error), the integer-domain
     # factorial / comb / perm / isqrt (negative), the float-domain log2 / log10 / log1p / asin / acos / acosh /
     # atanh / fmod (a domain ValueError), and the pure gcd / hypot / degrees / atan (never trap). The domain
@@ -4481,7 +4478,7 @@ def run_self_tests(fast=False):
     # trap freedom: the bitwise result is a fresh integer (over-approximated) that flows into later arithmetic
     # -- (a & b) + 1, (a ^ b) * 2. The nonnegative-operand bounds carry through (0 <= a & b, so 10 // ((a & b)
     # + 1) proves under a nonneg guard), while an unguarded 10 // (a & b) abstains (a & b can be 0; REFUTED
-    # withheld), never a false PROVED. The bare a & b is still trap free.
+    # withheld). The bare a & b is still trap free.
     assert check("def f(a: int, b: int):\n    return (a & b) + 1\n", target="f").status == PROVED
     assert check("def f(a: int, b: int):\n    return (a ^ b) * 2\n", target="f").status == PROVED
     assert check("def f(a: int, b: int):\n    return (a | b) - 1\n", target="f").status == PROVED
@@ -5213,9 +5210,8 @@ def run_self_tests(fast=False):
     assert check("def f(x: list[int]):\n    return x + 1\n", target="f").status != PROVED                    # container-as-scalar: still abstains
     # SOUNDNESS: a container-typed parameter (list / dict / set / tuple) used DIRECTLY as a scalar -- a + 1,
     # t * 2, -a, int(a) -- is a TypeError on the real value, so the integer CHC model and the value engine's
-    # opaque int() abstain (UNKNOWN) on that pattern, leaving no false PROVED; a container used AS a container
-    # (a[i], len(a),
-    # for x in a) and a scalar derived from it (len(a) + 1) are sound and still decide.
+    # opaque int() abstain (UNKNOWN); a container used AS a container (a[i], len(a), for x in a) and a scalar
+    # derived from it (len(a) + 1) are sound and still decide.
     assert check("def f(a: list):\n    return a + 1\n", target="f").status != PROVED
     assert check("def f(d: dict):\n    return d + 1\n", target="f").status != PROVED
     assert check("def f(s: set):\n    return s + 1\n", target="f").status != PROVED
@@ -5530,7 +5526,7 @@ def run_self_tests(fast=False):
     # invariant s == p(i) is INTERPOLATED through a few small concrete steps (finite differences, not a monomial
     # null-space whose exact-rational arithmetic over huge sampled values is the learner's wall), then verified
     # inductively and for the postcondition. So an arbitrary-degree power sum (i^4, i^5, i^6) is proved in bounded
-    # time, while a wrong closed form fails a check and is never a false PROVED.
+    # time, while a wrong closed form fails a check.
     _ps = lambda k: "def f(n):\n    s = 0\n    i = 0\n    while i < n:\n        i = i + 1\n        s = s + %s\n    return s\n" % ("*".join(["i"] * k))
     assert prove(_ps(4), "30*result == 6*n**5 + 15*n**4 + 10*n**3 - n", requires="n >= 0", target="f").status == PROVED   # sum i^4 (degree 5)
     assert prove(_ps(5), "12*result == 2*n**6 + 6*n**5 + 5*n**4 - n**2", requires="n >= 0", target="f").status == PROVED  # sum i^5 (degree 6)
@@ -6601,7 +6597,7 @@ def run_self_tests(fast=False):
     # result so the CALLER decides SYMBOLICALLY (no execution) instead of bailing to UNKNOWN -- a recursive
     # helper inside a larger function is triaged. The helper's result range is not modeled (an
     # over-approximation), so a trap that rests on it withholds REFUTED (UNKNOWN, no fabricated witness), and a
-    # helper that can itself trap is not marked, so the caller stays UNKNOWN -- never a false PROVED.
+    # helper that can itself trap is not marked, so the caller stays UNKNOWN.
     from .engines import _trapfree_recursive_callees
     _sv6 = (core.SANDBOX_SUBJECT, core.ALLOW_SUBJECT_EXECUTION)
     core.SANDBOX_SUBJECT = False; core.ALLOW_SUBJECT_EXECUTION = False     # force the symbolic path, no sandbox oracle
@@ -6680,7 +6676,7 @@ def run_self_tests(fast=False):
         # the caller-maintained-precondition case. Demotes when every call site pins the witnessing parameter to a
         # constant that misses the witness, OR when every caller is itself verified trap free (so the inlined call
         # cannot reach the trap). Scan ranking only -- the standalone check verdict is unchanged. An unguarded
-        # symbolic caller, or no in-repo caller, keeps the finding (surface, never hide).
+        # symbolic caller, or no in-repo caller, keeps the finding.
         _cf = _osx.path.join(_dx, "ctx_const.py")
         with open(_cf, "w", encoding="utf-8") as _fh:                                # callers pass constants missing n=-2
             _fh.write("def _div(n):\n    return 100 // (n + 2)\n\ndef pub(x):\n    return _div(5) + _div(7)\n")
@@ -6737,7 +6733,7 @@ def run_self_tests(fast=False):
     assert prove(_np + "def f():\n    a = np.zeros((2, 3))\n    return a.sum(axis=1).shape[0]\n", "result == 2").status == PROVED
     assert check(_np + "def f(t):\n    return t.sum()\n").status == PROVED                            # an unannotated receiver: opaque-safe
     # SOUNDNESS: the truth value of a multi-element array is a ValueError ("ambiguous"), so `if a:` does not
-    # over-approximate to a benign bool -- it abstains (UNKNOWN, never a false PROVED). A rich comparison a == b
+    # over-approximate to a benign bool -- it abstains (UNKNOWN). A rich comparison a == b
     # is ELEMENT-WISE (an array of booleans, not a scalar), so `if a == b:` is ambiguous too; `.any()` / `.all()`
     # give a real bool, and a scalar derived from the array (a.size > 0) is a normal comparison.
     assert check(_np + "def f():\n    a = np.zeros((2, 3))\n    if a:\n        return 1\n    return 0\n").status == UNKNOWN
@@ -6836,7 +6832,7 @@ def run_self_tests(fast=False):
     # pandas Series is a sized 1-D column with opaque cells: Series(list / container) carries the column's
     # length, a positional .iloc index is bounds-checked, and a min / max of a possibly-empty column is the
     # ValueError pandas raises; a guard on the length proves it. Cell values abstain. (DataFrame and pd.array
-    # construction can raise on mismatched data, so they stay UNKNOWN -- never a false PROVED.)
+    # construction can raise on mismatched data, so they stay UNKNOWN.)
     _pd = "import pandas as pd\n"
     assert prove(_pd + "def f():\n    s = pd.Series([10, 20, 30])\n    return len(s)\n", "result == 3", target="f").status == PROVED
     assert check(_pd + "def f():\n    s = pd.Series([1, 2, 3])\n    return s.iloc[2]\n", target="f").status == PROVED
@@ -6850,7 +6846,7 @@ def run_self_tests(fast=False):
     # class name, a qualified module.Type, a string forward reference, or a union) is an opaque receiver, so an
     # attribute access or a method call on it raises no modeled trap (PROVED), while a construction whose
     # __init__ can raise a modeled trap (a mismatched DataFrame, an unknown protobuf field) correctly stays
-    # UNKNOWN -- never a false PROVED.
+    # UNKNOWN.
     assert check("def f(msg: SomeMessage):\n    return msg.field\n", target="f").status == PROVED          # bare class name
     assert check("import m\ndef f(cfg: m.Config):\n    return cfg.hidden_size\n", target="f").status == PROVED   # qualified type
     assert check("import pandas as pd\ndef f(df: pd.DataFrame):\n    return df.shape\n", target="f").status == PROVED

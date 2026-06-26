@@ -64,8 +64,7 @@ def _solve_horn(prop, target, technique, proved, relations, declvars, rules, que
     """The shared Spacer tail of the CHC engines: build a Fixedpoint over `relations` / `declvars` / `rules`,
     query `query`, and map unsat / sat / unknown to PROVED / REFUTED / UNKNOWN. `technique` labels REFUTED and
     both UNKNOWN verdicts, `proved` the PROVED one; `on_error(msg)` gives the reason on a Z3Exception, and
-    `corroborate` gates the cvc5 invariant re-check (`proof_certificate`) on a PROVED. Behavior-identical to the
-    per-engine inline blocks it replaces."""
+    `corroborate` gates the cvc5 invariant re-check (`proof_certificate`) on a PROVED."""
     fp = z3.Fixedpoint(); fp.set(engine="spacer"); fp.set("timeout", timeout)
     for rel in relations:
         fp.register_relation(rel)
@@ -101,10 +100,8 @@ def verify_equiv(prop, target, impl_src, spec_src, repo) -> Verdict:
         impl_val, spec_val = fold(rets), _subst(fold(srets), subs)
         impl_trap, spec_trap = _trap_or(itraps), _trap_or(straps, subs)
         spec_none = z3.substitute(snone, *subs) if subs else snone
-        # equivalence of partial functions: same trap inputs, same None-return inputs, and
-        # equal values where both return a value. Building the value comparison can itself fail
-        # when the two functions return incompatible sorts -- that is a non-equivalence we report
-        # as UNKNOWN rather than letting a sort error escape.
+        # partial-function equivalence: same trap inputs, same None-return inputs, equal values elsewhere.
+        # Incompatible return sorts make the value comparison fail to build; report UNKNOWN, not a sort error.
         claim_false = z3.Or(z3.Xor(impl_trap, spec_trap),
                             z3.Xor(inone, spec_none),
                             z3.And(z3.Not(impl_trap), z3.Not(spec_trap),
@@ -169,10 +166,9 @@ def _loop_fn_parts(src):
 
 def _loop_equiv_product(prop, target, impl_src, spec_src, repo):
     """For-loop equivalence by a relational product: run both `for elem in xs` loops in lockstep over the same
-    list, accumulating each side's variables (the spec's renamed apart), and prove the two results agree at every
-    input by the single inductive invariant the sequence-loop engine synthesizes -- sound both ways, where the
-    value engine's loop over-approximation would be unsound for ==. None when either side is not a single
-    for-loop over a shared parameter, or the merged proof is itself UNKNOWN."""
+    list, accumulating each side's variables (the spec's renamed apart), and prove the results agree at every
+    input by the sequence-loop engine's single inductive invariant. None when either side is not a single
+    for-loop over a shared parameter, or the merged proof is UNKNOWN."""
     if repo:
         return None
     ip, sp = _loop_fn_parts(impl_src), _loop_fn_parts(spec_src)
@@ -287,8 +283,7 @@ def _isolate_target(src, fns, target):
 def _wrapper_of(dec_fn):
     """(param_name, wrapper_args, wrapper_body) for a one-parameter decorator whose body is exactly a single
     nested def then `return <that def>`, or a single `return <lambda>` -- the wrapper a decorator applies. None
-    for any other shape (a decorator with extra statements captures locals the inlining would drop, so it is
-    declined rather than modeled unfaithfully)."""
+    for any other shape (extra statements would capture locals the inlining drops)."""
     if len(dec_fn.args.args) != 1 or dec_fn.args.vararg or dec_fn.args.kwarg or dec_fn.args.kwonlyargs:
         return None
     p, body = dec_fn.args.args[0].arg, dec_fn.body
@@ -646,8 +641,7 @@ def _object_attribute_only(fn, oname, assign_node, classes, cname):
     """The set of mutator-method names called on `oname` when it is used only as the single `oname = C()`
     construction, as `oname.attr` loads/stores, and as `oname.m(args)` calls to simple mutator methods (which
     the rewrite inlines). None when the object escapes -- a bare use (aliased `p = oname`, passed `f(oname)`,
-    returned, indexed, compared) or a method that is not a simple mutator -- so the rewrite declines it rather
-    than producing a false PROVED."""
+    returned, indexed, compared) or a method that is not a simple mutator."""
     ok_ids = {id(assign_node.targets[0])}                        # the construction's target Name
     mutators = set()
     for n in ast.walk(fn):
@@ -1186,9 +1180,9 @@ def _check_trapfree_symexec(prop, target, src, pre_node, spec, repo, has_pre, tr
     """Trap-freedom fallback through the value engine, for a loop-free function the CFG/CHC checker declines
     (a local dict built by `d[k] = v` then read). `core._TRAPFREE` makes the value engine total, so the verdict
     rests on the traps alone (a missing-key KeyError, a division by zero, a failing assert). PROVED when no trap
-    is reachable under the precondition (sound: the over-approximation only widens the input set); a reachable
-    trap REFUTES only with no precondition and no havoc, where the query is exact. `trapfree_callees` are
-    recursive callees verified trap free standalone, inlined as a fresh result so the caller proceeds."""
+    is reachable under the precondition; a reachable trap REFUTES only with no precondition and no havoc, where
+    the query is exact. `trapfree_callees` are recursive callees verified trap free standalone, inlined as a
+    fresh result so the caller proceeds."""
     gated = _definite_assignment_guard(prop, target, "implicit contracts (asserts + trap freedom)", [src])
     if gated is not None:                                        # a variable possibly read before assignment on some
         return gated                                             # branch raises UnboundLocalError, not precisely modeled,
@@ -1282,10 +1276,8 @@ def _trapfree_recursive_callees(src, repo):
 def _trap_witness(src, pre_node, spec, repo):
     """A concrete input on which `src` reaches a trap, found by the exact value engine, as
     ({name: value} dict, formatted string) -- or (None, None) when the value engine over-approximates (a
-    havoc'd loop, a surviving None) so a model need not be a real input, or cannot model the body. This
-    lets a trap-freedom refutation, which the CFG/Horn engine reports without a witness, still carry a
-    reproducible counterexample. Sound: with no havoc the symbolic execution is exact, so a model of the
-    trap condition under the precondition is a genuine trapping input."""
+    havoc'd loop, a surviving None) so a model need not be a real input, or cannot model the body. With no
+    havoc the symbolic execution is exact, so a model of the trap condition is a genuine trapping input."""
     try:
         from .domains import _infer_param_kinds
         kinds = _infer_param_kinds(_fndef(src))
@@ -1743,9 +1735,8 @@ def _check_core(src, requires, repo, total, prop, target):
         if alt.status != UNKNOWN:                                  # (e.g. a local dict built then read)
             safe = alt
     if safe.status == UNKNOWN and _called_repo_names(src, repo):
-        # the value engine bailed inlining a recursive callee (a recursive helper inside this function); when
-        # that callee is itself trap free, inline it as a trap-free result and re-run the value engine, so the
-        # caller decides symbolically (no execution) instead of staying UNKNOWN or needing the sandbox oracle.
+        # the value engine bailed inlining a recursive callee; when that callee is itself trap free, inline it
+        # as a trap-free result and re-run, so the caller decides symbolically instead of staying UNKNOWN.
         _tfc = _trapfree_recursive_callees(src, repo)
         if _tfc:
             alt = _check_trapfree_symexec(prop, target, src, pre_node, spec, repo,
@@ -1753,12 +1744,10 @@ def _check_core(src, requires, repo, total, prop, target):
             if alt.status != UNKNOWN:
                 safe = alt
     if safe.status == UNKNOWN and _is_self_recursive(src):
-        # the value engine bails on the recursive self-call (the inliner cannot recurse), but the recursion
-        # engine decides trap freedom symbolically -- a reachable base-case or recursive-step trap is an Err
-        # under the call's path condition -- with no execution, so it refutes even with a leading import that
-        # would block the sandbox oracle (the import is a no-op symbolically). Take only its REFUTED (sound on
-        # the int-modeled inputs); a container recursion it int-models could vacuously "prove", so a PROVED
-        # there is left to the existing flow rather than trusted.
+        # the value engine bails on the recursive self-call, but the recursion engine decides trap freedom
+        # symbolically (a reachable base-case or recursive-step trap is an Err under the call's path condition),
+        # so it refutes even with a leading import that would block the sandbox oracle. Take only its REFUTED;
+        # a container recursion it int-models could vacuously "prove", so a PROVED there is left to the flow.
         _rpre = (lambda P: z3.BoolVal(True)) if requires.strip() == "True" else pre_fn
         try:
             _rrec = verify_recursive(prop, target, src, _rpre, lambda S, r: z3.BoolVal(True))
@@ -1767,20 +1756,18 @@ def _check_core(src, requires, repo, total, prop, target):
         if _rrec is not None and _rrec.status == REFUTED:
             safe = _rrec
     if safe.status == UNKNOWN and (_called_repo_names(src, repo) or _is_self_recursive(src)):
-        # before the sandbox oracle: a bounded symbolic unrolling of the caller and its (recursive) callees
-        # reaches the trap through an un-inlinable callee with NO execution, taking a witness only on a
-        # fully-unrolled (exact) path -- so the recursive-callee trap (f's `x // gcd(...)`, or a callee whose
-        # base case traps) refutes symbolically, reducing the cases that fall through to running the subject.
+        # before the sandbox oracle: bounded symbolic unrolling of the caller and its (recursive) callees
+        # reaches the trap through an un-inlinable callee, taking a witness only on a fully-unrolled (exact)
+        # path -- so the recursive-callee trap (f's `x // gcd(...)`, a callee whose base case traps) refutes.
         _iin, _icex = _interproc_bmc_witness(src, pre_node, spec, repo)
         if _iin is not None:
             safe = Verdict(REFUTED, prop, target, "implicit contracts (interprocedural unrolling)",
                            counterexample=_icex, counterexample_inputs=_iin,
                            reason="a modeled trap is reachable through an un-inlinable callee (bounded symbolic unrolling)")
     if safe.status == UNKNOWN and (_called_repo_names(src, repo) or _is_self_recursive(src)):
-        # every symbolic engine abstained on a function whose callee the inliner could not resolve (a
-        # recursive callee, e.g. f's `// gcd(...)` where gcd recurses, or self-recursion): the isolated
-        # sandbox decides a reachable trap the engines could not reach. Sound (real execution); silent when
-        # execution is disabled, so a purely-symbolic run still never runs the analyzed code.
+        # every symbolic engine abstained on a function whose callee the inliner could not resolve (a recursive
+        # callee, e.g. f's `// gcd(...)`, or self-recursion): the isolated sandbox decides a reachable trap the
+        # engines could not. Silent when execution is disabled, so a symbolic run still never runs the subject.
         tin, tcex = _oracle_trap_refute(src, requires, repo)
         if tin is not None:
             safe = Verdict(REFUTED, prop, target, "implicit contracts (interprocedural concrete trap)",
@@ -2506,7 +2493,7 @@ def _rewrite_decorator(dec, this_mod, modfuncs, name_imports, mod_imports):
     load_program's name mangling and the decorator inliner resolves it: a bare @g / @deco (a same-module
     function or a from-import) and an attribute @m.deco (through `import m`) both become @<mod>__deco, and the
     factory forms @g(args) / @m.deco(args) rewrite their callee likewise. A decorator naming a function outside
-    the program is left untouched, so the inliner declines it (UNKNOWN) rather than guessing."""
+    the program is left untouched, so the inliner declines it (UNKNOWN)."""
     def mangled(node):
         if isinstance(node, ast.Name):
             if node.id in name_imports:
@@ -2671,12 +2658,10 @@ def _standalone_def_src(m, drop_receiver=False):
     """A class method re-emitted as a standalone function (decorators and any return annotation dropped) so
     the trap-freedom engine can triage it: `self`/`cls` and any attribute access fall outside the modeled
     subset and yield UNKNOWN, while a method that is a pure function of its parameters is still verified. With
-    drop_receiver, the receiver (`self`/`cls`) is dropped from the parameter list so it reads as a free opaque
-    name -- used when computing the trap-freedom *verdict*, since a receiver is an object, not a sampled
-    scalar, so a 'trap' pinned only to `self=<value>` is spurious: modeling self as a parameter would
-    manufacture one, while a genuine parameter-only trap (a // b) still refutes and a constructed-receiver
-    trap is the heap driver's. The default keeps the receiver, so the returned source still names a real
-    instance method for confirmation and repro (_confirm_method)."""
+    drop_receiver, the receiver (`self`/`cls`) is dropped so it reads as a free opaque name -- used when
+    computing the trap-freedom *verdict*, since a 'trap' pinned only to `self=<value>` is spurious (a receiver
+    is an object, not a sampled scalar); a genuine parameter-only trap (a // b) still refutes. The default keeps
+    the receiver, naming a real instance method for confirmation and repro (_confirm_method)."""
     fn = copy.deepcopy(m)
     fn.decorator_list = []
     if drop_receiver and fn.args.args and fn.args.args[0].arg in ("self", "cls"):
@@ -2887,10 +2872,9 @@ def _method_heap_refute(module_src, class_name, method_node, total):
     the heap engine: build `obj = ClassName(); return obj.method(<params>)` over the module's classes (minus
     its imports, which the heap engine cannot follow) and verify trap freedom. A reachable trap on a
     freshly-constructed instance -- an empty self.items.pop(), an unguarded self.items[0], a missing
-    self.d[k] -- is REFUTED with a witness, which the standalone (self-opaque) check cannot see. Returns that
-    Verdict or None; a heap PROVED is never propagated, since the heap model defaults an unset attribute to 0
-    rather than abstaining, so only its refutation is trusted here. Declines a staticmethod, a vararg/kwarg
-    method, or a receiver the driver cannot construct without arguments (it then abstains, not guesses)."""
+    self.d[k] -- is REFUTED with a witness the standalone (self-opaque) check cannot see. Returns that Verdict
+    or None; only a heap refutation is trusted (the heap model defaults an unset attribute to 0). Declines a
+    staticmethod, a vararg/kwarg method, or a receiver the driver cannot construct without arguments."""
     m = method_node
     params = [a.arg for a in m.args.args]
     if not params or params[0] not in ("self", "cls"):          # a staticmethod is a plain function, handled elsewhere
@@ -3051,7 +3035,7 @@ def _confirm_method(module_src, class_name, method_src, v):
     with an integer self cannot. The receiver is built against the whole module minus its imports, so a sibling
     helper class (a Node) the class needs is defined while an import-dependent path simply fails to reproduce.
     Returns {"confirmed", "exception", "witness"}, or None when the subject is not a plain instance method or
-    the class is not constructible without arguments here (stays unconfirmed rather than guessing)."""
+    the class is not constructible without arguments here."""
     if not (core.SANDBOX_SUBJECT or core.ALLOW_SUBJECT_EXECUTION):
         return None
     try:
@@ -3129,14 +3113,11 @@ def _calls_to(key, repo):
 
 def _context_unreachable(key, repo, witness, verdict_by_key):
     """Whether a private function `key`'s standalone trap is unreachable in its real repo context, so a scan
-    demotes the finding rather than presenting it as a candidate. SCAN RANKING ONLY -- never a verdict, so this
-    never turns a REFUTED into a PROVED; it lowers a finding's rank when the trap rests on a caller-maintained
-    precondition. True when `key` has in-repo callers and EITHER (a) every call site pins a witnessing parameter
-    to a constant that misses the witness (the trapping input is never injected), OR (b) every caller's own
-    trap-freedom check is PROVED (each caller is verified trap free, so the inlined call to `key` cannot reach
-    the trap there). A symbolic / recursive / keyword / starred call argument, a call passing exactly the
-    witness, or any caller left UNKNOWN or REFUTED keeps the finding -- the conservative direction for a triage
-    report (surface, do not hide)."""
+    demotes the finding rather than presenting it as a candidate. SCAN RANKING ONLY, never a verdict. True when
+    `key` has in-repo callers and EITHER (a) every call site pins a witnessing parameter to a constant that
+    misses the witness, OR (b) every caller's own trap-freedom check is PROVED (so the inlined call cannot reach
+    the trap). A symbolic / keyword / starred call argument, a call passing exactly the witness, or any caller
+    left UNKNOWN or REFUTED keeps the finding (surface, do not hide)."""
     calls = _calls_to(key, repo)
     callers = {ck for ck, _ in calls if ck != key}
     if not calls or not callers:
@@ -3242,9 +3223,8 @@ def _build_finding(label, v, src, repo, fname, kind, execute, classinfo=None):
 def _escalate_unknown(label, src, repo, fname):
     """Pursue a symbolic UNKNOWN in execute mode rather than dropping it: guided fuzzing in the sandbox over a
     spread of edge-case inputs (empty containers, zero, small ints, short strings). If any input raises a
-    modeled trap, report a distinct `suspected` finding with the triggering input -- a swallowed UNKNOWN in a
-    bug finder is a missed bug. Returns the finding dict or None. A TypeError under fuzzed inputs is a sampling
-    type mismatch, not a function bug, so it is not reported."""
+    modeled trap, report a distinct `suspected` finding with the triggering input. Returns the finding dict or
+    None. A TypeError under fuzzed inputs is a sampling type mismatch, not a function bug, so it is not reported."""
     import itertools as _it
     try:
         fn = _fndef(src)
@@ -3283,8 +3263,7 @@ def _scan_severity(v):
     technique is normalized away by check's return). A trap the sandbox oracle executed, or a value-engine
     division / index / key / None trap, ranks above a reachable bare `raise`, which the CFG engine reports
     identically for a genuine crash and an intended input-validation `raise` (so that tier warrants review).
-    This orders and labels the report; it is not a soundness claim -- every finding is a genuinely reachable
-    trap."""
+    This orders and labels the report; every finding is a genuinely reachable trap."""
     r = (v.reason or "").lower()
     if "concrete" in r:                                          # the sandbox oracle executed it: a confirmed crash
         return 3, "confirmed crash (executed in the sandbox)"
@@ -5085,11 +5064,10 @@ def verify_function(prop, target, src, pre, post, repo=None, timeout=4000) -> Ve
 
 
 def _annotate_machine_overflow(v, src, pre, repo):
-    """Always-on companion: a function proved over Python's unbounded integers is additionally
-    checked for signed wraparound at the default machine width under the same precondition. If an
-    operation can wrap, that witness is attached to the (still PROVED, for Python semantics) verdict
-    so the wraparound is surfaced rather than left to a separately invoked width-specific check. A
-    looping or nonlinear body the straight-line bitvector check cannot model is left unannotated."""
+    """Always-on companion: a function proved over Python's unbounded integers is additionally checked for
+    signed wraparound at the default machine width under the same precondition. If an operation can wrap, that
+    witness is attached to the (still PROVED, for Python semantics) verdict. A looping or nonlinear body the
+    straight-line bitvector check cannot model is left unannotated."""
     if not core.CHECK_MACHINE_OVERFLOW or v.status != PROVED:
         return v
     mv = verify_no_overflow(v.prop, v.target, src, repo, pre=pre)
@@ -5167,28 +5145,30 @@ def verify_no_raise(prop, target, src, pre, repo=None, timeout=4000) -> Verdict:
         return gated
     fn = _fndef(src)
     params = [a.arg for a in fn.args.args]
-    # a str/bytes parameter, bound as an integer relation in the CHC model, would read int(s) / s + 1 / floor
-    # division as total integer ops though they trap on the real value. Abstain when such a parameter is used,
-    # so the value engine (which models strings) decides it.
+    # a str/bytes parameter bound as an integer relation would read int(s) / s + 1 / floor division as total
+    # integer ops, though they trap on the real value; abstain so the value engine (which models strings) decides.
     _strparams = {a.arg for a in fn.args.args
                   if isinstance(a.annotation, ast.Name) and a.annotation.id in ("str", "bytes")}
     if _strparams and any(isinstance(n, ast.Name) and n.id in _strparams for n in ast.walk(fn)):
         return Verdict(UNKNOWN, prop, target, "exception safety",
                        reason="a str/bytes-typed parameter is outside the integer CHC model (value engine decides)")
-    # an object-typed parameter (a user class, a qualified name, or a PEP-604 union), bound as an integer in
-    # the CHC model, would read a scalar op on it -- 100 // proto, proto + 1 -- as a total integer op though it
-    # is a TypeError on the real object (the proto=0 / dataset=0 scan artifacts). Abstain when such a parameter
-    # is used, so the value engine (which models it as an opaque receiver) decides it.
+    # an object-typed parameter bound as an integer would read a scalar op on it (100 // proto) as a total
+    # integer op, though it is a TypeError on the real object; abstain so the value engine decides it.
     _objparams = {a.arg for a in fn.args.args if core._is_object_annotation(a.annotation)}
     if _objparams and any(isinstance(n, ast.Name) and n.id in _objparams for n in ast.walk(fn)):
         return Verdict(UNKNOWN, prop, target, "exception safety",
                        reason="an object-typed parameter is outside the integer CHC model (value engine decides)")
-    # a list/dict/set/tuple parameter used DIRECTLY as a scalar -- arithmetic (a + 1), -a, int(a) / float(a) --
-    # reads as a total integer op though it is a TypeError on the real container. Abstain so the value engine
-    # decides; a container used as a container (a[i], len(a), for x in a, x in a) is sound here and stays.
-    # a method call on an int/float/bool parameter (n.append(...)) reads as a trap-free opaque call though a
-    # number has no such method (AttributeError). Abstain so the value engine decides; a duck-typed or
-    # class-annotated receiver is a genuine opaque object whose method is assumed to exist.
+    # a float parameter bound as a z3.Int loses IEEE-754 semantics (NaN non-reflexivity, signed zero, the
+    # infinities), so a trap guarded by them reads as unreachable; abstain so the value engine decides it over z3.FP.
+    _floatparams = {a.arg for a in fn.args.args
+                    if isinstance(a.annotation, ast.Name) and a.annotation.id == "float"}
+    if _floatparams and any(isinstance(n, ast.Name) and n.id in _floatparams for n in ast.walk(fn)):
+        return Verdict(UNKNOWN, prop, target, "exception safety",
+                       reason="a float-typed parameter is outside the integer CHC model (value engine decides)")
+    # a method call on a number-typed (int/float/bool) parameter (n.append(...)) reads as a trap-free opaque
+    # call though a number has no such method (AttributeError), and a list/dict/set/tuple parameter used as a
+    # scalar (a + 1, -a, int(a)) reads as a total integer op though it is a TypeError; abstain on both so the
+    # value engine decides. A container used as a container, or a class-annotated receiver, is sound and stays.
     _numparams = {a.arg for a in fn.args.args
                   if isinstance(a.annotation, ast.Name) and a.annotation.id in ("int", "float", "bool")}
     if _numparams and any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
@@ -5300,10 +5280,9 @@ def _verify_recursive_core(prop, target, src, pre, post, timeout=4000) -> Verdic
     name = fn.name
     if not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name
                for n in ast.walk(fn)):
-        # not self-recursive: the recursion engine models every parameter as an integer with no
-        # container/type guard, so on a non-recursive body it would vacuously prove e.g. `return a + 1` for a
-        # list parameter (a TypeError). Decline -- such a function is decided by check / the value engine
-        # earlier in the cascade, which do carry that guard.
+        # not self-recursive: the recursion engine models every parameter as an integer, so on a non-recursive
+        # body it would vacuously prove e.g. `return a + 1` for a list parameter (a TypeError). Decline; such a
+        # function is decided by check / the value engine earlier in the cascade.
         return Verdict(UNKNOWN, prop, target, "CHC/recursion", reason="not a self-recursive function")
     params = [a.arg for a in fn.args.args]
     pv = {p: z3.Int("p_" + p) for p in params}
@@ -5444,9 +5423,8 @@ def _recursive_bmc_witness(src, pre, post, k=12):
     """A concrete witness for a recursive REFUTED, by bounded symbolic unrolling (no execution). Inline the
     self-recursive function to depth k, then solve for an input meeting the precondition whose recursion bottoms
     out within k (so the unrolled value is exact) and whose return violates the postcondition. Returns
-    ({name: value}, str) or (None, None) when none is found within k or the body is outside this unroller; never
-    invents a witness. Reports an exact, non-trapping, spec-violating return when one exists; otherwise an input
-    reaching a division trap on a bottomed-out path, so a trap-freedom REFUTED also gets a witness."""
+    ({name: value}, str) or (None, None) when none is found within k or the body is outside this unroller.
+    Reports an exact spec-violating return, else an input reaching a division trap on a bottomed-out path."""
     try:
         fn = _fndef(src)
     except Unsupported:
@@ -5595,8 +5573,7 @@ def _interproc_bmc_witness(src, pre_node, spec, repo, k=10):
     does not bottom out within k returns a fresh havoc value and its path is marked inexact (`deep`), so a
     witness is taken only on a fully-unrolled path where the computation is exact. Returns ({name: value}, str)
     reaching a division / modulo trap under the precondition, or (None, None) when none is found within k or the
-    bodies are outside this unroller. Sound: on an exact path the trap genuinely fires, so this is the symbolic
-    counterpart of the sandbox oracle for the recursive-callee trap -- never invents a witness."""
+    bodies are outside this unroller."""
     try:
         fn = _fndef(src)
     except Unsupported:
@@ -5798,12 +5775,10 @@ def _refute_batch(src, repo, fname, args, samples):
 
 
 def _concrete_refute(src, pre, post, args, repo, trials=400, bound=64, seed=20240916):
-    """Fallback for an inconclusive Horn-clause result: sample concrete integer inputs that satisfy
-    the precondition, run the real function, and report REFUTED if the postcondition fails on any of
-    them. Sound for refutation only -- a concrete execution that violates the spec is a genuine
-    counterexample. The subject runs sandboxed by default, so this needs no off-by-default flag; the
-    precondition and postcondition (unpicklable Z3 terms) are evaluated here in the parent. Returns a
-    Verdict(REFUTED, ...) or None."""
+    """Fallback for an inconclusive Horn-clause result: sample concrete integer inputs that satisfy the
+    precondition, run the real function, and report REFUTED if the postcondition fails on any of them
+    (refutation only). The subject runs sandboxed by default; the precondition and postcondition (unpicklable
+    Z3 terms) are evaluated here in the parent. Returns a Verdict(REFUTED, ...) or None."""
     if not args or not (core.SANDBOX_SUBJECT or core.ALLOW_SUBJECT_EXECUTION):
         return None
     try:
@@ -7474,8 +7449,7 @@ def _recurrence_candidates(sym, order, guard):
     """Candidate recurrence sets (half-spaces over the loop variables) for a non-termination certificate:
     the loop guard itself (already inductive for a monotone-away counter), each variable bounded one way
     (v >= c / v <= c), and each pair difference bounded (v - w >= c / v - w <= c), for small offsets c. Each
-    is only a guess; the recurrence conditions are discharged soundly by z3, so a guess that does not
-    certify is discarded, never trusted."""
+    is a guess; z3 discharges the recurrence conditions, so an uncertified guess is discarded."""
     cands = [("guard", guard)]
     for v in order:
         for c in (0, 1, -1, 2, -2):
@@ -7491,16 +7465,12 @@ def _recurrence_candidates(sym, order, guard):
 
 
 def verify_nontermination(prop, target, src, repo=None, pre=None) -> Verdict:
-    """Prove a single while-loop function diverges from some reachable input -- a definite non-termination
-    bug, reported as REFUTED with the diverging witness. A recurrence set R (a half-space over the loop
-    variables) is synthesized and every condition discharged soundly with z3: R implies the loop guard (the
-    loop continues), R is closed under the loop body (each iteration stays in R), the body does not trap on R
-    (so the iteration completes rather than exiting via an exception), and R is reachable -- an input
-    satisfying `pre` whose trap-free pre-loop initialization lands a state in R. A reachable state in such an
-    R begins an infinite run, so the function never returns. UNKNOWN when no recurrence set is found
-    (non-termination is undecidable, so only a found certificate reports the bug); never PROVED, since
-    proving the loop always halts is verify_termination's side. The dual of verify_termination: the latter
-    asks whether every input halts, this whether some input diverges."""
+    """Prove a single while-loop function diverges from some reachable input -- a definite non-termination bug,
+    reported as REFUTED with the diverging witness. A recurrence set R (a half-space over the loop variables)
+    is synthesized and every condition discharged with z3: R implies the loop guard, R is closed under the body,
+    the body does not trap on R, and R is reachable (an input satisfying `pre` whose trap-free pre-loop
+    initialization lands in R). UNKNOWN when no recurrence set is found; never PROVED (the dual of
+    verify_termination, which asks whether every input halts)."""
     src = _lower_list_lengths(src)
     fn, args, init, loop, ret = _parse_single_loop(src)
     if loop is None:
@@ -8082,12 +8052,11 @@ def verify_ranking_synth(prop, target, src, repo=None) -> Verdict:
     coeffs = [z3.Int(f"rc{i}") for i in range(len(order) + 1)]
     rank = lambda st: coeffs[0] + z3.Sum([coeffs[i + 1] * st[order[i]] for i in range(len(order))])
     r_sym, r_body = rank(sym), rank(body)
-    # The synthesis condition is exists-coeffs forall-states, and r is bilinear (coeff * state),
-    # so a monolithic quantified query is nonlinear and times out nondeterministically. Solve it
-    # by CEGIS instead: the synthesizer fits coefficients to a growing set of concrete sample
-    # states (each constraint linear in the coefficients, hence a fast quantifier-free solve), and
-    # a verifier checks the concrete candidate over all states with one more quantifier-free solve,
-    # feeding back any counterexample state. This terminates and is deterministic.
+    # The synthesis condition is exists-coeffs forall-states, and r is bilinear (coeff * state), so a
+    # monolithic quantified query is nonlinear and times out nondeterministically. Solve it by CEGIS: the
+    # synthesizer fits coefficients to a growing set of concrete sample states (each constraint linear in the
+    # coefficients, a fast quantifier-free solve), and a verifier checks the candidate over all states with one
+    # more quantifier-free solve, feeding back any counterexample. Terminates, deterministic.
     synth = z3.Solver(); synth.set("rlimit", core.SOLVE_RLIMIT)   # deterministic bound, not wall-clock
     synth.add(z3.Or(*[c != 0 for c in coeffs[1:]]))
     subst = lambda expr, st: z3.substitute(expr, *[(sym[w], z3.IntVal(st[w])) for w in order])
@@ -8189,9 +8158,9 @@ def _powersum_invariant(prop, target, src, pre, post, repo=None, maxdeg=8) -> Ve
     recovered by interpolating p through a few small concrete steps (finite differences) rather than searching a
     monomial null-space -- the exact-rational-over-huge-values cost wall the data-driven learner hits past
     degree 4. The interpolated polynomials, the counter's guard-derived bound, and `counter >= start` form a
-    candidate invariant the solver then checks for initiation, preservation, and entailment of the postcondition
-    at exit; a wrong interpolation fails a check and yields UNKNOWN, never a false PROVED. This discharges an
-    arbitrary-degree power sum (sum of i^k) in bounded time. UNKNOWN outside the param-free unit-counter shape."""
+    candidate invariant the solver checks for initiation, preservation, and the postcondition at exit; a wrong
+    interpolation fails a check and yields UNKNOWN. Discharges an arbitrary-degree power sum (sum of i^k);
+    UNKNOWN outside the param-free unit-counter shape."""
     import math
     fn, args, init, loop, ret = _parse_single_loop(src)
     if loop is None or ret is None or not args:
