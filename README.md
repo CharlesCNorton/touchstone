@@ -51,16 +51,12 @@ ranked by exact match (a matched type set at the exact source position, the metr
 | Scalpel | static | 193 / 845 |
 | Type4Py | ML | 157 / 845 |
 
-Sonnet 4.6, Opus 4.8, and Touchstone are scored on the same 868-fact commit, so those three are a controlled
-comparison: Touchstone leads at 841, ahead of the two frontier models (824 and 822, themselves a two-fact gap
-inside the noise). gpt-4o's 806 is on a different commit (860 facts) and the paper's tools on a third (845),
-so their placement is a looser comparison. Haiku 4.5 is the outlier: it answered "unknown" on 466 of the 868
-slots, so its 281 reflects abstention rather than wrong inference, and it was about 70 percent accurate on the
-402 it did commit to. Touchstone is the only deterministic, reproducible, machine-checked tool at the top, and
-on the same-commit set it now matches more facts than the frontier LLMs do. The
-static and ML figures are from the TypeEvalPy paper, gpt-4o from the project's LLM evaluation, and the Claude
-models through the same emit-and-match harness. The verifier's own gate is `python -m touchstone.ci` (self-tests,
-soundness audits against CPython, and a verification benchmark, all required to pass) plus the Rocq proof check.
+Sonnet 4.6, Opus 4.8, and Touchstone are scored on the same 868-fact commit (the controlled comparison); gpt-4o
+(860 facts) and the paper's static/ML tools (845) are on different commits, so their placement is looser. Haiku
+4.5 abstained on 466 of the 868 slots. The static and ML figures are from the TypeEvalPy paper, gpt-4o from the
+project's LLM evaluation, and the Claude models through the same emit-and-match harness. The gate is
+`python -m touchstone.ci` (self-tests, soundness audits against CPython, a verification benchmark) plus the Rocq
+proof check.
 
 ### Verifier head-to-head
 
@@ -75,11 +71,9 @@ true contract, a counterexample or sound rejection for a false one.
 | CrossHair | concolic falsifier | 10 / 12 |
 | Nagini | deductive (Viper/JVM) | 9 / 12 |
 
-The three have different profiles on the same problems: Touchstone proves, refutes, and synthesizes the loop
-invariants, so it decides every problem; CrossHair confirms the straight-line cases and refutes the violated
-ones but cannot confirm the loops over all paths; Nagini proves the straight-line contracts and rejects the
-violated ones but needs a hand-written invariant for the loops Touchstone synthesizes. Each peer runs from its
-own toolchain when installed, so the figures reproduce.
+The three differ on the same problems: Touchstone proves, refutes, and synthesizes the loop invariants, so it
+decides every problem; CrossHair confirms straight-line cases and refutes violated ones but cannot confirm loops
+over all paths; Nagini proves straight-line contracts but needs a hand-written invariant for the loops.
 
 ## Command line
 
@@ -126,21 +120,17 @@ REFUTED  [property via verified VC generator (Rocq-extracted wpg)]
 
 Functional equivalence and predicates; whole-function and interprocedural reasoning over control flow with
 multiple loops, arbitrary nesting, break and continue, and any step direction; self-recursion, mutual
-recursion, and recursion over lists; whole-program verification across module boundaries through the call
-graph, so a callee's trap is seen at the caller; deductive and synthesized loop invariants, with a sound
-over-approximation proving a postcondition over a for-loop, comprehension, or complex target the exact
-invariant engines decline, withholding REFUTED; abstract
-interpretation (interval, zone, octagon, Karr, polyhedra, machine-integer); IEEE-754 floating point total
-over every double, with Inf and NaN as first-class inputs, exact floor division and modulo, and the `math`
-module modeled with its domain errors as traps and the transcendentals as sound over-approximations; numpy
-arrays and torch tensors carried by their shape, with broadcasting, matrix multiply, the axis reductions,
-reshape, and the shape-mismatch trap; a curated set of pure standard-library functions proved trap free;
-arrays with quantified specifications; termination and cost
-of counted, container, and data-dependent loops (linear, lexicographic, and synthesized ranking functions)
-and of self- and mutual recursion (well-founded measures), with non-termination reported as a findable bug
-(a recurrence set witnessing a diverging input); exceptions; rely-guarantee concurrency for all schedules and
-depths over locks, counting semaphores, condition variables, and async/await cooperative scheduling; and
-separation logic with the frame rule, the magic wand, and inductive heap predicates.
+recursion, and recursion over lists; whole-program verification across module boundaries; deductive and
+synthesized loop invariants, with a sound over-approximation for a for-loop, comprehension, or complex target
+the exact engines decline; abstract interpretation (interval, zone, octagon, Karr, polyhedra, machine-integer);
+IEEE-754 floating point total over every double, with Inf and NaN as first-class inputs, exact floor division
+and modulo, and the `math` module (domain errors as traps, transcendentals as sound over-approximations); numpy
+arrays and torch tensors carried by their shape (broadcasting, matrix multiply, axis reductions, reshape, the
+shape-mismatch trap); a curated set of pure standard-library functions proved trap free; arrays with quantified
+specifications; termination and cost of counted, container, and data-dependent loops and of self- and mutual
+recursion, with non-termination reported as a findable bug; exceptions; rely-guarantee concurrency over locks,
+counting semaphores, condition variables, and async/await; and separation logic with the frame rule, the magic
+wand, and inductive heap predicates.
 
 Container content is modeled, not just shape: set union, intersection, and difference by their membership;
 strided slice length for strings and lists; bytes and bytearray element values in [0, 255]; the ord/chr
@@ -149,22 +139,19 @@ an attribute decides. A generator's yielded values are checked at every yield, i
 accumulator unrolled to a bound; a recursive callee the inliner cannot unfold is summarized at the call site by
 its `@ensure` contract; and `verify_equiv` decides equivalence of two for-loops by a relational product.
 
-A non-integer parameter is carried through the value engine rather than abandoned to the integer engines: a string
-method such as `encode`, a starred unpacking `a, *b = seq` (the rest bound to the exact middle slice), and an in-repo
-class constructor (an opaque dataclass-style instance, its `__init__` confirmed trap free). A behavior-preserving
-decorator -- a memoizer (`functools.lru_cache` / `cache`), `functools.wraps`, or a binding / marker -- is analyzed as
-its undecorated body, while an unknown decorator is inlined or declined; a for-loop counter stepped by an
-unconditional integer constant carries its exact post-loop value `s_init + step * len(seq)`, so a length guard proves
-a later trap on it safe; and a variable possibly read before assignment on some branch makes the checker abstain
-rather than prove the function total.
+A non-integer parameter is carried through the value engine rather than abandoned to the integer engines: a
+string method such as `encode`, a starred unpacking `a, *b = seq`, and an in-repo class constructor (its
+`__init__` confirmed trap free). A behavior-preserving decorator (`functools.lru_cache` / `cache` / `wraps`, or a
+binding marker) is analyzed as its undecorated body; a for-loop counter stepped by an integer constant carries
+its exact post-loop value `s_init + step * len(seq)`; and a variable possibly read before assignment makes the
+checker abstain.
 
 Values carry their real types through the symbolic core; the heap models object identity, aliasing, mutation,
-and method dispatch along the C3 MRO (multiple inheritance); a sequence index is checked against the
-container's length and a dict key against the keys provably present (a `*args` parameter is such a sequence
-and `**kwargs` such a dict), so a guarded access is proved safe and an unguarded one refuted with the witness. These, with None
-in arithmetic, type mismatches, division by zero, and (alongside every integer proof) fixed-width overflow,
-are the traps that refute a totality claim; inside a for-loop over a container the first iteration is checked
-exactly, so a per-element trap refutes on a non-empty witness while later iterations stay an over-approximation.
+and method dispatch along the C3 MRO; a sequence index is checked against the container's length and a dict key
+against the keys provably present (`*args` is such a sequence, `**kwargs` such a dict). The traps that refute a
+totality claim are these, plus None in arithmetic, type mismatches, division by zero, and fixed-width overflow;
+inside a for-loop the first iteration is checked exactly, so a per-element trap refutes on a non-empty witness
+while later iterations stay an over-approximation.
 
 A property is stated in Python over the parameters and `result` (`prove`), with `len`, indexing, membership,
 `old(e)` for the entry value, and bounded `all` / `any` over a concrete range or literal; written as
@@ -200,15 +187,14 @@ instance), returns UNKNOWN rather than a guess.
 
 ## The modeled subset
 
-Touchstone is sound by construction in three tiers of trust: a **machine-checked core** (the integer IR and
-its weakest-precondition generators, the fixed-width and division/modulo encodings, the interval transfers,
-and the further encoders below, all proved in Rocq and run as extracted code); an **engine-modeled subset**
-(everything in "What it covers", modeled soundly and cross-checked against CPython, but not each individually
-proved); and everything else, which returns **UNKNOWN with a reason** rather than a guess. `touchstone covers`
-prints the tiers and `coverage_report()` measures the modeled fraction. An opt-in best-effort mode
-(`--best-effort` / `best_effort=True`, off by default) instead assumes unmodeled calls and framework methods
-are well-behaved, giving a labeled lower-trust verdict for C-extension- and framework-heavy code; it relaxes
-trap freedom only and never proves a postcondition over an assumed value.
+Touchstone is sound by construction in three tiers of trust: a **machine-checked core** (the integer IR and its
+weakest-precondition generators, the fixed-width and division/modulo encodings, the interval transfers, and the
+further encoders below, all proved in Rocq and run as extracted code); an **engine-modeled subset** (everything
+in "What it covers", modeled soundly and cross-checked against CPython, but not each individually proved); and
+everything else, which returns **UNKNOWN with a reason** rather than a guess. `touchstone covers` prints the
+tiers and `coverage_report()` measures the modeled fraction. An opt-in best-effort mode (`--best-effort`, off by
+default) assumes unmodeled calls and framework methods are well-behaved -- a labeled lower-trust verdict for
+framework-heavy code; it relaxes trap freedom only.
 
 What returns UNKNOWN, always named, never guessed:
 
@@ -235,18 +221,16 @@ What returns UNKNOWN, always named, never guessed:
 
 ## Soundness
 
-Every construct is encoded soundly or returned as UNKNOWN with a reason, so an unsupported feature is never
-silently skipped or assumed away. A PROVED is confirmed by a second, independent procedure -- cvc5 where the
-fragment round-trips (its nonlinear coverings for polynomial goals), otherwise a checked SOS certificate or the
-real-relaxation nlsat lane, with the certificate naming which backed it; a verdict the second procedure actively
-refutes is reported as a prover bug rather than trusted, and when cvc5 is absent the PROVED degrades to a
-clearly-labeled single-solver result rather than vanishing. Verification runs under a deterministic
-resource bound, so identical input yields an identical verdict on every machine, and carries a reproducibility
-certificate; `proof_bundle` exports it as a re-checkable bundle (the discharged SMT-LIB queries, the solver
-versions, the configuration, and a content hash) that `recheck_bundle` or any SMT solver re-verifies
-independently. `prove` / `verify` / `check` establish partial correctness (no trap and the postcondition
-holds, not termination, which is the separate `verify_total` / `check --total`); a true property that exceeds
-the default bound and comes back UNKNOWN can be retried at `--budget high`, so incompleteness is visible.
+Every construct is encoded soundly or returned as UNKNOWN with a reason; an unsupported feature is never
+silently skipped. A PROVED is confirmed by a second, independent procedure -- cvc5 where the fragment
+round-trips, otherwise a checked SOS certificate or the real-relaxation nlsat lane, with the certificate naming
+which backed it; a verdict the second procedure refutes is reported as a prover bug, and when cvc5 is absent the
+PROVED degrades to a labeled single-solver result. Verification runs under a deterministic resource bound, so
+identical input yields an identical verdict on every machine; `proof_bundle` exports a re-checkable bundle (the
+discharged SMT-LIB queries, solver versions, configuration, and a content hash) that `recheck_bundle` or any SMT
+solver re-verifies. `prove` / `verify` / `check` establish partial correctness (no trap and the postcondition
+holds, not termination -- that is `verify_total` / `check --total`); a UNKNOWN that exceeds the default bound can
+be retried at `--budget high`.
 
 The trust base is machine-checked in Rocq (`proofs/`), every theorem closed under the global context with no
 axioms and no Admitted: the operational semantics of the modeled subset; the VC generator over it (sound and
@@ -262,12 +246,10 @@ condition implies the property. SMTCoq additionally re-checks each integer oblig
 Coq's kernel.
 
 The VC generators, the interval operators, the `//` / `%` encoding, and the type-lattice join are extracted
-from those proofs; the engine runs the Python image of that extraction directly, and a shipped audit holds
-each module byte-for-byte equal to the committed JSON extraction on every install with no Coq toolchain. So
-the code that runs is the one proven correct in Rocq. With that core verified, the random differential checks
-against CPython are a completeness regression measuring precision, and machine-generated fuzz corpora (integer,
-sequence, recursion, while-invariant, and interprocedural) feed code no human wrote through the same CPython
-oracle, holding the trap-freedom verdicts sound on inputs no human chose.
+from those proofs; the engine runs the Python image of that extraction directly, and a shipped audit holds each
+module byte-for-byte equal to the committed JSON extraction on every install with no Coq toolchain. The
+differential checks against CPython and the machine-generated fuzz corpora (integer, sequence, recursion,
+while-invariant, interprocedural) are completeness regressions over that verified core.
 
 ## Type inference
 
@@ -294,16 +276,11 @@ committed is the fraction of those that match; recall is their product.
 | TypeEvalPy autogen suite | 27,801 / 77,268 (36.0%) | 100% | 92.7% |
 | CPython standard library | 151 / 1218 (12.4%) | 100% | 90.7% |
 
-The sound mode commits only where the type is fixed independent of the inputs, so its reach is narrower than
-the heuristic's, but a committed bound is a proven over-approximation: on the CPython cross-check, where the
-ground truth is the observed runtime type, the inferred bound contained it in all 151 committed slots. The
-TypeEvalPy figures are scored against commit `3719de1`; the CPython cross-check ran on 3.13.2 and is the
-held-out, out-of-distribution measurement (the autogen suite is generated from templates the heuristic was
-tuned against, and its static ground truth carries a few label errors -- `a = func()` returning an int labeled
-`str` -- so its raw `--sound` soundness reads 99.7% against those labels, though every committed bound holds
-against the observed runtime types). Counts and rates move with the benchmark commit and the standard-library
-version, so the tables are snapshots `python -m touchstone.typeeval` reproduces. Every type is spelled by its
-runtime `__name__`, so a match reflects an inferred type, not a naming convention.
+The sound mode commits only where the type is fixed independent of the inputs, so its reach is narrower than the
+heuristic's; a committed bound is a proven over-approximation, holding against the observed runtime type in all
+151 CPython-cross-check slots. The TypeEvalPy figures are scored against commit `3719de1`; the CPython
+cross-check ran on 3.13.2 (the held-out measurement). Counts move with the benchmark commit and the
+standard-library version, so the tables are snapshots `python -m touchstone.typeeval` reproduces.
 
 ## Run
 

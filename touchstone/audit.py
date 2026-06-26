@@ -683,9 +683,12 @@ def stdlib_trapfree_audit():
     TypeError / KeyError / IndexError / ZeroDivisionError / AssertionError) on a well-typed argument, and that
     every registered dotted name resolves to a real callable. A modeled trap on a valid argument is an unsound
     allowlist entry (SoundnessError); an unmodeled exception (OSError, ...) is fine."""
-    import importlib
+    import importlib, os
     MT = (ValueError, TypeError, KeyError, IndexError, ZeroDivisionError, AssertionError)
+    _posix_only = {"os.getuid", "os.getgid", "os.geteuid", "os.getegid", "os.getpgrp", "os.getlogin"}
     for qual in core._STDLIB_TF:                              # every entry resolves to a callable
+        if qual in _posix_only and os.name != "posix":       # POSIX-only here; resolved and exercised on Linux CI
+            continue
         mod, _, leaf = qual.rpartition(".")
         try:
             obj = importlib.import_module(mod.split(".")[0])
@@ -2768,11 +2771,12 @@ def run_self_tests(fast=False):
         assert _xrc == 1 and "REFUTED" in _xout and "x=0" in _xout, _xout
         if core.sandbox_run_batch("def f(x):\n    return x\n", {}, "f", [[1]]) == [("ok", 1)]:
             assert "trace:" in _xout and "ZeroDivisionError" in _xout, _xout
-        _xb2 = _xio.StringIO()
-        with _xcl.redirect_stdout(_xb2):
-            _xrc2 = _xmain(["repair", "--generator", "printf 'def f(x):\\n    return x + 1\\n'",
-                            "--ensures", "result == x + 1"])
-        assert _xrc2 == 0 and "PROVED" in _xb2.getvalue(), _xb2.getvalue()
+        if _xsh.which("printf"):                              # the repair generator shells out; printf is POSIX-only
+            _xb2 = _xio.StringIO()
+            with _xcl.redirect_stdout(_xb2):
+                _xrc2 = _xmain(["repair", "--generator", "printf 'def f(x):\\n    return x + 1\\n'",
+                                "--ensures", "result == x + 1"])
+            assert _xrc2 == 0 and "PROVED" in _xb2.getvalue(), _xb2.getvalue()
     finally:
         _xsh.rmtree(_xd, ignore_errors=True)
 
