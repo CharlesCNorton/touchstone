@@ -172,6 +172,32 @@ A property is stated in Python over the parameters and `result` (`prove`), with 
 given as a Z3 predicate. A counterexample comes back with its execution trace (`explain`) and, on request, a
 failing test (`repro_test`).
 
+## Constraint solving and search
+
+Verdicts are produced by an SMT and CHC backend, so the verbs also serve as a decision procedure for
+finite-domain problems written as ordinary Python: a `check` counterexample is a satisfying assignment, and a
+PROVED verdict is a proof that no assignment exists. A problem is posed as a function whose mined assertion
+fails exactly on a solution, or as a postcondition over its parameters. Within the modeled integer, string,
+and floating-point fragments this decides, among others:
+
+- combinatorial constraint satisfaction -- Sudoku, N-queens, graph and map coloring, Latin and magic squares,
+  logic-grid puzzles, and cryptarithms;
+- number theory and Diophantine search -- integer factorization, Pythagorean and Heronian triangles, Pell
+  equations, Frobenius numbers, sums of like powers, and self-descriptive, narcissistic, and taxicab numbers;
+- algebraic identities and inequalities, including polynomial nonnegativity by sum-of-squares and the nonlinear
+  backend (Cauchy-Schwarz, AM-GM, Schur);
+- combinatorial impossibility proofs -- pigeonhole, Ramsey bounds, the non-existence of an Eulerian walk, and
+  cellular-automaton predecessor states;
+- string synthesis over the sequence theory -- constrained text, palindrome construction, and input-sanitizer
+  bypasses;
+- applied modeling -- balancing chemical equations, stoichiometry and calorimetry, voltage-divider design,
+  orbital resonances, calendar arithmetic, dietary planning, and affine-cipher recovery;
+- game theory and social choice -- pure-strategy Nash equilibria and Condorcet cycles.
+
+A problem outside the modeled fragments, or one whose unsatisfiability the backend cannot establish within the
+deterministic resource bound (primality posed as the absence of a factorization, or a large pigeonhole
+instance), returns UNKNOWN rather than a guess.
+
 ## The modeled subset
 
 Touchstone is sound by construction in three tiers of trust: a **machine-checked core** (the integer IR and
