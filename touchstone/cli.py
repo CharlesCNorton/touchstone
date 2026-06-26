@@ -1,19 +1,35 @@
-"""Command-line entry points, one per use mode, over the same engine the Python API drives:
+"""Command-line entry points, one per use mode, over the same engine the Python API drives. The verbs:
 
-    touchstone check      FILE [--func NAME] [--requires EXPR] [--total]   trap-freedom (and any asserts) of a function
-    touchstone verify     FILE [--func NAME]             the @require / @ensure contracts written in FILE
-    touchstone verify-all FILE                           every @ensure function in a module (a CI gate)
-    touchstone prove      FILE --ensures EXPR [--requires EXPR] [--func NAME]
-    touchstone equiv      IMPL SPEC --func NAME          two implementations agree on every input
-    touchstone infer      FILE [--func NAME] [--emit]    sound types of a return and its locals
-    touchstone examples                                  run the capability gallery
-    touchstone selftest                                  run the self-test suite
-    touchstone demo                                      the narrated demonstration
+  verdict-returning (the exit status mirrors the verdict, so they compose in CI):
+    touchstone check      FILE [--func NAME] [--requires EXPR] [--total]   trap freedom (and any asserts) for all inputs
+    touchstone verify     FILE [--func NAME]                               the @require / @ensure contracts written in FILE
+    touchstone verify-all FILE                                            every @ensure function in a module (a CI gate)
+    touchstone prove      FILE --ensures EXPR [--requires EXPR] [--func]   a postcondition over the parameters and `result`
+    touchstone equiv      IMPL SPEC --func NAME                            two implementations agree on every input
+    touchstone change     BEFORE AFTER [--func NAME] [--ensures EXPR]      a change preserves the code's properties (gate an AI diff)
+    touchstone explain    FILE [--ensures EXPR] [--func NAME]              check / prove, then show a refutation's path and live values
 
-FILE may be - to read the source from standard input, so the verbs compose with cat and heredocs.
-The verb verdicts (check / verify / verify-all / prove / equiv) set the exit status so they compose
-in CI: 0 PROVED, 1 REFUTED, 2 UNKNOWN; a usage, read, or syntax error exits 3. Pass --json for one
-machine-readable object, --quiet for only the verdict word, or --timeout MS to bound each query.
+  triage across a tree:
+    touchstone repo       DIR [--total] [--changed PATHS] [--jobs N]       trap freedom of every top-level function in a package
+    touchstone scan       TARGET [--execute] [--repro]                     reachable traps in an owner/repo, a URL, or a local path
+    touchstone gate       [DIR] [--base REF] [--changed PATHS]             verify each changed function (an AI-diff / PR gate)
+    touchstone coverage   DIR [--history FILE] [--jobs N]                  verified-subset coverage of a package, tracked over time
+
+  synthesis and inference:
+    touchstone spec       FILE [--func NAME]                               synthesize a contract the function provably satisfies
+    touchstone infer      FILE [--func NAME] [--emit]                      sound over-approximate types of a return and its locals
+    touchstone repair     --generator CMD [--ensures EXPR] [--before F]    re-run a generator until the property holds
+
+  servers and meta:
+    touchstone lsp / mcp                                                  the language server / the MCP verification-tools server (stdio)
+    touchstone covers                                                     what it can prove, and the modeled subset
+    touchstone examples / selftest / demo                                 the capability gallery / the self-tests / the narrated demo
+
+FILE may be - to read the source from standard input, so the verbs compose with cat and heredocs. The
+verdict verbs set the exit status (0 PROVED, 1 REFUTED, 2 UNKNOWN; a usage, read, or syntax error exits 3)
+and share --json (one machine-readable object), --quiet (only the verdict word), --timeout MS, --budget
+{standard,high,max} (the deterministic resource bound), --repro (a failing test on a refutation), and
+--best-effort (assume unmodeled calls are well-behaved, a lower-trust verdict).
 """
 import argparse
 import ast
@@ -302,7 +318,6 @@ def _cmd_explain(a):
 
 
 def _cmd_repair(a):
-    import subprocess
     _check_spec(a.requires, "requires")
     if a.ensures is not None:
         _check_spec(a.ensures, "ensures")
