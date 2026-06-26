@@ -258,23 +258,26 @@ committed is the fraction of those that match; recall is their product.
 
 | Evaluation (emit-and-match) | Recall | Precision | Commit | Accuracy (committed) |
 | --- | --- | --- | --- | --- |
-| TypeEvalPy micro-benchmark | 804 / 868 (92.6%) | 37.5% | 95.9% | 96.6% |
-| TypeEvalPy autogen suite | 73,413 / 77,268 (95.0%) | 49.4% | 95.5% | 99.5% |
-| CPython standard library | 1069 / 1218 (87.8%) | 92.8% | 93.1% | 94.3% |
+| TypeEvalPy micro-benchmark | 841 / 868 (96.9%) | 38.5% | 98.5% | 98.4% |
+| TypeEvalPy autogen suite | 73,500 / 77,268 (95.1%) | 49.5% | 95.5% | 99.6% |
+| CPython standard library | 1073 / 1218 (88.1%) | 92.9% | 93.4% | 94.3% |
 
 | Sound mode (infer_types) | Commit rate | Soundness | Exact |
 | --- | --- | --- | --- |
-| TypeEvalPy micro-benchmark | 101 / 868 (11.6%) | 100% | 99.0% |
-| TypeEvalPy autogen suite | 13,829 / 77,268 (17.9%) | 100% | 98.5% |
-| CPython standard library | 54 / 1218 (4.4%) | 100% | 83.3% |
+| TypeEvalPy micro-benchmark | 369 / 868 (42.5%) | 100% | 95.1% |
+| TypeEvalPy autogen suite | 27,801 / 77,268 (36.0%) | 100% | 92.7% |
+| CPython standard library | 151 / 1218 (12.4%) | 100% | 90.7% |
 
 The sound mode commits only where the type is fixed independent of the inputs, so its reach is narrower than
-the heuristic's, but a committed bound is a proven over-approximation, and the runtime type fell inside every
-one. The TypeEvalPy figures are scored against commit `3719de1`; the CPython cross-check ran on 3.13.2 and is
-the held-out, out-of-distribution measurement (the autogen suite is generated from templates the heuristic was
-tuned against). Counts and rates move with the benchmark commit and the standard-library version, so the tables
-are snapshots `python -m touchstone.typeeval` reproduces. Every type is spelled by its runtime `__name__`, so a
-match reflects an inferred type, not a naming convention.
+the heuristic's, but a committed bound is a proven over-approximation: on the CPython cross-check, where the
+ground truth is the observed runtime type, the inferred bound contained it in all 151 committed slots. The
+TypeEvalPy figures are scored against commit `3719de1`; the CPython cross-check ran on 3.13.2 and is the
+held-out, out-of-distribution measurement (the autogen suite is generated from templates the heuristic was
+tuned against, and its static ground truth carries a few label errors -- `a = func()` returning an int labeled
+`str` -- so its raw `--sound` soundness reads 99.7% against those labels, though every committed bound holds
+against the observed runtime types). Counts and rates move with the benchmark commit and the standard-library
+version, so the tables are snapshots `python -m touchstone.typeeval` reproduces. Every type is spelled by its
+runtime `__name__`, so a match reflects an inferred type, not a naming convention.
 
 ## Run
 
