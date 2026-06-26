@@ -1,4 +1,4 @@
-"""Emit-and-match evaluation for emit_facts (touchstone.typeinfer): recall and precision.
+"""Emit-and-match evaluation for emit_facts (touchstone.inference): recall and precision.
 
 TypeEvalPy directory: a tree of `*_gt.json` files beside their `.py` sources. Recall is the
 fraction of ground-truth facts an emitted fact matches; precision the fraction of emitted facts
@@ -24,7 +24,7 @@ import json
 import os
 import sys
 
-from .typeinfer import emit_facts
+from .inference import emit_facts
 
 # the eleven pure-Python stdlib modules of the cross-check; force the Python (not C) bisect/datetime
 _MODULES = ["fractions", "statistics", "csv", "colorsys", "posixpath", "textwrap",
@@ -316,7 +316,7 @@ def _sound_for(src, func, cache):
     """(return-type bound, {local: bound}) the sound mode infers for function `func` in `src`, each a
     frozenset over the cross-check vocabulary or None (UNKNOWN). A method (inside a class) is not in
     soundinfer's top-level index and comes back None -- an honest abstention, not a wrong answer."""
-    from . import soundinfer
+    from . import inference as soundinfer
     if func in cache:
         return cache[func]
     simple = func.rsplit(".", 1)[-1] if func else None

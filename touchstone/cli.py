@@ -565,7 +565,7 @@ def _cmd_infer(a):
     src = _read(a.file)
     _require_func(src, _label(a.file), a.func)
     if a.emit:                                                   # the TypeEvalPy emit-and-match surface
-        from . import typeinfer
+        from . import inference as typeinfer
         # pass the file path (so imports of sibling modules in the same directory resolve) and qualified=True
         # (so an imported / stdlib type keeps the module-path spelling TypeEvalPy's matcher expects, e.g.
         # itertools.count, to_import.A) -- both materially raise the TypeEvalPy exact-match score.

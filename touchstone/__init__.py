@@ -4,16 +4,16 @@ The full API is available from the top level; the same names are grouped into im
 domains, engines, theories, audit) for callers that want one layer in isolation.
 
 The top level loads lazily: z3 is imported only on first access of a verification name (check, prove,
-verify_*, the engines, the domains). `import touchstone` and the stdlib-only inference submodules (typeinfer,
-soundinfer) do not pull in the solver.
+verify_*, the engines, the domains). `import touchstone` and the stdlib-only inference submodule (inference)
+does not pull in the solver.
 """
 import importlib
 
 # Resolved from the stdlib-only inference module, so reaching these does not import the solver.
 _LIGHT = {
-    "infer_types": "soundinfer",
-    "infer_return_type": "soundinfer",
-    "infer_local_types": "soundinfer",
+    "infer_types": "inference",
+    "infer_return_type": "inference",
+    "infer_local_types": "inference",
 }
 
 

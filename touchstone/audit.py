@@ -17,7 +17,6 @@ from . import core
 from .core import *
 from .engines import *
 from .domains import *
-from .theories import *
 from .vcgen import *
 
 
@@ -1041,7 +1040,7 @@ def differential_method_audit():
     trap means a trapping method is missing from core._TRAPPING_METHODS. Needs ALLOW_SUBJECT_EXECUTION."""
     if not core.ALLOW_SUBJECT_EXECUTION:
         raise RuntimeError("differential_method_audit requires ALLOW_SUBJECT_EXECUTION")
-    from . import benchmark as _bench
+    from . import domains as _bench
     exprs = [
         "[].pop()", "[1, 2].pop(5)", "[1, 2].remove(9)", "[1, 2].index(9)", "[1, 'a'].sort()",
         "{}.popitem()", "{1: 2}.pop(9)", "set().pop()", "{1, 2}.remove(9)",
@@ -1081,7 +1080,7 @@ def differential_sound_inference_audit():
     so any unsound narrowing surfaces. Needs ALLOW_SUBJECT_EXECUTION (it runs the corpus)."""
     if not core.ALLOW_SUBJECT_EXECUTION:
         raise RuntimeError("differential_sound_inference_audit requires ALLOW_SUBJECT_EXECUTION")
-    from .soundinfer import infer_return_type
+    from .inference import infer_return_type
     corpus = [
         ("def f():\n    return 5\n", [()]),
         ("def f():\n    return 'a' + 'b'\n", [()]),
@@ -1172,7 +1171,7 @@ def differential_sound_local_audit():
     if not core.ALLOW_SUBJECT_EXECUTION:
         raise RuntimeError("differential_sound_local_audit requires ALLOW_SUBJECT_EXECUTION")
     import sys as _sys
-    from .soundinfer import infer_local_types
+    from .inference import infer_local_types
     corpus = [
         ("def f():\n    a = 5\n    b = 'x'\n    c = [1, 2]\n    d = len(b)\n    return d\n", ()),
         ("def f(n):\n    x = 0\n    y = 'a'\n    z = (1, 2)\n    return x\n", (3,)),
@@ -1450,7 +1449,7 @@ def extracted_lattice_audit():
     always available. (Strings, containers, and the heap/array model are proven sound in the same file but
     the engine discharges them through z3's theories, so only the join is tied here to running code.)"""
     from ._generated import encoders_rocq as _enc
-    from .soundinfer import _join
+    from .inference import _join
     def _to_rocq(b):                                          # a frozenset/None bound -> the extraction's option (list tag)
         if b is None:
             return ("None",)
@@ -1515,7 +1514,7 @@ def committed_obligations_audit():
     proofs tree is absent (an installed-only package ships no proofs/), where there is nothing to hold."""
     import os
     import re
-    from . import smtcoq_export
+    from . import vcgen as smtcoq_export
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "proofs", "touchstone_obligations.v")
     if not os.path.isfile(path):
@@ -1528,7 +1527,7 @@ def committed_obligations_audit():
         raise SoundnessError(
             "proofs/touchstone_obligations.v is stale: the engine now discharges an integer obligation the "
             "committed (kernel-checked) file does not cover; regenerate with "
-            "`python -m touchstone.smtcoq_export proofs/touchstone_obligations.v`. Missing: " + next(iter(missing)))
+            "`python -m touchstone.vcgen proofs/touchstone_obligations.v`. Missing: " + next(iter(missing)))
     return {"available": True, "checks": len(generated)}
 
 
@@ -2830,7 +2829,7 @@ def run_self_tests(fast=False):
     assert check("def f(xs: list):\n    if len(xs) > 0:\n        return xs[0]\n    return 0\n").status == PROVED
     # self-recursion: a trap in the recursive branch is reachable (10 // (n - 1) divides by zero at n == 1),
     # and one guarded away from the base is not. The recursion engine decides these.
-    from .benchmark import _decide as _bdecide
+    from .domains import _decide as _bdecide
     _rt = "def f(n):\n    if n <= 0:\n        return 0\n    return (10 // (n - 1)) + f(n - 1)\n"
     assert _bdecide(_rt, {"f": _rt}).status == REFUTED
     _rs = "def f(n):\n    if n <= 0:\n        return 0\n    return (10 // n) + f(n - 1)\n"
@@ -2973,7 +2972,7 @@ def run_self_tests(fast=False):
     assert prove(_multi, "result == x + 1", target="safe").status == PROVED
 
     # verify a change preserves the code's properties (a diff gate) and carries a re-checkable proof bundle
-    from .certificate import recheck_bundle as _recheck
+    from .vcgen import recheck_bundle as _recheck
     assert verify_change("def f(a):\n    return a + a\n", "def f(a):\n    return 2 * a\n").status == PROVED
     assert verify_change("def f(a):\n    return a + a\n", "def f(a):\n    return a + 1\n").status == REFUTED
     _cc = '@require("n >= 0")\n@ensure("result == n")\ndef c(n):\n    return n\n'
@@ -2986,7 +2985,7 @@ def run_self_tests(fast=False):
 
     # type inference: super() keeps the receiver subclass, and a tuple returned through a variable still
     # destructures per position
-    from .typeinfer import emit_facts as _emit
+    from .inference import emit_facts as _emit
     def _ty(src, name):
         return next((sorted(f["type"]) for f in _emit(src)
                      if (f.get("variable") or f.get("function")) == name), None)
@@ -3201,7 +3200,7 @@ def run_self_tests(fast=False):
     _lz = _sp5.run([_sys5.executable, "-c",
                     "import sys, touchstone\n"
                     "assert 'z3' not in sys.modules, 'import touchstone loaded z3'\n"
-                    "import touchstone.typeinfer, touchstone.soundinfer\n"
+                    "import touchstone.inference\n"
                     "assert 'z3' not in sys.modules, 'type-inference submodule loaded z3'\n"
                     "_ = touchstone.infer_types\n"
                     "assert 'z3' not in sys.modules, 'infer_types loaded z3'\n"
@@ -4072,7 +4071,7 @@ def run_self_tests(fast=False):
     # sound type inference of self.<field>: a field set in __init__ bounds a read in any method, and a field
     # set in __new__ on the returned instance bounds it too; an unsound __new__ (returns a different object)
     # contributes no field, so the read abstains. The receiver is a never-subclassed class, so self is it.
-    from .soundinfer import infer_return_type as _irt
+    from .inference import infer_return_type as _irt
     assert _irt("class C:\n    def __init__(self):\n        self.x = 5\n    def get(self):\n        return self.x\n",
                 target="C.get") == {"int"}
     assert _irt("class C:\n    def __new__(cls):\n        self = object.__new__(cls)\n        self.x = 'hi'\n"
@@ -5607,7 +5606,7 @@ def run_self_tests(fast=False):
     # trap freedom (broadest applicable engine) and each decided verdict is cross-checked against CPython
     # in the sandbox. No decided verdict may contradict execution -- that is the soundness bar (zero),
     # and the harness must decide and confirm the trap-free and trap-reachable cases.
-    from . import benchmark as _bench
+    from . import domains as _bench
     if fast:                                                # inner loop: skip the external-corpus sandbox benchmark
         _bm = {"contradictions": 0, "proved": 1, "refuted": 1, "confirmed": 1, "decided": 1}
     else:
@@ -6124,7 +6123,7 @@ def run_self_tests(fast=False):
     assert "z3 + cvc5" in cert_v.certificate and "rlimit" in cert_v.certificate
     # the certificate is backed by a re-checkable bundle: the discharged SMT-LIB refutation queries, re-run
     # independently and required UNSAT, with a content hash a tampered bundle fails. A REFUTED has no bundle.
-    from .certificate import proof_bundle, recheck_bundle
+    from .vcgen import proof_bundle, recheck_bundle
     _pb = proof_bundle(lambda: verify_equiv("pb", "f", aa[0], aa[1], {}))
     assert _pb["checkable"] and _pb["n_queries"] >= 1, _pb
     assert recheck_bundle(_pb)["verified"] is True, _pb

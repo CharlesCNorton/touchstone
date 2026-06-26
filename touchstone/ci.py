@@ -12,7 +12,7 @@ Exits nonzero on any failed assertion or SoundnessError.
 import sys
 from . import _impl as t
 from . import core
-from . import benchmark
+from . import domains as benchmark
 
 
 def _decided(rep):

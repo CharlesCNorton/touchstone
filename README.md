@@ -301,7 +301,7 @@ eval "$(opam env --switch=rocq9)" && cd proofs && bash verify_coq.sh
 ## Layout
 
 ```
-touchstone/      package: core, domains, engines, theories, vcgen, audit, ci, examples (_impl is the engine)
+touchstone/      package: core, domains, engines, vcgen, inference, audit, ci, examples (_impl is the engine)
 proofs/          Rocq + SMTCoq proofs, the extracted VC generators + interval operators, verify_coq.sh
 .github/         continuous integration: the audits and the proof gate on every change
 pyproject.toml   package metadata and pinned Python dependencies

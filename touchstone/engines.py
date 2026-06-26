@@ -51,7 +51,7 @@ def _escalate_budget(thunk):
 def _float_kinds(src):
     """Unannotated parameters inferred float (only the float kind), for symexec in the value channel; None if none."""
     try:
-        from .benchmark import _infer_param_kinds
+        from .domains import _infer_param_kinds
         k = _infer_param_kinds(_fndef(src))
     except Exception:
         return None
@@ -926,7 +926,7 @@ def _try_sos_prove(prop, target, impl_src, post_node, pre_node, repo):
 
     def poly(X):
         return z3.substitute(polyterm, *[(intargs[i], X[i]) for i in range(nvars)])
-    from .theories import verify_sos_nonneg
+    from .domains import verify_sos_nonneg
     for deg in (2, 4):
         if _m.comb(nvars + deg // 2, deg // 2) > 10:         # bound the 2^k PSD-minor enumeration
             continue
@@ -945,7 +945,7 @@ def _prove_via_havoc(prop, target, impl_src, pre_node, post_node, repo):
     over-approximation widens the reachable states, so a post holding over all of them holds for the real ones
     (PROVED is sound); a violation may be spurious, so this only ever PROVES, never refutes."""
     try:
-        from .benchmark import _infer_param_kinds
+        from .domains import _infer_param_kinds
         kinds = _infer_param_kinds(_fndef(impl_src))
     except Exception:
         kinds = None
@@ -1194,7 +1194,7 @@ def _check_trapfree_symexec(prop, target, src, pre_node, spec, repo, has_pre, tr
         return gated                                             # branch raises UnboundLocalError, not precisely modeled,
     #                                                              so the value engine abstains rather than proving total
     try:
-        from .benchmark import _infer_param_kinds
+        from .domains import _infer_param_kinds
         _fn = _fndef(src)
         kinds = _infer_param_kinds(_fn)
         risky_isinstance = _isinstance_guards_guessed_scalar(_fn, kinds)
@@ -1287,7 +1287,7 @@ def _trap_witness(src, pre_node, spec, repo):
     reproducible counterexample. Sound: with no havoc the symbolic execution is exact, so a model of the
     trap condition under the precondition is a genuine trapping input."""
     try:
-        from .benchmark import _infer_param_kinds
+        from .domains import _infer_param_kinds
         kinds = _infer_param_kinds(_fndef(src))
     except Exception:
         kinds = None
@@ -1363,7 +1363,7 @@ def _trap_info_for_witness(src, pre_node, spec, repo, witness):
     if not witness:
         return None
     try:
-        from .benchmark import _infer_param_kinds
+        from .domains import _infer_param_kinds
         kinds = _infer_param_kinds(_fndef(src))
     except Exception:
         kinds = None
@@ -1463,7 +1463,7 @@ def _sandbox_first_trap(fn, src, repo, requires, prefer=None, trials=48, seed=20
     if params and params[0] in ("self", "cls"):                  # a method receiver cannot be sampled standalone:
         return None, None                                        # a trap on an int self is a type artifact, not a bug
     try:
-        from .benchmark import _infer_param_kinds
+        from .domains import _infer_param_kinds
         kinds = _infer_param_kinds(fn)                            # usage-inferred kind of each unannotated parameter
     except Exception:
         kinds = {}
@@ -1944,7 +1944,7 @@ def change_bundle(before, after, requires=None, ensures=None, func=None, repo=No
     preserving, trusting only their own solver rather than the engine that produced it. The bundle is
     checkable when the change is PROVED through the SMT-query path (an equivalence or a loop-free contract);
     a CHC loop proof discharges an invariant rather than a single query and the bundle says so."""
-    from .certificate import proof_bundle
+    from .vcgen import proof_bundle
     return proof_bundle(lambda: verify_change(before, after, requires=requires, ensures=ensures,
                                               func=func, repo=repo), label=label)
 
@@ -2291,7 +2291,7 @@ def check_return_annotation(src, repo=None, target=None) -> Verdict:
                        counterexample="falls through to None",
                        reason="can fall through to an implicit None but the annotation is %s" % annsrc)
     try:
-        from .soundinfer import infer_return_type
+        from .inference import infer_return_type
         s = infer_return_type(src, repo, target)
     except Exception:
         s = None
@@ -3258,7 +3258,7 @@ def _escalate_unknown(label, src, repo, fname):
     res = core.sandbox_run_batch_typed(src, repo or {}, fname, combos)
     if res is None:
         return None
-    from .benchmark import _MODELED_TRAPS
+    from .domains import _MODELED_TRAPS
     for tup, r in zip(combos, res):
         if r and r[0] == "raise" and r[1] in _MODELED_TRAPS and r[1] != "TypeError":
             wit = {params[i]: tup[i] for i in range(len(params))}
