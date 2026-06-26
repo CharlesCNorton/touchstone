@@ -2621,6 +2621,16 @@ def run_self_tests(fast=False):
     _twoctr = "def f(a, b):\n    if a == 0:\n        return 0\n    if b == 0:\n        return f(a - 1, 5)\n    return f(a, b - 1)\n"
     _vlx = verify_recursive_termination("rt-lex", "f", _twoctr, lambda P: z3.And(P["a"] >= 0, P["b"] >= 0))
     assert _vlx.status == PROVED and "lexicographic" in _vlx.technique, _vlx
+    # the lexicographic bound is required only on the component that strictly decreases at each edge, so a sound
+    # measure survives an unconstrained nested-call argument (Ackermann-flavored): a falls with its callee value
+    # >= 0 while the second slot is a recursive-call result, and b's own decrease is bounded by the guard b > 0.
+    _nest = ("def f(a, b):\n    if a == 0:\n        return 0\n    if b <= 0:\n"
+             "        return f(a - 1, f(a - 1, 0))\n    return f(a, b - 1)\n")
+    _vnest = verify_recursive_termination("rt-lex-nested", "f", _nest, lambda P: P["a"] >= 0)
+    assert _vnest.status == PROVED and "lexicographic" in _vnest.technique, _vnest
+    # but the bound still blocks a divergent two-counter whose strictly decreasing component is never bounded below
+    _divlex = "def f(a, b):\n    if a == 0:\n        return 0\n    return f(a, b - 1)\n"
+    assert verify_recursive_termination("rt-lex-div", "f", _divlex, lambda P: P["a"] >= 0).status == UNKNOWN
     # mutual-recursion (size-change) termination: one well-founded measure shared across the whole cycle. The
     # measure n decreases at every edge of is_even -> is_odd -> is_even, so the cycle halts; a cycle with no
     # decrease stays UNKNOWN (sound abstention), and a single-function cycle defers to the self-recursion engine.
@@ -3339,6 +3349,24 @@ def run_self_tests(fast=False):
     # chained comparison is desugared (1 < a < 5)
     assert verify_function("chain", "f", "def f(a):\n    if 1 < a < 5:\n        return 1\n    return 0\n",
                            lambda S: z3.BoolVal(True), lambda S, r: z3.Or(r == 0, r == 1), {}).status == PROVED
+
+    # a chained comparison is accepted in the requires/ensures spec language too, desugared as in a body; a false
+    # chained bound still refutes, so the desugaring widens reach without weakening soundness
+    assert prove("def f(a):\n    return a\n", "0 <= result <= 1", requires="0 <= a <= 1").status == PROVED
+    assert check("def f(a):\n    return 100 // a\n", requires="1 <= a <= 9").status == PROVED
+    assert prove("def f(a):\n    return a + 1\n", "0 <= result <= 1", requires="5 <= a <= 9").status == REFUTED
+    assert verify_contracts('@require("0 <= n <= 100")\n@ensure("0 <= result <= 100")\n'
+                            "def clamp(n):\n    return n\n").status == PROVED
+    assert verify_contracts('@require("0 <= n <= 100")\n@ensure("0 <= result <= 50")\n'
+                            "def f(n):\n    return n\n").status == REFUTED
+
+    # minimize_witness returns the lexicographically minimal counterexample (fewest nonzero, then least total
+    # magnitude), bounded by the deterministic SOLVE_RLIMIT so the witness reproduces across runs and machine load
+    _zw = {"a": z3.Int("a"), "b": z3.Int("b")}
+    _mw = core.minimize_witness(z3.And(_zw["a"] + _zw["b"] == 5, _zw["a"] >= 0, _zw["b"] >= 0), _zw, ["a", "b"])
+    assert _mw is not None
+    _va, _vb = _mw.eval(_zw["a"]).as_long(), _mw.eval(_zw["b"]).as_long()
+    assert _va + _vb == 5 and (_va == 0 or _vb == 0)            # exactly one nonzero: minimization actually ran
 
     # for-loops are desugared and verified like any while loop
     forsum = "def f(n):\n    s = 0\n    for i in range(n):\n        s = s + 1\n    return s\n"
@@ -4513,6 +4541,21 @@ def run_self_tests(fast=False):
     assert prove("def f(a):\n    return a ^ a\n", "result == 0", requires="-128 <= a and a <= 127", target="f").status == PROVED
     assert prove("def f(a, b):\n    return a & b\n", "result == a", requires=_sb, target="f").status == REFUTED
     assert "signed" in prove("def f(a):\n    return a & a\n", "result == a", requires="-128 <= a and a <= 127", target="f").technique
+    # a bitwise identity mixed with integer arithmetic decides at width 16 and 32, not only 8: the Int2BV/BV2Int
+    # bridge leaves both z3 and cvc5 UNKNOWN there, so a widened pure-bitvector discharge takes over. A true
+    # identity proves, a false variant refutes, and one that could overflow the bitvector headroom stays UNKNOWN.
+    _p16 = "0 <= a and a <= 65535 and 0 <= b and b <= 65535"
+    _p32 = "0 <= a and a <= 4294967295 and 0 <= b and b <= 4294967295"
+    assert prove("def f(a, b):\n    return a ^ b\n", "result == (a | b) - (a & b)", requires=_p16).status == PROVED
+    assert prove("def f(a, b):\n    return a ^ b\n", "result == (a | b) - (a & b)", requires=_p32).status == PROVED
+    assert prove("def f(a, b):\n    return a + b\n", "result == (a ^ b) + 2 * (a & b)", requires=_p32).status == PROVED
+    assert prove("def f(a, b):\n    return a ^ b\n", "result == (a | b) - (a & b) + 1", requires=_p16).status == REFUTED
+    # the widened-bitvector path is sound under overflow: a product that can exceed the headroom is not decided
+    from .engines import _bitwise_bvnative
+    _ovf = _bitwise_bvnative("ovf", "f", "def f(a, b):\n    return a * b * a * b\n",
+                             ast.parse("result == (a * b) * (a * b)", mode="eval").body,
+                             ast.parse(_p32, mode="eval").body, 32)
+    assert _ovf is None, _ovf                                    # abstains rather than risk a wraparound verdict
     # float ** : x ** 0 is 1.0 and x ** 1 is x bit-exactly (modeled exactly, for every double); a higher constant
     # power is a sound over-approximation (a nonnegative finite base gives a nonnegative result, an even power of a
     # finite base is nonnegative, the anchors), so a property following from the axioms is PROVED -- while
@@ -4541,6 +4584,13 @@ def run_self_tests(fast=False):
     assert prove("def f(x, y):\n    return x ** y\n", "result >= 1", requires="x >= 1 and y >= 0", target="f").status == PROVED
     assert prove("def f(x, y):\n    return pow(x, y)\n", "result >= 0", requires="x >= 0 and y >= 0", target="f").status == PROVED
     assert prove("def f(x, y):\n    return x ** y\n", "result >= 0", target="f").status == UNKNOWN     # unconstrained: not forced
+    # a CONSTANT exponent beyond the unroll cap (64) is still over-approximated, but the reason names it a constant
+    # over the cap rather than a variable exponent; a genuine variable exponent keeps the variable-exponent wording.
+    _vcap = prove("def f(x):\n    return x ** 100\n", "result >= x", requires="x >= 1", target="f")
+    assert _vcap.status == UNKNOWN and "constant exponent over the unroll cap" in _vcap.reason, _vcap
+    _vvar = prove("def f(x, y):\n    if y >= 1:\n        return x ** y\n    return 1\n", "result >= x",
+                  requires="x >= 1", target="f")
+    assert _vvar.status == UNKNOWN and "variable exponent" in _vvar.reason, _vvar
     # variable bit-shift x << k / x >> k: a negative count is a ValueError and the value is over-approximated, so
     # a k >= 0 guard proves trap freedom while the unguarded shift abstains (like x ** y); a constant shift stays exact.
     assert check("def f(x: int, k: int):\n    if k >= 0:\n        return x << k\n    return 0\n", target="f").status == PROVED

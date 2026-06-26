@@ -1049,8 +1049,8 @@ def _prove_core(impl_src, ensures, requires, repo, prop, target):
     impl_src = _isolate_target(impl_src, _fns, target)           # a multi-function module: prove about `target` alone
     spec = Ctx(repo); spec.traps = None; spec.pc = z3.BoolVal(True)
     try:
-        pre_node = ast.parse(textwrap.dedent(requires), mode="eval").body
-        post_node = ast.parse(textwrap.dedent(ensures), mode="eval").body
+        pre_node = core.parse_spec(requires)
+        post_node = core.parse_spec(ensures)
     except SyntaxError as e:
         return Verdict(UNKNOWN, prop, target, "property (Python spec)", reason=f"spec syntax: {e}")
     pre_node, post_node = _strip_old(pre_node), _strip_old(post_node)
@@ -1720,7 +1720,7 @@ def _check_core(src, requires, repo, total, prop, target):
     src = _isolate_target(src, _fns, target)                     # a multi-function module: check `target` alone
     spec = Ctx(repo); spec.traps = None; spec.pc = z3.BoolVal(True)
     try:
-        pre_node = ast.parse(textwrap.dedent(requires), mode="eval").body
+        pre_node = core.parse_spec(requires)
     except SyntaxError as e:
         return Verdict(UNKNOWN, prop, target, "implicit contracts", reason=f"precondition syntax: {e}")
     pre_node = _strip_old(pre_node)
@@ -4452,6 +4452,110 @@ def _infer_bv_width(pre_node, src, repo=None):
     return None
 
 
+def _bitwise_bvnative(prop, target, src, post_node, pre_node, width) -> Optional[Verdict]:
+    """Discharge a width-bounded nonnegative bitwise/arithmetic identity in the pure bitvector domain, avoiding
+    the Int2BV/BV2Int bridge that leaves both z3 and cvc5 UNKNOWN at width 16 and 32 (the bridge couples integer
+    arithmetic with bitvector results, a theory mix neither solver bit-blasts). Each parameter maps to a wider
+    bitvector held in [0, 2^width); bitwise and arithmetic run at that wider width with no-overflow / nonnegativity
+    side conditions. When those side conditions provably hold on the whole valid region, the bitvector computation
+    equals the unbounded-integer one, so the bitvector verdict transfers exactly. Straight-line nonnegative
+    fragment only (assignments then a single return); returns None on anything outside it, so the caller's
+    UNKNOWN stands -- this path only ever adds a decision, never overrides a sound abstention."""
+    try:
+        fn = _fndef(src)
+    except Exception:
+        return None
+    params = [a.arg for a in fn.args.args]
+    if not params:
+        return None
+    wide = width + 32                                            # headroom so + / - / * cannot silently overflow
+    cap = z3.BitVecVal(1 << width, wide)
+    lo, hi = -(1 << (wide - 1)), 1 << (wide - 1)
+    env = {p: z3.BitVec("_bvn_" + p, wide) for p in params}
+    obl = []                                                    # the side conditions that make BV == integer
+
+    def ev_e(node, scope):
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+            if not (lo <= node.value < hi):
+                raise Unsupported("bvnative: constant out of range")
+            return z3.BitVecVal(node.value, wide)
+        if isinstance(node, ast.Name):
+            if node.id not in scope:
+                raise Unsupported("bvnative: free variable")
+            return scope[node.id]
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            x = ev_e(node.operand, scope)
+            obl.append(z3.BVSubNoOverflow(z3.BitVecVal(0, wide), x))
+            obl.append(z3.BVSubNoUnderflow(z3.BitVecVal(0, wide), x, True))
+            return z3.BitVecVal(0, wide) - x
+        if isinstance(node, ast.BinOp):
+            x, y = ev_e(node.left, scope), ev_e(node.right, scope)
+            op = type(node.op)
+            if op in (ast.BitAnd, ast.BitOr, ast.BitXor):
+                obl.append(x >= 0); obl.append(y >= 0)         # integer bitwise == BV bitwise only for nonnegatives
+                return x & y if op is ast.BitAnd else (x | y if op is ast.BitOr else x ^ y)
+            if op is ast.Add:
+                obl.append(z3.BVAddNoOverflow(x, y, True)); obl.append(z3.BVAddNoUnderflow(x, y))
+                return x + y
+            if op is ast.Sub:
+                obl.append(z3.BVSubNoOverflow(x, y)); obl.append(z3.BVSubNoUnderflow(x, y, True))
+                return x - y
+            if op is ast.Mult:
+                obl.append(z3.BVMulNoOverflow(x, y, True)); obl.append(z3.BVMulNoUnderflow(x, y))
+                return x * y
+            raise Unsupported("bvnative: operator")
+        raise Unsupported("bvnative: expression")
+
+    def ev_b(node, scope):
+        if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+            return z3.BoolVal(node.value)
+        if isinstance(node, ast.Compare) and len(node.ops) == 1:
+            l, r = ev_e(node.left, scope), ev_e(node.comparators[0], scope)
+            op = type(node.ops[0])
+            table = {ast.Eq: l == r, ast.NotEq: l != r, ast.Lt: l < r, ast.LtE: l <= r, ast.Gt: l > r, ast.GtE: l >= r}
+            if op not in table:                                # signed BV comparison (exact for the nonneg values here)
+                raise Unsupported("bvnative: comparison")
+            return table[op]
+        if isinstance(node, ast.BoolOp):
+            parts = [ev_b(v, scope) for v in node.values]
+            return z3.And(*parts) if isinstance(node.op, ast.And) else z3.Or(*parts)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return z3.Not(ev_b(node.operand, scope))
+        raise Unsupported("bvnative: boolean")
+
+    try:
+        scope = dict(env)
+        ret = None
+        for st in fn.body:                                     # straight-line: assignments then a single return
+            if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+                scope[st.targets[0].id] = ev_e(st.value, scope)
+            elif isinstance(st, ast.Return) and st.value is not None:
+                ret = ev_e(st.value, scope); break
+            else:
+                return None                                    # control flow / unsupported statement: abstain
+        if ret is None:
+            return None
+        region = [z3.ULT(env[p], cap) for p in params]         # every parameter in [0, 2^width)
+        if pre_node is not None:
+            region.append(ev_b(pre_node, dict(env)))
+        post_t = ev_b(post_node, {**env, "result": ret})
+    except (Unsupported, z3.Z3Exception):
+        return None
+    reg = z3.And(*region) if region else z3.BoolVal(True)
+    obls = z3.And(*obl) if obl else z3.BoolVal(True)
+    if _solve(z3.And(reg, z3.Not(obls)))[0] != PROVED:         # an overflow on the valid region would make the
+        return None                                            # bitvector model unfaithful: abstain rather than risk it
+    status, model = _solve(z3.And(reg, z3.Not(post_t)))
+    if status == UNKNOWN:
+        return None
+    cex = cex_in = None
+    if status == REFUTED and model is not None:
+        cex_in = {p: model.eval(env[p], model_completion=True).as_long() for p in params}
+        cex = ", ".join(f"{p}={cex_in[p]}" for p in params)
+    return Verdict(status, prop, target, f"bitvector (exact bitwise, unsigned width {width})",
+                   counterexample=cex, counterexample_inputs=cex_in)
+
+
 def verify_bitwise(prop, target, src, post_node, pre_node=None, repo=None, width=64) -> Verdict:
     """Decide a property over a loop-free function whose body (or specification) uses bitwise & / | / ^
     between variables, exactly, by encoding each bitwise operator -- in the body AND in the spec -- through
@@ -4484,6 +4588,10 @@ def verify_bitwise(prop, target, src, post_node, pre_node=None, repo=None, width
         inrange = z3.And(*ctx.bv_obligs)
         claim = z3.And(pre_t, inrange, z3.Or(_trap_or(itraps), inone, z3.Not(post_t)))
         status, model = _solve(claim)
+        if status == UNKNOWN and not signed and z3.is_false(z3.simplify(z3.Or(_trap_or(itraps), inone))):
+            bvn = _bitwise_bvnative(prop, target, src, post_node, pre_node, width)   # BV2Int leaves the solver
+            if bvn is not None:                                                      # UNKNOWN at width 16/32: decide
+                return bvn                                                           # it in the pure bitvector domain
         cex = cex_in = None
         if status == REFUTED:
             model = minimize_witness(claim, z3args, args) or model
@@ -6239,13 +6347,16 @@ def verify_recursive_termination(prop, target, src, pre=None, repo=None) -> Verd
             ok = True
             for pc, args, aux in calls:
                 assume = z3.And(pre(pv), pc, *aux)
-                lex_dec = z3.Or(m1(pv) > m1(args),               # the first component that changes decreases
-                                z3.And(m1(pv) == m1(args), m2(pv) > m2(args)))
-                b1 = _solve(z3.And(assume, m1(args) < 0))[0]     # both components stay >= 0 (well-founded on N^2)
-                b2 = _solve(z3.And(assume, m2(args) < 0))[0]
-                dec = _solve(z3.And(assume, z3.Not(lex_dec)))[0]
+                # per-edge lexicographic descent, bounding only the component that carries the decrease on this
+                # edge: either the first strictly decreases and its callee value is >= 0 (the second is then free
+                # -- an unconstrained nested-call argument, as in Ackermann), or the first is unchanged and the
+                # second strictly decreases and is >= 0. Sound: the first stays in N along any path, so it falls
+                # only finitely often, and between its falls the second is a strictly decreasing sequence in N.
+                lex_ok = z3.Or(z3.And(m1(pv) > m1(args), m1(args) >= 0),
+                               z3.And(m1(pv) == m1(args), m2(pv) > m2(args), m2(args) >= 0))
+                dec = _solve(z3.And(assume, z3.Not(lex_ok)))[0]
                 prs = _solve(z3.And(assume, z3.Not(pre(args))))[0]   # the precondition is preserved
-                if not (b1 == PROVED and b2 == PROVED and dec == PROVED and prs == PROVED):
+                if not (dec == PROVED and prs == PROVED):
                     ok = False; break
             if ok:
                 return Verdict(PROVED, prop, target, "recursion termination (lexicographic measure)",

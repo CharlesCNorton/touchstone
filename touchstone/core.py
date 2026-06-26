@@ -118,6 +118,34 @@ class _TrapList(list):
         self.lines.append(getattr(self._ctx, "_cur_line", None))
 
 
+def _unchain_compare(node):
+    """`a < b < c` -> `(a < b) and (b < c)`; a single-op compare is returned unchanged. The middle operands are
+    re-read in each conjunct, which matches Python exactly here because spec and body expressions are pure."""
+    if not isinstance(node, ast.Compare) or len(node.ops) <= 1:
+        return node
+    operands = [node.left] + node.comparators
+    parts = [ast.Compare(left=operands[i], ops=[node.ops[i]], comparators=[operands[i + 1]])
+             for i in range(len(node.ops))]
+    return ast.BoolOp(op=ast.And(), values=parts)
+
+
+class _SpecDesugar(ast.NodeTransformer):
+    """Chained-comparison desugaring for a require/ensure expression -- the only body desugaring a pure spec
+    needs, applied without the statement-level rewrites (for, with, aug-assign) that cannot occur in a spec."""
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        return _unchain_compare(node)
+
+
+def parse_spec(s):
+    """Parse a require/ensure expression to an AST node, desugaring a chained comparison `0 <= a <= 1` to
+    `0 <= a and a <= 1` the way a function body is, so the spec language accepts it identically."""
+    node = ast.parse(textwrap.dedent(s), mode="eval").body
+    node = _SpecDesugar().visit(node)
+    ast.fix_missing_locations(node)
+    return node
+
+
 class _Desugar(ast.NodeTransformer):
     def __init__(self, classes=None, suppress_names=None):
         self._tmp = 0
@@ -147,12 +175,7 @@ class _Desugar(ast.NodeTransformer):
 
     def visit_Compare(self, node):
         self.generic_visit(node)
-        if len(node.ops) <= 1:
-            return node
-        operands = [node.left] + node.comparators          # a < b < c -> (a<b) and (b<c)
-        parts = [ast.Compare(left=operands[i], ops=[node.ops[i]], comparators=[operands[i + 1]])
-                 for i in range(len(node.ops))]
-        return ast.BoolOp(op=ast.And(), values=parts)
+        return _unchain_compare(node)                      # a < b < c -> (a<b) and (b<c)
 
     def visit_For(self, node):
         self.generic_visit(node)
@@ -1936,6 +1959,8 @@ def _callee_contract(src):
             node = a.body
         else:
             continue
+        node = _SpecDesugar().visit(node)                  # `0 <= a <= 1` in a contract, as in a body
+        ast.fix_missing_locations(node)
         (reqs if nm in ("require", "pre") else enss).append(node)
     if not enss:
         return None
@@ -3056,7 +3081,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     base_i, exp_i = _as_int(l), _as_int(r)
                     if ctx.traps is not None:
                         ctx.traps.append(z3.And(ctx.pc, base_i == 0, exp_i < 0))
-                    _note_overapprox(ctx, "** with a variable exponent")
+                    over_cap = (isinstance(node.right, ast.Constant) and isinstance(node.right.value, int)
+                                and not isinstance(node.right.value, bool) and node.right.value > 64)
+                    _note_overapprox(ctx, "** with a constant exponent over the unroll cap (64)" if over_cap
+                                     else "** with a variable exponent")
                     r2 = z3.FreshInt("pow")
                     if ctx.facts is not None:
                         ctx.facts.extend(_pow_axioms(base_i, exp_i, r2))
@@ -6332,7 +6360,10 @@ def minimize_witness(claim_false, z3args, args):
         return None
     try:
         o = z3.Optimize()
-        o.set("timeout", 4000)
+        if SOLVE_RLIMIT:
+            o.set("rlimit", SOLVE_RLIMIT)        # deterministic cutoff: the reported minimal counterexample is
+        else:                                    # reproducible across runs and machine load (a wall clock is not);
+            o.set("timeout", SOLVE_TIMEOUT_MS)   # on starvation check() is unknown -> None -> the caller keeps its cex
         o.add(claim_false)
         absv = []
         for a in args:

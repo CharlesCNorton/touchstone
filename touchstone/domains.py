@@ -2011,7 +2011,7 @@ def verify_sl_code(prop, target, src, cells=(), post=None, pre=None) -> Verdict:
         formula = s.mkTerm(K.AND, sp, s.mkTerm(K.NOT, q))
         if pre is not None:
             formula = s.mkTerm(K.AND, formula,
-                               _cvc5_sl_eval(ast.parse(pre, mode="eval").body, env, current, allcells, s, K))
+                               _cvc5_sl_eval(core.parse_spec(pre), env, current, allcells, s, K))
         s.assertFormula(formula)
         r = str(s.checkSat())
     except Unsupported as u:

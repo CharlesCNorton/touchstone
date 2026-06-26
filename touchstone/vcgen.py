@@ -479,8 +479,8 @@ def prove_via_vcgen(src, ensures, requires="True", repo=None, prop="property", t
         pass
     try:
         params, ghost, prog, ret_expr, nvars = lower_function(src)
-        post_node = ast.parse(textwrap.dedent(ensures), mode="eval").body
-        pre_node = ast.parse(textwrap.dedent(requires), mode="eval").body
+        post_node = core.parse_spec(ensures)
+        pre_node = core.parse_spec(requires)
 
         def post_resolve(nm):
             if nm == "result":

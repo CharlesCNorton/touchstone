@@ -136,8 +136,3 @@
 136. Fix the KeyError in `mutagen.easyid3.original_date_delete` at line 2 (id3={}, key=7) [quodlibet/mutagen]
 137. Fix the KeyError in `mutagen.easyid3.original_date_get` at line 2 (id3={}, key=7) [quodlibet/mutagen]
 138. Fix the IndexError in `mutagen.easyid3.txxxkey_deleter` at line 2 (id3=[], key=7, frameid=7) [quodlibet/mutagen]
-139. Desugar the `requires` and `ensures` specification language so a chained comparison such as `0 <= a <= 1` is accepted there as it is in a function body, instead of failing with a chained-comparison error.
-140. Bound `minimize_witness` by the deterministic `SOLVE_RLIMIT` rather than a wall-clock optimizer timeout, so the reported counterexample is reproducible across runs and machine load.
-141. Relax the lexicographic well-foundedness check in `verify_recursive_termination` to require the non-negativity bound only on the component that strictly decreases at each call edge, so a sound lexicographic measure is not rejected when a nested-call argument is unconstrained (for example Ackermann).
-142. Decide a postcondition-side variable bitwise identity at widths above 8 in `verify_bitwise` and its width inference, which currently proves such an identity at width 8 but abstains at 16 and 32.
-143. Report a constant `**` exponent beyond the unroll cap as a constant over the cap in the over-approximation reason, not as a variable exponent.
