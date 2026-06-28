@@ -3213,6 +3213,64 @@ def run_self_tests(fast=False):
     finally:
         _sh.rmtree(_dk, ignore_errors=True)
 
+    # scan verdict cache: a re-scan with a content-addressed cache returns findings identical to an uncached
+    # scan, caches only non-REFUTED verdicts (so a finding's witness is always recomputed fresh), and -- the
+    # soundness point -- a unit edited from safe to trapping is re-triaged to REFUTED, never served a stale PROVED.
+    _dc = _tf.mkdtemp(prefix="ts_cache_")
+    try:
+        for _i in range(4):
+            open(_os.path.join(_dc, "m%d.py" % _i), "w").write(
+                "def divz(a, b):\n    return a // b\ndef safe(x):\n    return x + 1\n")
+        _locs = lambda _r: sorted(_f["location"] for _f in _r["findings"])
+        _cache = {}
+        _r1 = scan(_dc, execute=False, jobs=1, cache=_cache)
+        _r2 = scan(_dc, execute=False, jobs=1, cache=_cache)                                  # all safe units now hits
+        assert _locs(_r1) == _locs(_r2) == ["m%d.divz" % _i for _i in range(4)]
+        assert _r2["proved"] == 4 and _r2["refuted"] == 4 and _r2["unknown"] == 0
+        assert len(_cache) == 4 and all(_v["status"] != REFUTED for _v in _cache.values())    # only the safe fns
+        assert _locs(scan(_dc, execute=False, jobs=1)) == _locs(_r1)                          # uncached: same findings
+        _cs = {}
+        open(_os.path.join(_dc, "m0.py"), "w").write("def divz(x):\n    return x + 1\n")      # now safe
+        scan(_dc, execute=False, jobs=1, cache=_cs)                                           # m0.divz cached PROVED
+        open(_os.path.join(_dc, "m0.py"), "w").write("def divz(x):\n    return 1 // x\n")     # now traps
+        assert "m0.divz" in _locs(scan(_dc, execute=False, jobs=1, cache=_cs))                # re-triaged, not stale
+    finally:
+        _sh.rmtree(_dc, ignore_errors=True)
+
+    # SARIF 2.1.0 output for the triage verbs: a well-formed log, one result per finding carrying a level, a
+    # logical + physical location (module path and def line), and a stable fingerprint; the repo-row form emits
+    # one error result per refuted function and a physical location for a file::func gate label.
+    from .sarif import scan_to_sarif, rows_to_sarif
+    _dsf = _tf.mkdtemp(prefix="ts_sarif_")
+    try:
+        open(_os.path.join(_dsf, "a.py"), "w").write("def divz(a, b):\n    return a // b\ndef ok(x):\n    return x + 1\n")
+        _rep = scan(_dsf, execute=False, jobs=1)
+        _sl = scan_to_sarif(_rep)
+        assert _sl["version"] == "2.1.0" and len(_sl["runs"]) == 1
+        assert _sl["runs"][0]["tool"]["driver"]["name"] == "touchstone"
+        _results = _sl["runs"][0]["results"]
+        assert len(_results) == len(_rep["findings"]) == 1
+        _res0 = _results[0]
+        assert _res0["level"] in ("error", "warning", "note")
+        assert _res0["locations"][0]["logicalLocations"][0]["fullyQualifiedName"] == "a.divz"
+        assert _res0["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == "a.py"
+        assert _res0["partialFingerprints"]["touchstone/v1"] == finding_fingerprint(_rep["findings"][0])
+        _rs = rows_to_sarif([("pkg.f", "REFUTED"), ("pkg.g", "PROVED"), ("d.py::h", "REFUTED")])
+        assert len(_rs["runs"][0]["results"]) == 2                                            # only the refuted rows
+        assert _rs["runs"][0]["results"][1]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == "d.py"
+    finally:
+        _sh.rmtree(_dsf, ignore_errors=True)
+
+    # finding fingerprint + baseline partition: a fingerprint is the trap site and exception (independent of the
+    # sampled witness), and partition splits findings into those a baseline already records (known) and the rest
+    # (new), so a baselined scan fails only on a finding not in the baseline.
+    _bf1 = {"location": "p.f", "exception": "ZeroDivisionError", "classification": "bug"}
+    _bf2 = {"location": "p.g", "exception": "IndexError", "classification": "bug"}
+    assert finding_fingerprint(_bf1) == "p.f|ZeroDivisionError"
+    _bnew, _bknown = baseline_partition([_bf1, _bf2], [finding_fingerprint(_bf1)])
+    assert [_f["location"] for _f in _bknown] == ["p.f"] and [_f["location"] for _f in _bnew] == ["p.g"]
+    assert baseline_partition([_bf1], [])[0] == [_bf1]                                        # empty baseline: all new
+
     # verification-guided repair loop: a counterexample drives a generator to a verified result
     _attempts = iter(["def f(x):\n    return x + 1\n", "def f(x):\n    return 2 * x\n"])
     _r = repair_loop(lambda fb: next(_attempts), ensures="result == 2 * x")

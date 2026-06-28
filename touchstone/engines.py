@@ -3020,17 +3020,19 @@ def _triage_file_verdicts(src, total=False):
         repo = load_module(src)
         body = ast.parse(textwrap.dedent(src)).body
     except SyntaxError:
-        return []
-    out = []
+        return [], {}
+    out, locmap = [], {}
     for n in body:
         if isinstance(n, ast.FunctionDef) and n.name in repo:
             out.append((n.name, _guarded_fn_check(n, repo[n.name], repo, n.name, total), repo[n.name], repo, n.name, "function", None))
+            locmap[n.name] = (None, n.lineno)
         elif isinstance(n, ast.ClassDef):
             for m in n.body:                                 # the module source + class name, so a method finding
                 if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):   # confirms on a real constructed instance
                     v, ms = _guarded_method_verdict(src, n, m, total)   # standalone + heap driver, under the unit budget
                     out.append(("%s.%s" % (n.name, m.name), v, ms, {}, m.name, "method", (src, n.name)))
-    return out
+                    locmap["%s.%s" % (n.name, m.name)] = (None, m.lineno)
+    return out, locmap
 
 
 def _is_test_module(modname):
@@ -3138,12 +3140,13 @@ _UNIT_POOL_STALL_S = 180.0      # no result and no worker death for this long: a
 #                                 C call; mark the remaining units UNKNOWN and stop, rather than hang the scan
 
 
-def _run_unit_pool(tasks, repo, modules, total, n):
+def _run_unit_pool(tasks, repo, modules, total, n, progress=None, done0=0, ntotal=None):
     """Triage the unit tasks across a supervised spawn pool that tolerates a worker dying mid-unit. Each worker
     records the index of the unit it is on in a shared slot; when it aborts (a z3 SIGABRT no in-process bound can
     catch, an OOM kill, a segfault), the supervisor marks exactly that unit UNKNOWN, respawns the worker, and the
     rest of the units -- queued or on other workers -- are unaffected. Returns a lite row per task, in task
-    order (so a non-crashing unit's row is identical to the serial path)."""
+    order (so a non-crashing unit's row is identical to the serial path). `progress(done0 + completed, ntotal)`
+    is called as units finish, so a caller counting cache hits in done0 can report whole-scan progress."""
     import multiprocessing as _mp
     import time as _time
     from . import _partriage
@@ -3164,6 +3167,8 @@ def _run_unit_pool(tasks, repo, modules, total, n):
 
     workers = [_spawn(i) for i in range(n)]
     ntasks = len(tasks)
+    if ntotal is None:
+        ntotal = ntasks
     respawn_cap = ntasks + 4 * n + 8                          # each genuine crash consumes a task; far beyond this is
     respawns = 0                                              # a worker dying without progress -- stop, do not spin
     last = _time.monotonic()
@@ -3174,6 +3179,8 @@ def _run_unit_pool(tasks, repo, modules, total, n):
         if nd != last_done:
             last_done = nd
             last = _time.monotonic()
+            if progress:
+                progress(done0 + nd, ntotal)
         for i, w in enumerate(workers):
             if not w.is_alive():                             # a worker aborted/exited: the unit it recorded in
                 cur = current[i]                             # current[i] is the casualty -- mark only that one
@@ -3197,40 +3204,140 @@ def _run_unit_pool(tasks, repo, modules, total, n):
         mgr.shutdown()
     except Exception:
         pass
+    if progress and last_done < ntasks:                      # the in-loop report already hit ntotal unless we broke
+        progress(done0 + ntasks, ntotal)                     # out early (a stall); then account for the crash rows
     return out
 
 
-def _triage_repo_verdicts(root, total=False, jobs=None):
+def _unit_cache_keyer(repo, modules, execute, total):
+    """Return key(task): a content-addressed cache key for a scan unit, or None when it is not cacheable. A
+    function keys on its closure hash (its own source and every function it inlines, so a verdict is reused only
+    when the whole inlined closure is byte-identical -- the same soundness verify_repo's cache uses); a method
+    keys on its own module's full source plus its class/method name (a method is triaged with its whole module
+    as context, so any change to that module re-triages it). The key is prefixed with the execution mode and the
+    totality flag, since both change the verdict, so a symbolic and an --execute cache never cross-contaminate."""
+    closure_hash, _ = _closure_hasher(repo)
+    pref = "%s%d\0" % ("x" if execute else "s", 1 if total else 0)
+
+    def key(task):
+        modname, kind = task[0], task[1]
+        if kind == "F":
+            mk = _mangle(modname, task[2])
+            return pref + closure_hash(mk) if mk in repo else None
+        cname, mname = task[2], task[3]
+        blob = "M\0%s\0%s\0%s" % (cname, mname, modules.get(modname, ""))
+        return pref + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    return key
+
+
+def _verdict_to_cache(v):
+    """A scan unit's (non-REFUTED) verdict as a JSON-serializable record; only the fields a re-expanded row and
+    the proved/unknown tally consult. A REFUTED verdict is never cached, so a finding's counterexample / repro is
+    always recomputed fresh and no sampled witness has to round-trip through the cache file."""
+    return {"status": v.status, "prop": v.prop, "target": v.target, "technique": v.technique, "reason": v.reason}
+
+
+def _verdict_from_cache(d):
+    """Rebuild a Verdict from a _verdict_to_cache record (a cache hit, always non-REFUTED)."""
+    return Verdict(d["status"], d.get("prop"), d.get("target"), d.get("technique"), reason=d.get("reason"))
+
+
+def _row_from_cache(task, repo, modules, v):
+    """The lite triage row for a cache hit -- the structural fields of _unit_lite_row with the cached verdict
+    substituted for the solve. A hit is always non-REFUTED, so a method row's source slot (consulted only when a
+    finding is built) is never read and stays empty."""
+    modname, kind = task[0], task[1]
+    if kind == "F":
+        key = _mangle(modname, task[2])
+        return (modname, "%s.%s" % (modname, task[2]), v, key, key, "function", None)
+    cname, mname = task[2], task[3]
+    return (modname, "%s.%s.%s" % (modname, cname, mname), v, "", mname, "method", cname)
+
+
+def _unit_line(modname, modules, line_idx, kind, fname, cname):
+    """The source line of a unit's def in its module, for a finding's physical location (SARIF). The module is
+    parsed once and its def lines memoized in line_idx."""
+    idx = line_idx.get(modname)
+    if idx is None:
+        idx = {}
+        try:
+            for n in ast.parse(modules[modname]).body:
+                if isinstance(n, ast.FunctionDef):
+                    idx[("F", _mangle(modname, n.name))] = n.lineno   # a function row's fname slot is its mangled key
+                elif isinstance(n, ast.ClassDef):
+                    for m in n.body:
+                        if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            idx[("M", n.name, m.name)] = m.lineno
+        except (SyntaxError, KeyError):
+            pass
+        line_idx[modname] = idx
+    return idx.get(("F", fname)) if kind == "function" else idx.get(("M", cname, fname))
+
+
+def _triage_repo_verdicts(root, total=False, jobs=None, cache=None, progress=None):
     """Trap-freedom triage of a package tree, keeping for each function its Verdict plus the source, repo,
-    name, and kind a scan needs to confirm and reproduce a finding. Reuses the same cross-module load_program
-    resolution and the same check, so a callee's trap is seen at the call site. jobs > 1 (or the jobs=None auto
-    default, on a repo of at least _PAR_TRIAGE_MIN_MODULES modules) triages the units across a crash-tolerant
-    spawn pool capped at the CPU count: per-unit work, so a worker that aborts (a z3 SIGABRT no in-process bound
-    can catch) costs only that one unit (UNKNOWN), not the run -- and every unit that does not crash gets a row
-    identical to the serial path. A pool that cannot start falls back to serial."""
+    name, and kind a scan needs to confirm and reproduce a finding, and a {label: (module, line)} location map.
+    Reuses the same cross-module load_program resolution and the same check, so a callee's trap is seen at the
+    call site. jobs > 1 (or the jobs=None auto default, on a repo of at least _PAR_TRIAGE_MIN_MODULES modules)
+    triages the units across a crash-tolerant spawn pool capped at the CPU count: per-unit work, so a worker that
+    aborts (a z3 SIGABRT no in-process bound can catch) costs only that one unit (UNKNOWN), not the run -- and
+    every unit that does not crash gets a row identical to the serial path. A pool that cannot start falls back to
+    serial. `cache`, a {content_key: verdict_record} dict reused and updated in place, skips re-triaging a unit
+    whose source and inlined closure are byte-identical to a previous run (only its non-REFUTED verdicts are
+    stored, so findings stay fresh). `progress(done, total)` is called as units are decided."""
     modules = repo_modules(root)
     repo = load_program(modules, on_collision="skip")         # a scan tolerates a rare mangle collision, not crash
     items = [(m, src, total) for m, src in sorted(modules.items()) if not _is_test_module(m)]
+    tasks = _build_unit_tasks(items, repo)
+    ntotal = len(tasks)
+    keyfn = _unit_cache_keyer(repo, modules, core.SANDBOX_SUBJECT, total) if cache is not None else None
+    keys = [keyfn(t) for t in tasks] if keyfn else None
+    lite = [None] * ntotal
+    miss = []
+    for i, t in enumerate(tasks):                             # split cache hits (reuse the verdict) from misses
+        if keys and keys[i] is not None and keys[i] in cache:
+            lite[i] = _row_from_cache(t, repo, modules, _verdict_from_cache(cache[keys[i]]))
+        else:
+            miss.append(i)
+    done0 = ntotal - len(miss)
+    if progress:
+        progress(done0, ntotal)
+    miss_tasks = [tasks[i] for i in miss]
     if jobs is None:                                          # auto: parallelize a sizable repo, serial otherwise
         want = (os.cpu_count() or 1) if len(items) >= _PAR_TRIAGE_MIN_MODULES else 1
     else:
         want = jobs
-    n = min(want, len(items), os.cpu_count() or 1) if (want and want > 1) else 1
-    lite = None
-    if n > 1:
+    n = min(want, len(miss_tasks), os.cpu_count() or 1) if (want and want > 1) else 1
+    miss_rows = None
+    if n > 1 and miss_tasks:
         try:                                                  # per-unit tasks across the supervised, crash-tolerant
-            lite = _run_unit_pool(_build_unit_tasks(items, repo), repo, modules, total, n)   # pool (_run_unit_pool)
+            miss_rows = _run_unit_pool(miss_tasks, repo, modules, total, n,   # pool (_run_unit_pool)
+                                       progress=progress, done0=done0, ntotal=ntotal)
         except Exception:
-            lite = None                                       # a pool that cannot start: fall through to serial
-    if lite is None:
-        lite = [r for m, src, _t in items for r in _module_rows(m, src, repo, total)]
-    out = []
+            miss_rows = None                                  # a pool that cannot start: fall through to serial
+    if miss_rows is None:
+        miss_rows = []
+        for k, t in enumerate(miss_tasks):
+            try:
+                row = _unit_lite_row(t, repo, modules, total)
+            except BaseException:
+                row = _crash_unknown(t)
+            miss_rows.append(row)
+            if progress and (k % 16 == 0 or k + 1 == len(miss_tasks)):
+                progress(done0 + k + 1, ntotal)
+    for j, i in enumerate(miss):                              # place misses back at their task index; cache the
+        lite[i] = miss_rows[j]                                # cheap-to-serialize non-REFUTED verdicts
+        if cache is not None and keys[i] is not None and miss_rows[j][2].status != REFUTED:
+            cache[keys[i]] = _verdict_to_cache(miss_rows[j][2])
+    out, locmap, line_idx = [], {}, {}
     for (modname, label, v, srcref, fname, kind, cname) in lite:    # re-expand to the full scan rows (repo /
         if kind == "function":                                     # module source filled here, not shipped per row)
             out.append((label, v, repo[srcref], repo, fname, "function", None))
         else:
             out.append((label, v, srcref, {}, fname, "method", (modules[modname], cname)))
-    return out
+        locmap[label] = (modname, _unit_line(modname, modules, line_idx, kind, fname, cname))
+    return out, locmap
 
 
 def _has_explicit_raise(src, exc):
@@ -3633,7 +3740,7 @@ def _resolve_scan_target(target):
     return tmp, None, tmp, True
 
 
-def scan(target, execute=False, total=False, jobs=None):
+def scan(target, execute=False, total=False, jobs=None, cache=None, progress=None):
     """Point Touchstone at a target and return a ranked trap-freedom bug report. The target is resolved
     leniently, so exact URL formatting is not required: an `owner/repo` slug, a scheme-less or full GitHub URL
     (a repo, a blob file link, a tree directory link, or any other page -- reduced to what it references), a
@@ -3647,18 +3754,23 @@ def scan(target, execute=False, total=False, jobs=None):
     `input-validation`; anything the sandbox cannot reproduce stays `unconfirmed`. Findings are ranked bugs
     first; a replayable one carries a runnable repro test and the source. The repo triage runs in parallel by
     default (a spawn pool capped at the CPU count); pass jobs to set the worker count, or jobs=1 to force serial.
+    `cache`, a dict reused across runs (the CLI persists it as JSON), makes a re-scan incremental -- a unit whose
+    source and inlined closure are byte-identical to the cached run is not re-triaged. `progress(done, total)` is
+    called as units are decided, for a live counter on a long scan.
 
     Returns {target, fetched, executed, functions, proved, refuted, unknown, bugs, input_validation,
-    unconfirmed, findings}, each finding {location, kind, classification, exception, counterexample, witness,
-    reason, repro, source, severity, label}."""
+    unconfirmed, findings}, each finding {location, module, line, kind, classification, exception,
+    counterexample, witness, reason, repro, source, severity, label}."""
     import shutil
     path, single_src, tmp, fetched = _resolve_scan_target(target)
     saved = (core.SANDBOX_SUBJECT, core.ALLOW_SUBJECT_EXECUTION)
     core.SANDBOX_SUBJECT = bool(execute)                        # execute -> sandbox replay + oracle on; else the
     core.ALLOW_SUBJECT_EXECUTION = False                        # code is never run (no in-process path either)
     try:
-        rows = _triage_file_verdicts(single_src, total=total) if single_src is not None \
-            else _triage_repo_verdicts(path, total=total, jobs=jobs)
+        if single_src is not None:
+            rows, locmap = _triage_file_verdicts(single_src, total=total)
+        else:
+            rows, locmap = _triage_repo_verdicts(path, total=total, jobs=jobs, cache=cache, progress=progress)
         findings = [_build_finding(label, v, fsrc, frepo, fname, kind, execute, classinfo)
                     for label, v, fsrc, frepo, fname, kind, classinfo in rows if v.status == REFUTED]
         n_refuted = len(findings)
@@ -3693,11 +3805,30 @@ def scan(target, execute=False, total=False, jobs=None):
     proved = sum(1 for r in rows if r[1].status == PROVED)
     unknown = sum(1 for r in rows if r[1].status == UNKNOWN)
     findings.sort(key=lambda f: (-f["rank"], f["location"]))
+    for f in findings:                                          # attach the source location (module path + def line)
+        f["module"], f["line"] = locmap.get(f["location"], (None, None))   # for SARIF and a richer report
     cls = lambda c: sum(1 for f in findings if f["classification"] == c)
     return {"target": target, "fetched": fetched, "executed": bool(execute),
             "functions": len(rows), "proved": proved, "refuted": n_refuted, "unknown": unknown,
             "bugs": cls("bug"), "input_validation": cls("input-validation"), "unconfirmed": cls("unconfirmed"),
             "context_unreachable": cls("context-unreachable"), "suspected": cls("suspected"), "findings": findings}
+
+
+def finding_fingerprint(f):
+    """A stable identity for a scan finding across runs -- the trap site (its dotted location) and the exception
+    kind, independent of the sampled counterexample -- so a baseline can suppress findings already seen and fail
+    only on a new one. The same trap reported on two runs has the same fingerprint even if the witness differs."""
+    return "%s|%s" % (f.get("location", ""), f.get("exception") or f.get("classification") or "")
+
+
+def baseline_partition(findings, baseline):
+    """Split findings into (new, known) against a baseline -- an iterable of fingerprints from a prior run. A
+    finding is `known` when its fingerprint is in the baseline, else `new`. Order within each list is preserved."""
+    seen = set(baseline or ())
+    new, known = [], []
+    for f in findings:
+        (known if finding_fingerprint(f) in seen else new).append(f)
+    return new, known
 
 
 def verify_system(prop, target, repo, contracts) -> Verdict:
@@ -8785,6 +8916,8 @@ __all__ = [
     'verify_diff',
     'coverage',
     'scan',
+    'finding_fingerprint',
+    'baseline_partition',
     'verify_system',
     'verify_optional',
     'opt_none',

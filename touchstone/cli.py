@@ -11,7 +11,7 @@
 
   triage across a tree:
     touchstone repo       DIR [--total] [--changed PATHS] [--jobs N]       trap freedom of every top-level function in a package
-    touchstone scan       TARGET [--execute] [--repro]                     reachable traps in an owner/repo, a URL, or a local path
+    touchstone scan       TARGET [--execute] [--cache F] [--baseline F] [--sarif]   reachable traps in a repo / URL / path
     touchstone gate       [DIR] [--base REF] [--changed PATHS]             verify each changed function (an AI-diff / PR gate)
     touchstone coverage   DIR [--history FILE] [--jobs N]                  verified-subset coverage of a package, tracked over time
 
@@ -389,6 +389,10 @@ def _cmd_repo(a):
         except OSError:
             pass
     tally = Counter(s for _, s in rows)
+    if getattr(a, "sarif", False):
+        from . import sarif as _sarif
+        print(json.dumps(_sarif.rows_to_sarif(rows)))
+        return 1 if tally.get("REFUTED") else 0
     if a.json:
         print(json.dumps({"tally": dict(tally),
                           "functions": [{"name": n, "status": s} for n, s in rows]}))
@@ -409,13 +413,42 @@ def _cmd_scan(a):
     """Point at a repo URL, a .py file URL, or a local path and report the reachable traps, classified.
     Symbolic by default (the fetched code is never run); --execute replays each finding in the isolated
     sandbox to confirm the exception and split genuine bugs from intended input validation. Exit status is
-    nonzero on a confirmed bug (or, symbolic-only, any reachable trap); --repro prints a runnable failing
-    test for each confirmed finding."""
+    nonzero on a confirmed bug (or, symbolic-only, any reachable trap); with --baseline, only on a finding not
+    already recorded there. --cache makes a re-scan incremental, --jobs sets the worker count, --progress shows
+    a live counter, --sarif emits a code-scanning log, and --repro a runnable failing test per finding."""
+    cache = _load_json(a.cache, {}) if a.cache else None
+    progress = None
+    if a.progress:
+        def progress(done, total):
+            pct = (100 * done // total) if total else 100
+            print("\rtriaged %d/%d units (%d%%)" % (done, total, pct),
+                  end=("\n" if done >= total else ""), file=sys.stderr, flush=True)
     try:
-        rep = t.scan(a.target, execute=a.execute)
+        rep = t.scan(a.target, execute=a.execute, jobs=a.jobs, cache=cache, progress=progress)
     except ValueError as e:
         _die(str(e))
-    fail = bool(rep["bugs"] or rep.get("suspected")) if rep["executed"] else bool(rep["refuted"])
+    if cache is not None:
+        _dump_json(a.cache, cache)
+    findings = rep["findings"]
+    new_findings = None
+    if a.baseline:                                          # split findings against the recorded baseline; only a
+        new_findings, known = t.baseline_partition(findings, _load_json(a.baseline, []))   # new one fails the gate
+        for f in known:
+            f["baselined"] = True
+        if a.update_baseline:                              # establishing/refreshing: record the current state and
+            _dump_json(a.baseline, sorted({t.finding_fingerprint(f) for f in findings}))   # accept it (nothing is new)
+            for f in findings:
+                f["baselined"] = True
+            new_findings = []
+
+    def _fail(fs):                                          # executed: a confirmed/suspected bug; symbolic: any trap
+        return any(f["classification"] in ("bug", "suspected") for f in fs) if rep["executed"] else bool(fs)
+    fail = _fail(new_findings if a.baseline else findings)
+
+    if a.sarif:
+        from . import sarif as _sarif
+        print(json.dumps(_sarif.scan_to_sarif(rep)))
+        return 1 if fail else 0
     if a.json:
         print(json.dumps(rep))
         return 1 if fail else 0
@@ -427,9 +460,15 @@ def _cmd_scan(a):
     if rep["executed"]:
         print("  classified: %d bug(s), %d suspected, %d input-validation, %d unconfirmed"
               % (rep["bugs"], rep.get("suspected", 0), rep["input_validation"], rep["unconfirmed"]))
+    if a.baseline and a.update_baseline:
+        print("  baseline: recorded %d finding(s) to %s" % (len(findings), a.baseline))
+    elif a.baseline:
+        print("  baseline: %d new, %d known (%s)" % (len(new_findings), len(findings) - len(new_findings), a.baseline))
     for f in rep["findings"]:
         exc = "  [%s]" % f["exception"] if f["exception"] else ""
-        print("  %s  %s%s" % (_paint(_SCAN_TAG.get(f["classification"], "REFUTED")), f["location"], exc))
+        tag = "  (baselined)" if f.get("baselined") else ""
+        loc = f["location"] + (":%d" % f["line"] if f.get("line") else "")
+        print("  %s  %s%s%s" % (_paint(_SCAN_TAG.get(f["classification"], "REFUTED")), loc, exc, tag))
         print("      %s" % f["label"])
         if f["counterexample"]:
             print("      counterexample: %s" % f["counterexample"])
@@ -461,9 +500,13 @@ def _cmd_gate(a):
             _die("git diff failed: %s" % r.stderr.strip())
         files = [l.strip() for l in r.stdout.splitlines() if l.strip().endswith(".py")]
     if not files:
-        print("gate: no changed .py files")
+        if a.sarif:
+            from . import sarif as _sarif
+            print(json.dumps(_sarif.rows_to_sarif([])))
+        else:
+            print("gate: no changed .py files")
         return 0
-    refuted, bundles = [], []
+    refuted, bundles, gate_rows = [], [], []
     for f in files:
         try:
             with open(os.path.join(a.dir, f), encoding="utf-8") as fh:
@@ -483,10 +526,12 @@ def _cmd_gate(a):
                 v = t.check(after, target=n.name, prop="trap freedom")   # a new function: trap freedom
                 kind = "new"
             label = "%s::%s" % (f, n.name)
-            print("%-8s %s (%s)" % (v.status, label, kind))
+            gate_rows.append((label, v.status))
+            if not a.sarif:
+                print("%-8s %s (%s)" % (v.status, label, kind))
             if v.status == "REFUTED":
                 refuted.append(label)
-                if v.counterexample:
+                if v.counterexample and not a.sarif:
                     print("    counterexample: %s" % v.counterexample)
             elif a.bundle and v.status == "PROVED" and kind == "change":
                 b = t.change_bundle(before, after, func=n.name, label=label)
@@ -499,6 +544,10 @@ def _cmd_gate(a):
                 json.dump(bundles, fh)
         except OSError:
             pass
+    if a.sarif:
+        from . import sarif as _sarif
+        print(json.dumps(_sarif.rows_to_sarif(gate_rows)))
+        return 1 if refuted else 0
     print("--- gate: %d function(s) refuted, %d proof bundle(s) ---" % (len(refuted), len(bundles)))
     return 1 if refuted else 0
 
@@ -727,6 +776,8 @@ def build_parser():
     rp.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
                     help="triage across N worker processes (capped at the CPU count); the verdicts are identical "
                          "to a serial run")
+    rp.add_argument("--sarif", action="store_true",
+                    help="emit a SARIF 2.1.0 log (one result per refuted function) for code scanning")
     rp.set_defaults(fn=_cmd_repo)
 
     sc = sub.add_parser("scan",
@@ -738,6 +789,19 @@ def build_parser():
                          "bugs from intended input validation (default: symbolic only, code never run)")
     sc.add_argument("--repro", action="store_true", help="print a runnable failing test for each finding")
     sc.add_argument("--json", action="store_true", help="emit the full report as one JSON object")
+    sc.add_argument("--sarif", action="store_true",
+                    help="emit the findings as a SARIF 2.1.0 log (for GitHub code scanning or any SARIF viewer)")
+    sc.add_argument("--jobs", "-j", type=int, default=None, metavar="N",
+                    help="triage across N worker processes (default: auto -- the CPU count on a sizable repo, "
+                         "serial on a small one); jobs=1 forces serial")
+    sc.add_argument("--cache", default=None, metavar="FILE",
+                    help="reuse and update a content-addressed verdict cache so a re-scan only re-triages changed code")
+    sc.add_argument("--progress", action="store_true", help="print a live triaged-units counter to stderr")
+    sc.add_argument("--baseline", default=None, metavar="FILE",
+                    help="a JSON list of known-finding fingerprints; report all findings but exit nonzero only on "
+                         "one not in it (adopt a scan on a large repo without fixing every finding at once)")
+    sc.add_argument("--update-baseline", action="store_true",
+                    help="(re)write the --baseline file from this run's findings, then pass -- establishes or refreshes it")
     sc.set_defaults(fn=_cmd_scan)
 
     gt = sub.add_parser("gate", help="gate a diff: verify each changed function preserves its properties "
@@ -748,6 +812,8 @@ def build_parser():
                     help="comma-separated changed files, instead of computing the git diff")
     gt.add_argument("--bundle", default=None, metavar="DIR",
                     help="write re-checkable proof bundles for the verified changes to DIR")
+    gt.add_argument("--sarif", action="store_true",
+                    help="emit a SARIF 2.1.0 log (one result per refuted change) for code scanning")
     gt.set_defaults(fn=_cmd_gate)
 
     cv = sub.add_parser("coverage",

@@ -101,6 +101,12 @@ also emits a runnable failing test that reproduces it. An UNKNOWN is labeled `bu
 `approximation` (a sound over-approximation it will not certify), or `unmodeled` (a construct outside the
 subset, named with its line) so the next step is clear.
 
+For triage at scale, `scan` and `repo` emit `--sarif` (a SARIF 2.1.0 log for GitHub code scanning or any
+viewer); `scan --cache FILE` reuses a content-addressed verdict cache so a re-scan only re-triages changed
+code; `scan --baseline FILE` reports every finding but exits nonzero only on one not already recorded, to
+adopt the scan on a large codebase without fixing every finding at once; and `--jobs N` / `--progress` set
+the worker count and print a live triaged-units counter.
+
 Plain `prove` / `check` analyze symbolically and spawn nothing. `verify_repo(..., jobs=N)` (the `repo` verb's
 parallel triage) and the out-of-process sandbox (only when subject execution is enabled — the differential
 oracle, a recursive-callee trap fallback, `scan --execute`) use the multiprocessing **spawn** start method,
