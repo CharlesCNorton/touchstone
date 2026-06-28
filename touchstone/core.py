@@ -11,6 +11,7 @@ import sys
 import textwrap
 from fractions import Fraction as _Fr
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Callable, Dict, List, Optional, Tuple
 import z3
 
@@ -514,7 +515,29 @@ def _subst_names(node, mapping):
     return _S().visit(node)
 
 
-def _parse(src: str) -> ast.Module:
+def _clone_ast(node):
+    """A fast deep copy of an AST node -- ~4x quicker than copy.deepcopy (no __reduce__ / memo machinery):
+    fresh node objects and lists, with immutable leaf values (a Constant's value, identifier strings) shared.
+    This is the independent tree _parse hands out, so a caller's mutation never reaches the memoized template."""
+    if isinstance(node, ast.AST):
+        new = node.__class__()
+        for field in node._fields:
+            setattr(new, field, _clone_ast(getattr(node, field, None)))
+        for attr in node._attributes:
+            if hasattr(node, attr):
+                setattr(new, attr, getattr(node, attr))
+        return new
+    if type(node) is list:
+        return [_clone_ast(x) for x in node]
+    return node
+
+
+@lru_cache(maxsize=256)
+def _parse_template(src: str) -> ast.Module:
+    """The desugared parse of `src`, memoized: the engine re-parses the same source dozens of times per
+    function (check, symexec, the definite-assignment / self-recursion / use-before-def predicates). The
+    template is never handed out directly -- _parse returns a fast deep clone -- so a caller that mutates its
+    tree (symexec's async strip, a contract-decorator strip) cannot corrupt the cache or another caller's tree."""
     parsed = ast.parse(textwrap.dedent(src))
     classes = {n.name: n for n in parsed.body if isinstance(n, ast.ClassDef)}
     suppress_names = {a.asname or a.name for n in ast.walk(parsed)        # `from contextlib import suppress`
@@ -522,6 +545,10 @@ def _parse(src: str) -> ast.Module:
                       for a in n.names if a.name == "suppress"}
     tree = _Desugar(classes, suppress_names).visit(parsed)
     return ast.fix_missing_locations(tree)
+
+
+def _parse(src: str) -> ast.Module:
+    return _clone_ast(_parse_template(src))
 
 
 def _fndef(src: str):
