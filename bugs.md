@@ -135,3 +135,62 @@ Crashes found by `touchstone scan` in third-party code.
 - `pandapower/pf/run_bfswpf.py` — `_get_options(options={})` → KeyError: 'enforce_q_lims'
 - `pandapower/results.py` — `_get_costs(net=0, ppc={4: 2})` → KeyError: 'obj'
 - `pandapower/results.py` — `_ppci_other_to_ppc(result={}, ppc={}, mode=b   )` → KeyError: 'success'
+
+## sympy/sympy
+
+- `sympy/combinatorics/permutations.py` — `_af_invert(a=[-2, 8, 2, 1])` → IndexError
+- `sympy/combinatorics/permutations.py` — `_af_rmul(a=[-2, 8, 2, 1], b=[5, 8])` → IndexError
+- `sympy/combinatorics/tensor_can.py` — `dummy_sgs(dummies=[8, 2, 1, 2], sym=2, n=1)` → ValueError
+- `sympy/crypto/crypto.py` — `cycle_list(k=0, n=0)` → ZeroDivisionError
+- `sympy/crypto/crypto.py` — `decipher_kid_rsa(msg=0, key=[-2, 8, 2, 1])` → ValueError
+- `sympy/crypto/crypto.py` — `encipher_kid_rsa(msg=0, key=[-2, 8, 2, 1])` → ValueError
+- `sympy/crypto/crypto.py` — `kid_rsa_private_key(a=1, b=1, A=0, B=0)` → ZeroDivisionError ([#29975](https://github.com/sympy/sympy/pull/29975))
+- `sympy/crypto/crypto.py` — `kid_rsa_public_key(a=1, b=1, A=0, B=0)` → ZeroDivisionError ([#29975](https://github.com/sympy/sympy/pull/29975))
+- `sympy/integrals/intpoly.py` — `cross_product(v1=[], v2=[], v3=[-2, 8, 2, 1])` → IndexError
+- `sympy/logic/boolalg.py` — `_check_pair(minterm1=[-2, 8, 2, 1], minterm2=[5, 8])` → IndexError
+- `sympy/matrices/expressions/slice.py` — `slice_of_slice(s=[], t=[])` → ValueError
+- `sympy/ntheory/residue_ntheory.py` — `_discrete_log_trial_mul(n=0, a=0, b=0, order=0)` → ZeroDivisionError
+- `sympy/physics/quantum/qasm.py` — `get_index(target=0, labels=[-2, 8, 2, 1])` → ValueError
+- `sympy/plotting/pygletplot/plot_rotation.py` — `cross(a=[], b=[])` → IndexError
+- `sympy/plotting/pygletplot/plot_rotation.py` — `dot(a=[], b=[])` → IndexError
+- `sympy/plotting/pygletplot/util.py` — `interpolate_color(color1=[], color2=[], ratio=7)` → IndexError
+- `sympy/plotting/pygletplot/util.py` — `scale_value(v=0, v_min=0, v_len=0)` → ZeroDivisionError
+- `sympy/plotting/pygletplot/util.py` — `scale_value_list(flist=[])` → ValueError
+- `sympy/plotting/pygletplot/util.py` — `vec_sub(v1=[], v2=[])` → IndexError
+- `sympy/plotting/pygletplot/util.py` — `vec_subs(a=[-2, 8, 2, 1], b=[5, 8])` → IndexError
+- `sympy/plotting/textplot.py` — `linspace(start=0, stop=0, num=1)` → ZeroDivisionError
+- `sympy/polys/distributedmodules.py` — `sdm_LT(f=[])` → IndexError
+- `sympy/polys/distributedmodules.py` — `sdm_monomial_lcm(A=[], B=[])` → IndexError
+- `sympy/polys/distributedmodules.py` — `sdm_monomial_mul(M=[], X=7)` → IndexError
+- `sympy/polys/groebnertools.py` — `Num(f=[])` → IndexError
+- `sympy/polys/groebnertools.py` — `Polyn(f=[])` → IndexError
+- `sympy/polys/groebnertools.py` — `Sign(f=[])` → IndexError
+- `sympy/polys/rootisolation.py` — `_disjoint_p(M=[], N=[], strict=7)` → ValueError
+- `sympy/polys/rootisolation.py` — `_mobius_from_interval(I=[], field=7)` → ValueError
+- `sympy/series/formal.py` — `_apply_scale(sol=[-2, 8, 2, 1], scale=-1)` → TypeError
+- `sympy/solvers/diophantine/diophantine.py` — `_nint_or_floor(p=0, q=0)` → ZeroDivisionError
+- `sympy/solvers/diophantine/diophantine.py` — `divisible(a=0, b=0)` → ZeroDivisionError
+- `sympy/solvers/diophantine/diophantine.py` — `equivalent(u=-1, v=-1, r=2, s=2, D=-1, N=0)` → ZeroDivisionError
+- `sympy/stats/rv.py` — `rs_swap(a=[-2, 7], b=[])` → IndexError
+- `sympy/tensor/array/expressions/utils.py` — `_build_push_indices_down_func_transformation(flattened_contraction_indices=[])` → IndexError
+- `sympy/unify/core.py` — `index(it=[-2, 8, 2, 1], ind=[5, 8])` → IndexError
+- `sympy/vector/coordsysrect.py` — `_check_strings(arg_name=0, arg=[-2, 8, 2, 1])` → TypeError
+
+## voxel51/fiftyone
+
+- `fiftyone/core/dataset.py` — `_make_frame_collection_name(sample_collection_name=0)` → TypeError
+- `fiftyone/core/models.py` — `_patch_collate_fn(batch=[])` → IndexError
+- `fiftyone/multimodal/tags/_temporal_tags.py` — `_query_from_unique_key(key=[])` → ValueError
+- `fiftyone/multimodal/tags/_temporal_tags.py` — `_unique_key(doc={})` → KeyError
+- `fiftyone/multimodal/tags/_temporal_tags.py` — `_unique_query(doc={})` → KeyError
+- `fiftyone/utils/aws.py` — `_do_s3_download(args=[])` → ValueError
+- `fiftyone/utils/iou.py` — `_float_to_pixel(gt_bb=[], img_w=7, img_h=7)` → IndexError ([#7906](https://github.com/voxel51/fiftyone/pull/7906))
+- `fiftyone/utils/kitti.py` — `_swap_coordinates(vec=[])` → IndexError
+- `fiftyone/utils/labelstudio.py` — `_check_type(label=[], label_type=7, label_type_multiple=7)` → TypeError
+- `fiftyone/utils/scale.py` — `_make_bbox(bounding_box=[], frame_size=[])` → ValueError
+- `fiftyone/utils/scale.py` — `_make_point(point=[], frame_size=[])` → ValueError
+- `fiftyone/utils/scale.py` — `_parse_bbox(anno={}, frame_size=[])` → ValueError
+- `fiftyone/utils/scale.py` — `_parse_point(vertex={}, frame_size=[])` → ValueError
+- `fiftyone/utils/scale.py` — `_parse_video_bbox(anno={}, frame_size=[])` → ValueError
+- `fiftyone/utils/transformers.py` — `_convert_bounding_box(box=[], image_shape=[])` → ValueError
+- `fiftyone/utils/utils3d.py` — `_classify_point_to_plane(point=[], plane=[], normal=7, axis=7)` → IndexError
