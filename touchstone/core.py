@@ -38,6 +38,16 @@ CHECK_MACHINE_OVERFLOW = True            # run the fixed-width companion alongsi
 MACHINE_WIDTH = 64                       # default signed width for that companion (no per-call choice)
 SANDBOX_SUBJECT = True                   # run the concrete differential check in an isolated process,
 #                                          which lets it default on without trusting the subject in-process
+# Scan triage budgets: a whole-repo scan triages every unit, so one pathological unit (a giant generated body or
+# a runaway engine path) must not stall or OOM the run. SCAN_UNIT_NODE_BUDGET is the deterministic primary guard
+# -- a unit whose AST exceeds it is skipped to UNKNOWN before any engine runs (reproducible). SCAN_UNIT_TIMEOUT_S
+# is a per-unit wall-clock backstop (SIGALRM, main thread only) for a small-but-pathological unit the size cap
+# misses; 0 disables it for a fully deterministic (rlimit-only) scan. Both are scan-only; a direct check / prove
+# is not bounded here and stays rlimit-bound.
+SCAN_UNIT_NODE_BUDGET = 10000            # skip (UNKNOWN) a scanned function / method whose AST exceeds this
+SCAN_UNIT_TIMEOUT_S = 30                 # per-unit wall-clock backstop for a scan; 0 disables
+_SCAN_CRASH_ON = None                    # test hook only: a scan unit whose label contains this aborts its worker,
+#                                          exercising the crash-tolerant pool (engines._run_unit_pool). None in use.
 # Solver tuning, configurable rather than hardcoded (see configure()).
 SOLVE_TIMEOUT_MS = 60000                 # wall-clock backstop only; the rlimit below is the binding,
 #                                          machine-independent cutoff, so this is set high to not bind first
@@ -56,6 +66,16 @@ _TRAPFREE = False                        # trap-freedom over-approximation: the 
 #                                          are checked by havoc, complex targets and unmodeled operations
 #                                          (opaque truthiness/equality, None/bytes) raise no trap. Set only by
 #                                          _trap_free_via_symexec, so the exact equivalence engines are unaffected.
+
+# z3's own memory cap (MB): a runaway engine path (e.g. a giant generated body unrolled into an enormous z3
+# term) grows z3-allocated memory unbounded -- neither the rlimit (it bounds solving work, not term building)
+# nor a wall-clock signal (a Unix signal is deferred through a long z3 C call) catches that. memory_max_size
+# makes z3 raise a catchable "out of memory" at the next allocation past the cap, so a scan degrades the unit
+# to UNKNOWN instead of OOMing the process. Caps only z3's own allocations (not the repo dict), so it is safe
+# on the serial path too; global and applied at import, so every spawn worker that re-imports the package gets
+# it without extra plumbing. Generous, so it binds only a genuine runaway, never a normal solve.
+Z3_MAX_MEMORY_MB = 3000
+z3.set_param("memory_max_size", Z3_MAX_MEMORY_MB)
 
 
 def configure(**kw):

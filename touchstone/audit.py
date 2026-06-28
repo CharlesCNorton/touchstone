@@ -3164,6 +3164,55 @@ def run_self_tests(fast=False):
     finally:
         _sh.rmtree(_dp, ignore_errors=True)
 
+    # per-unit scan budget: a unit whose AST exceeds core.SCAN_UNIT_NODE_BUDGET is skipped to UNKNOWN before any
+    # engine runs (deterministic), so one giant generated body cannot stall or OOM a whole-repo scan. A tiny
+    # budget skips even a small trap (every unit UNKNOWN, no findings); a large budget finds it. The wall-clock
+    # backstop is a separate opt-out net, not exercised here (these units finish instantly).
+    _db = _tf.mkdtemp(prefix="ts_budget_")
+    try:
+        open(_os.path.join(_db, "a.py"), "w").write("def trap(a, b):\n    return a // b\n")
+        open(_os.path.join(_db, "b.py"), "w").write("def ok(x):\n    return x + 1\n")
+        _saved_budget = core.SCAN_UNIT_NODE_BUDGET
+        try:
+            core.SCAN_UNIT_NODE_BUDGET = 100000                  # generous: the small trap is checked and refuted
+            _hi = scan(_db, execute=False, jobs=1)
+            core.SCAN_UNIT_NODE_BUDGET = 4                       # below every unit's node count: all skipped
+            _lo = scan(_db, execute=False, jobs=1)
+        finally:
+            core.SCAN_UNIT_NODE_BUDGET = _saved_budget
+        assert _hi["refuted"] == 1 and any(_f["location"] == "a.trap" for _f in _hi["findings"])
+        assert _lo["refuted"] == 0 and _lo["unknown"] == _lo["functions"]   # the budget skipped every unit to UNKNOWN
+    finally:
+        _sh.rmtree(_db, ignore_errors=True)
+
+    # per-unit crash tolerance: a unit that aborts its worker (a z3 SIGABRT no in-process bound can catch,
+    # simulated here through the _SCAN_CRASH_ON test hook) is isolated to UNKNOWN, while its module-siblings and
+    # the rest of the repo still triage. Force a crash on every 'boom' across a multi-module tree under the
+    # supervised pool (jobs > 1) and confirm only the booms are lost.
+    _dk = _tf.mkdtemp(prefix="ts_crash_")
+    try:
+        for _i in range(8):
+            open(_os.path.join(_dk, "m%d.py" % _i), "w").write(
+                "def boom(a, b):\n    return a // b\n"          # aborts its worker
+                "def fine(a, b):\n    return a // b\n"           # sibling: still REFUTED despite the crash
+                "def okay(x):\n    return x + 1\n")              # sibling: still PROVED
+        _saved_crash = core._SCAN_CRASH_ON
+        try:
+            core._SCAN_CRASH_ON = ".boom"
+            _ck = scan(_dk, execute=False, jobs=4)
+        finally:
+            core._SCAN_CRASH_ON = _saved_crash
+        _ckloc = {_f["location"] for _f in _ck["findings"]}
+        _crashed = not any(_loc.endswith(".boom") for _loc in _ckloc)             # booms -> UNKNOWN (the pool ran) vs
+        #                                          REFUTED (a bare `python -c` cannot spawn, so triage runs serial and
+        #                                          the worker-only hook never fires); assert isolation only when it ran
+        assert sum(1 for _i in range(8) if "m%d.fine" % _i in _ckloc) == 8        # every fine refuted, both ways
+        assert _ck["proved"] == 8                                                 # every okay proved, both ways
+        if _crashed:
+            assert _ck["refuted"] == 8 and _ck["unknown"] == 8                    # the 8 booms isolated to UNKNOWN
+    finally:
+        _sh.rmtree(_dk, ignore_errors=True)
+
     # verification-guided repair loop: a counterexample drives a generator to a verified result
     _attempts = iter(["def f(x):\n    return x + 1\n", "def f(x):\n    return 2 * x\n"])
     _r = repair_loop(lambda fb: next(_attempts), ensures="result == 2 * x")

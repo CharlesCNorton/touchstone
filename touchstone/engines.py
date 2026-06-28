@@ -4,6 +4,9 @@ contracts, arrays, termination and cost, bounded model checking, and the increme
 import ast
 import builtins as _builtins
 import copy
+import contextlib
+import signal
+import threading
 import hashlib
 import inspect
 import os
@@ -2861,6 +2864,72 @@ def _safe_check(src, repo, target, total):
         return Verdict(UNKNOWN, target or "f", target or "f", "scan", reason="check raised: %s" % type(e).__name__)
 
 
+class _UnitBudgetExceeded(BaseException):
+    """A scanned unit hit its per-unit wall-clock backstop. BaseException (not Exception) so an inner
+    `except Exception` deep in the cascade cannot swallow it -- it unwinds to the per-unit guard, which records
+    UNKNOWN. Scan-only; never raised on a direct check / prove."""
+
+
+@contextlib.contextmanager
+def _unit_deadline(seconds):
+    """Bound the wrapped per-unit work by `seconds` of wall-clock via SIGALRM, raising _UnitBudgetExceeded on
+    overrun. A no-op when seconds is falsey, where SIGALRM is unavailable, or off the main thread (an LSP / MCP
+    worker thread cannot take the signal) -- there the deterministic node budget is the only guard. The parallel
+    scan's spawn workers run each unit on their own main thread, so the backstop applies there."""
+    if not seconds or not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def _fire(signum, frame):
+        raise _UnitBudgetExceeded("unit exceeded the %gs scan wall-clock budget" % seconds)
+
+    old = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def _unit_over_budget(node):
+    """A reason string when the unit's AST node count exceeds SCAN_UNIT_NODE_BUDGET (the deterministic size cap),
+    else None: a giant generated body blows an engine up unbounded, so a scan skips it before any engine runs."""
+    budget = core.SCAN_UNIT_NODE_BUDGET
+    if not budget:
+        return None
+    n = sum(1 for _ in ast.walk(node))
+    return "exceeds the scan complexity budget (%d AST nodes > %d)" % (n, budget) if n > budget else None
+
+
+def _guarded_fn_check(node, src, repo, key, total):
+    """The scan-triage check for a top-level function under the per-unit budget: a unit over the deterministic
+    node budget, or one whose check overruns the wall-clock backstop, is abandoned to UNKNOWN (sound) rather than
+    left to stall or OOM the whole scan."""
+    over = _unit_over_budget(node)
+    if over is not None:
+        return Verdict(UNKNOWN, key or "f", key or "f", "scan", reason=over)
+    try:
+        with _unit_deadline(core.SCAN_UNIT_TIMEOUT_S):
+            return _safe_check(src, repo, key, total)
+    except _UnitBudgetExceeded as e:
+        return Verdict(UNKNOWN, key or "f", key or "f", "scan", reason=str(e))
+
+
+def _guarded_method_verdict(module_src, class_node, method_node, total):
+    """_method_verdict under the same per-unit budget. An over-budget method skips straight to UNKNOWN with an
+    empty standalone source -- an UNKNOWN unit yields no finding, so its source is never consulted, and the giant
+    body is never even re-emitted."""
+    over = _unit_over_budget(method_node)
+    if over is not None:
+        return Verdict(UNKNOWN, method_node.name, method_node.name, "scan", reason=over), ""
+    try:
+        with _unit_deadline(core.SCAN_UNIT_TIMEOUT_S):
+            return _method_verdict(module_src, class_node, method_node, total)
+    except _UnitBudgetExceeded as e:
+        return Verdict(UNKNOWN, method_node.name, method_node.name, "scan", reason=str(e)), ""
+
+
 def _heap_driver_worthwhile(method_node):
     """Whether the (solver-backed) heap driver can find a trap the standalone self-opaque check missed: only
     a subscript (IndexError / KeyError), a container-method call (pop / append / remove / ...), or a floor-
@@ -2955,11 +3024,11 @@ def _triage_file_verdicts(src, total=False):
     out = []
     for n in body:
         if isinstance(n, ast.FunctionDef) and n.name in repo:
-            out.append((n.name, _safe_check(repo[n.name], repo, n.name, total), repo[n.name], repo, n.name, "function", None))
+            out.append((n.name, _guarded_fn_check(n, repo[n.name], repo, n.name, total), repo[n.name], repo, n.name, "function", None))
         elif isinstance(n, ast.ClassDef):
             for m in n.body:                                 # the module source + class name, so a method finding
                 if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):   # confirms on a real constructed instance
-                    v, ms = _method_verdict(src, n, m, total)   # standalone, upgraded by the heap driver
+                    v, ms = _guarded_method_verdict(src, n, m, total)   # standalone + heap driver, under the unit budget
                     out.append(("%s.%s" % (n.name, m.name), v, ms, {}, m.name, "method", (src, n.name)))
     return out
 
@@ -2994,22 +3063,151 @@ def _module_rows(modname, src, repo, total):
             key = _mangle(modname, n.name)
             if key in repo:
                 out.append((modname, "%s.%s" % (modname, n.name),
-                            _safe_check(repo[key], repo, key, total), key, key, "function", None))
+                            _guarded_fn_check(n, repo[key], repo, key, total), key, key, "function", None))
         elif isinstance(n, ast.ClassDef):
             for m in n.body:
                 if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    v, ms = _method_verdict(src, n, m, total)   # standalone, upgraded by the heap driver
+                    v, ms = _guarded_method_verdict(src, n, m, total)   # standalone + heap driver, under the unit budget
                     out.append((modname, "%s.%s.%s" % (modname, n.name, m.name), v, ms, m.name, "method", n.name))
+    return out
+
+
+def _unit_lite_row(job, repo, modules, total, crash_on=None):
+    """Compute one unit's lite triage row -- the same tuple _module_rows emits. A function unit (job[1] == 'F')
+    is checked against the cross-module repo; a method unit ('M') is triaged standalone + heap driver. crash_on,
+    when a substring of the unit's label, aborts the process here: a test hook that exercises crash tolerance by
+    simulating a z3 SIGABRT on a chosen unit."""
+    modname, kind = job[0], job[1]
+    if kind == "F":
+        fname = job[2]
+        label = "%s.%s" % (modname, fname)
+        if crash_on and crash_on in label:
+            os._exit(134)
+        key = _mangle(modname, fname)
+        node = _fndef(repo[key])
+        return (modname, label, _guarded_fn_check(node, repo[key], repo, key, total), key, key, "function", None)
+    cname, mname = job[2], job[3]
+    label = "%s.%s.%s" % (modname, cname, mname)
+    if crash_on and crash_on in label:
+        os._exit(134)
+    cnode = next((c for c in ast.parse(modules[modname]).body
+                  if isinstance(c, ast.ClassDef) and c.name == cname), None)
+    mnode = next((m for m in cnode.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and m.name == mname), None) if cnode is not None else None
+    if mnode is None:                                            # the method went away (a parse quirk): abstain
+        return (modname, label, Verdict(UNKNOWN, mname, mname, "scan", reason="method not found"), "", mname, "method", cname)
+    v, ms = _guarded_method_verdict(modules[modname], cnode, mnode, total)
+    return (modname, label, v, ms, mname, "method", cname)
+
+
+def _crash_unknown(job):
+    """The lite row for a unit whose worker died on it (a z3 abort) -- UNKNOWN, isolated to this one unit."""
+    modname, kind = job[0], job[1]
+    reason = "worker aborted on this unit (z3 crash); isolated to UNKNOWN"
+    if kind == "F":
+        key = _mangle(modname, job[2])
+        return (modname, "%s.%s" % (modname, job[2]), Verdict(UNKNOWN, key, key, "scan", reason=reason),
+                key, key, "function", None)
+    cname, mname = job[2], job[3]
+    return (modname, "%s.%s.%s" % (modname, cname, mname), Verdict(UNKNOWN, mname, mname, "scan", reason=reason),
+            "", mname, "method", cname)
+
+
+def _build_unit_tasks(items, repo):
+    """Flatten the modules into one task per unit (function or method): the crash-tolerant pool processes each
+    unit independently, so a worker that aborts loses only that unit. Order matches the serial _module_rows
+    iteration, so the reassembled rows are identical to the serial path for every unit that does not crash."""
+    tasks = []
+    for modname, src, _t in items:
+        try:
+            body = ast.parse(src).body
+        except SyntaxError:
+            continue
+        for n in body:
+            if isinstance(n, ast.FunctionDef):
+                if _mangle(modname, n.name) in repo:
+                    tasks.append((modname, "F", n.name))
+            elif isinstance(n, ast.ClassDef):
+                for m in n.body:
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        tasks.append((modname, "M", n.name, m.name))
+    return tasks
+
+
+_UNIT_POOL_STALL_S = 180.0      # no result and no worker death for this long: a worker is wedged in a non-aborting
+#                                 C call; mark the remaining units UNKNOWN and stop, rather than hang the scan
+
+
+def _run_unit_pool(tasks, repo, modules, total, n):
+    """Triage the unit tasks across a supervised spawn pool that tolerates a worker dying mid-unit. Each worker
+    records the index of the unit it is on in a shared slot; when it aborts (a z3 SIGABRT no in-process bound can
+    catch, an OOM kill, a segfault), the supervisor marks exactly that unit UNKNOWN, respawns the worker, and the
+    rest of the units -- queued or on other workers -- are unaffected. Returns a lite row per task, in task
+    order (so a non-crashing unit's row is identical to the serial path)."""
+    import multiprocessing as _mp
+    import time as _time
+    from . import _partriage
+    ctx = _mp.get_context("spawn")
+    mgr = ctx.Manager()
+    results = mgr.dict()                                      # idx -> lite row; in a separate server process, so a
+    current = mgr.list([-1] * n)                              # worker crash cannot corrupt it (unlike a shared Queue)
+    task_q = ctx.Queue()                                      # read-only to workers: a reader's abort cannot corrupt it
+    for i, job in enumerate(tasks):
+        task_q.put((i, job))
+    rest = (task_q, results, current, repo, modules, total,
+            core.SANDBOX_SUBJECT, core.ALLOW_SUBJECT_EXECUTION, core._SCAN_CRASH_ON)
+
+    def _spawn(widx):
+        p = ctx.Process(target=_partriage.scan_unit_worker, args=(widx,) + rest, daemon=True)
+        p.start()
+        return p
+
+    workers = [_spawn(i) for i in range(n)]
+    ntasks = len(tasks)
+    respawn_cap = ntasks + 4 * n + 8                          # each genuine crash consumes a task; far beyond this is
+    respawns = 0                                              # a worker dying without progress -- stop, do not spin
+    last = _time.monotonic()
+    last_done = 0
+    while len(results) < ntasks:
+        _time.sleep(0.1)
+        nd = len(results)
+        if nd != last_done:
+            last_done = nd
+            last = _time.monotonic()
+        for i, w in enumerate(workers):
+            if not w.is_alive():                             # a worker aborted/exited: the unit it recorded in
+                cur = current[i]                             # current[i] is the casualty -- mark only that one
+                if isinstance(cur, int) and 0 <= cur < ntasks and cur not in results:
+                    results[cur] = _crash_unknown(tasks[cur])
+                    last = _time.monotonic()
+                if len(results) < ntasks and respawns < respawn_cap:
+                    workers[i] = _spawn(i)                   # respawn to finish any remaining queued units
+                    respawns += 1
+        if respawns >= respawn_cap or _time.monotonic() - last > _UNIT_POOL_STALL_S:
+            break                                            # runaway respawns or a non-aborting wedge: stop here
+    rd = dict(results.items())                               # one fetch of the whole map, not a per-task RPC
+    out = [rd[i] if i in rd else _crash_unknown(tasks[i]) for i in range(ntasks)]
+    for w in workers:
+        try:
+            w.terminate()
+            w.join(timeout=1)
+        except Exception:
+            pass
+    try:
+        mgr.shutdown()
+    except Exception:
+        pass
     return out
 
 
 def _triage_repo_verdicts(root, total=False, jobs=None):
     """Trap-freedom triage of a package tree, keeping for each function its Verdict plus the source, repo,
     name, and kind a scan needs to confirm and reproduce a finding. Reuses the same cross-module load_program
-    resolution and the same check, so a callee's trap is seen at the call site. The per-module work is
-    independent and the verdicts are rlimit-deterministic, so jobs > 1 (or the jobs=None auto default, on a
-    repo of at least _PAR_TRIAGE_MIN_MODULES modules) triages the modules across a spawn pool capped at the CPU
-    count -- byte-identical rows to the serial path, faster. A pool that cannot start falls back to serial."""
+    resolution and the same check, so a callee's trap is seen at the call site. jobs > 1 (or the jobs=None auto
+    default, on a repo of at least _PAR_TRIAGE_MIN_MODULES modules) triages the units across a crash-tolerant
+    spawn pool capped at the CPU count: per-unit work, so a worker that aborts (a z3 SIGABRT no in-process bound
+    can catch) costs only that one unit (UNKNOWN), not the run -- and every unit that does not crash gets a row
+    identical to the serial path. A pool that cannot start falls back to serial."""
     modules = repo_modules(root)
     repo = load_program(modules, on_collision="skip")         # a scan tolerates a rare mangle collision, not crash
     items = [(m, src, total) for m, src in sorted(modules.items()) if not _is_test_module(m)]
@@ -3020,14 +3218,8 @@ def _triage_repo_verdicts(root, total=False, jobs=None):
     n = min(want, len(items), os.cpu_count() or 1) if (want and want > 1) else 1
     lite = None
     if n > 1:
-        import concurrent.futures
-        import multiprocessing as _mp
-        from . import _partriage                              # the worker lives in its own module (avoids the cycle)
-        try:                                                  # scan_init replicates scan's execution-mode flags, so a
-            with concurrent.futures.ProcessPoolExecutor(      # symbolic scan never runs code in a spawned worker
-                    max_workers=n, mp_context=_mp.get_context("spawn"), initializer=_partriage.scan_init,
-                    initargs=(repo, core.SANDBOX_SUBJECT, core.ALLOW_SUBJECT_EXECUTION)) as ex:
-                lite = [r for mrows in ex.map(_partriage.scan_module, items) for r in mrows]
+        try:                                                  # per-unit tasks across the supervised, crash-tolerant
+            lite = _run_unit_pool(_build_unit_tasks(items, repo), repo, modules, total, n)   # pool (_run_unit_pool)
         except Exception:
             lite = None                                       # a pool that cannot start: fall through to serial
     if lite is None:
