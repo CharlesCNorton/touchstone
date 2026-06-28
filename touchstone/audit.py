@@ -3142,6 +3142,28 @@ def run_self_tests(fast=False):
     finally:
         _sh.rmtree(_dm, ignore_errors=True)
 
+    # a scan's repo triage parallelizes the same way and stays just as deterministic: jobs > 1 triages the
+    # modules across a spawn pool (capped at the CPU count), each worker replicating the symbolic-scan
+    # execution flags, and returns byte-identical findings and counts to the serial scan. Exercise a
+    # multi-module tree with a trapping function, a safe one, and a trapping method, so both the function and
+    # the method worker paths run.
+    _dp = _tf.mkdtemp(prefix="ts_parscan_")
+    try:
+        for _i in range(4):
+            open(_os.path.join(_dp, "m%d.py" % _i), "w").write(
+                "def divz(a, b):\n    return a // b\n"
+                "def safe(x):\n    return x + 1\n"
+                "class C:\n    def trap(self):\n        return 1 // 0\n")
+
+        def _scankey(_r):
+            return (_r["functions"], _r["proved"], _r["refuted"], _r["unknown"],
+                    sorted((_f["location"], _f["classification"], _f["kind"]) for _f in _r["findings"]))
+        _ss = scan(_dp, execute=False, jobs=1)
+        assert _scankey(_ss) == _scankey(scan(_dp, execute=False, jobs=4))   # parallel == serial, deterministically
+        assert _ss["functions"] == 12 and _ss["proved"] == 4 and _ss["refuted"] == 8 and _ss["unknown"] == 0
+    finally:
+        _sh.rmtree(_dp, ignore_errors=True)
+
     # verification-guided repair loop: a counterexample drives a generator to a verified result
     _attempts = iter(["def f(x):\n    return x + 1\n", "def f(x):\n    return 2 * x\n"])
     _r = repair_loop(lambda fb: next(_attempts), ensures="result == 2 * x")

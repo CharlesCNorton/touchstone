@@ -10,6 +10,7 @@ import touchstone
 
 _REPO = None
 _CHECK = None
+_ENGINES = None
 
 
 def init(repo):
@@ -31,3 +32,25 @@ def run(job):
     except Exception:
         status = "UNKNOWN"
     return h, status
+
+
+def scan_init(repo, sandbox_subject, allow_exec):
+    """Pool initializer for the parallel SCAN triage (engines._triage_repo_verdicts). Like init -- the shared
+    repo and the ordered package load through touchstone.check -- and additionally replicates scan's
+    execution-mode flags in the worker: a spawned worker imports fresh and would otherwise default
+    SANDBOX_SUBJECT on, running code during a symbolic-only scan, so set the worker's core flags to match the
+    main process exactly. Holds the loaded engines module for the per-module worker."""
+    global _REPO, _CHECK, _ENGINES
+    _REPO = repo
+    _CHECK = touchstone.check                                     # forces the ordered load (no submodule cycle)
+    from touchstone import core as _core, engines as _eng         # both fully loaded now
+    _core.SANDBOX_SUBJECT = sandbox_subject
+    _core.ALLOW_SUBJECT_EXECUTION = allow_exec
+    _ENGINES = _eng
+
+
+def scan_module(item):
+    """Triage one module (modname, src, total) against the shared repo and return its lite rows (the picklable
+    per-module rows engines._triage_repo_verdicts re-expands)."""
+    modname, src, total = item
+    return _ENGINES._module_rows(modname, src, _REPO, total)

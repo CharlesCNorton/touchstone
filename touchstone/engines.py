@@ -2946,32 +2946,69 @@ def _is_test_module(modname):
     return leaf.startswith("test_") or leaf.endswith("_test") or leaf == "conftest"
 
 
-def _triage_repo_verdicts(root, total=False):
+_PAR_TRIAGE_MIN_MODULES = 8        # below this a scan's repo triage stays serial: the spawn cost would not pay off
+
+
+def _module_rows(modname, src, repo, total):
+    """The triage rows for one module -- top-level functions checked against the cross-module `repo`, each class
+    method triaged standalone (upgraded by the heap driver). Each row is the lightweight, picklable
+    (modname, label, verdict, srcref, fname, kind, class_name): a function's srcref is its mangled repo key, a
+    method's its standalone source; _triage_repo_verdicts re-expands these into the full scan rows. Shared by
+    the serial and the parallel (per-module spawn-pool) triage paths -- one module is an independent unit."""
+    out = []
+    try:
+        body = ast.parse(src).body
+    except SyntaxError:
+        return out
+    for n in body:
+        if isinstance(n, ast.FunctionDef):
+            key = _mangle(modname, n.name)
+            if key in repo:
+                out.append((modname, "%s.%s" % (modname, n.name),
+                            _safe_check(repo[key], repo, key, total), key, key, "function", None))
+        elif isinstance(n, ast.ClassDef):
+            for m in n.body:
+                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    v, ms = _method_verdict(src, n, m, total)   # standalone, upgraded by the heap driver
+                    out.append((modname, "%s.%s.%s" % (modname, n.name, m.name), v, ms, m.name, "method", n.name))
+    return out
+
+
+def _triage_repo_verdicts(root, total=False, jobs=None):
     """Trap-freedom triage of a package tree, keeping for each function its Verdict plus the source, repo,
     name, and kind a scan needs to confirm and reproduce a finding. Reuses the same cross-module load_program
-    resolution and the same check, so a callee's trap is seen at the call site."""
+    resolution and the same check, so a callee's trap is seen at the call site. The per-module work is
+    independent and the verdicts are rlimit-deterministic, so jobs > 1 (or the jobs=None auto default, on a
+    repo of at least _PAR_TRIAGE_MIN_MODULES modules) triages the modules across a spawn pool capped at the CPU
+    count -- byte-identical rows to the serial path, faster. A pool that cannot start falls back to serial."""
     modules = repo_modules(root)
     repo = load_program(modules, on_collision="skip")         # a scan tolerates a rare mangle collision, not crash
+    items = [(m, src, total) for m, src in sorted(modules.items()) if not _is_test_module(m)]
+    if jobs is None:                                          # auto: parallelize a sizable repo, serial otherwise
+        want = (os.cpu_count() or 1) if len(items) >= _PAR_TRIAGE_MIN_MODULES else 1
+    else:
+        want = jobs
+    n = min(want, len(items), os.cpu_count() or 1) if (want and want > 1) else 1
+    lite = None
+    if n > 1:
+        import concurrent.futures
+        import multiprocessing as _mp
+        from . import _partriage                              # the worker lives in its own module (avoids the cycle)
+        try:                                                  # scan_init replicates scan's execution-mode flags, so a
+            with concurrent.futures.ProcessPoolExecutor(      # symbolic scan never runs code in a spawned worker
+                    max_workers=n, mp_context=_mp.get_context("spawn"), initializer=_partriage.scan_init,
+                    initargs=(repo, core.SANDBOX_SUBJECT, core.ALLOW_SUBJECT_EXECUTION)) as ex:
+                lite = [r for mrows in ex.map(_partriage.scan_module, items) for r in mrows]
+        except Exception:
+            lite = None                                       # a pool that cannot start: fall through to serial
+    if lite is None:
+        lite = [r for m, src, _t in items for r in _module_rows(m, src, repo, total)]
     out = []
-    for modname, src in sorted(modules.items()):
-        if _is_test_module(modname):                          # a test file's helpers/fixtures are not under audit
-            continue
-        try:
-            body = ast.parse(src).body
-        except SyntaxError:
-            continue
-        for n in body:
-            if isinstance(n, ast.FunctionDef):
-                key = _mangle(modname, n.name)
-                if key in repo:
-                    out.append(("%s.%s" % (modname, n.name), _safe_check(repo[key], repo, key, total),
-                                repo[key], repo, key, "function", None))
-            elif isinstance(n, ast.ClassDef):
-                for m in n.body:
-                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        v, ms = _method_verdict(src, n, m, total)   # standalone, upgraded by the heap driver
-                        out.append(("%s.%s.%s" % (modname, n.name, m.name), v, ms, {}, m.name,
-                                    "method", (src, n.name)))
+    for (modname, label, v, srcref, fname, kind, cname) in lite:    # re-expand to the full scan rows (repo /
+        if kind == "function":                                     # module source filled here, not shipped per row)
+            out.append((label, v, repo[srcref], repo, fname, "function", None))
+        else:
+            out.append((label, v, srcref, {}, fname, "method", (modules[modname], cname)))
     return out
 
 
@@ -3375,7 +3412,7 @@ def _resolve_scan_target(target):
     return tmp, None, tmp, True
 
 
-def scan(target, execute=False, total=False):
+def scan(target, execute=False, total=False, jobs=None):
     """Point Touchstone at a target and return a ranked trap-freedom bug report. The target is resolved
     leniently, so exact URL formatting is not required: an `owner/repo` slug, a scheme-less or full GitHub URL
     (a repo, a blob file link, a tree directory link, or any other page -- reduced to what it references), a
@@ -3387,7 +3424,8 @@ def scan(target, execute=False, total=False):
     finding in the isolated sandbox and classifies it: a confirmed ZeroDivisionError / IndexError / KeyError /
     TypeError is a `bug`; a confirmed ValueError / AssertionError the body explicitly raises is
     `input-validation`; anything the sandbox cannot reproduce stays `unconfirmed`. Findings are ranked bugs
-    first; a replayable one carries a runnable repro test and the source.
+    first; a replayable one carries a runnable repro test and the source. The repo triage runs in parallel by
+    default (a spawn pool capped at the CPU count); pass jobs to set the worker count, or jobs=1 to force serial.
 
     Returns {target, fetched, executed, functions, proved, refuted, unknown, bugs, input_validation,
     unconfirmed, findings}, each finding {location, kind, classification, exception, counterexample, witness,
@@ -3399,7 +3437,7 @@ def scan(target, execute=False, total=False):
     core.ALLOW_SUBJECT_EXECUTION = False                        # code is never run (no in-process path either)
     try:
         rows = _triage_file_verdicts(single_src, total=total) if single_src is not None \
-            else _triage_repo_verdicts(path, total=total)
+            else _triage_repo_verdicts(path, total=total, jobs=jobs)
         findings = [_build_finding(label, v, fsrc, frepo, fname, kind, execute, classinfo)
                     for label, v, fsrc, frepo, fname, kind, classinfo in rows if v.status == REFUTED]
         n_refuted = len(findings)
