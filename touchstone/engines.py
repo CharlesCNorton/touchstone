@@ -1734,7 +1734,21 @@ def _check_core(src, requires, repo, total, prop, target):
         alt = _check_trapfree_symexec(prop, target, src, pre_node, spec, repo, requires.strip() != "True")
         if alt.status != UNKNOWN:                                  # (e.g. a local dict built then read)
             safe = alt
-    if safe.status == UNKNOWN and _called_repo_names(src, repo):
+    # _called_repo_names and _is_self_recursive each walk the whole function, and the trap-freedom fallbacks
+    # below consult them up to three times on this unchanged src; memoize each to one lazy computation (a
+    # function decided above never pays for them).
+    _crn_cache, _sr_cache = [], []
+
+    def _called_names():
+        if not _crn_cache:
+            _crn_cache.append(_called_repo_names(src, repo))
+        return _crn_cache[0]
+
+    def _self_rec():
+        if not _sr_cache:
+            _sr_cache.append(_is_self_recursive(src))
+        return _sr_cache[0]
+    if safe.status == UNKNOWN and _called_names():
         # the value engine bailed inlining a recursive callee; when that callee is itself trap free, inline it
         # as a trap-free result and re-run, so the caller decides symbolically instead of staying UNKNOWN.
         _tfc = _trapfree_recursive_callees(src, repo)
@@ -1743,7 +1757,7 @@ def _check_core(src, requires, repo, total, prop, target):
                                           requires.strip() != "True", trapfree_callees=_tfc)
             if alt.status != UNKNOWN:
                 safe = alt
-    if safe.status == UNKNOWN and _is_self_recursive(src):
+    if safe.status == UNKNOWN and _self_rec():
         # the value engine bails on the recursive self-call, but the recursion engine decides trap freedom
         # symbolically (a reachable base-case or recursive-step trap is an Err under the call's path condition),
         # so it refutes even with a leading import that would block the sandbox oracle. Take only its REFUTED;
@@ -1755,7 +1769,7 @@ def _check_core(src, requires, repo, total, prop, target):
             _rrec = None
         if _rrec is not None and _rrec.status == REFUTED:
             safe = _rrec
-    if safe.status == UNKNOWN and (_called_repo_names(src, repo) or _is_self_recursive(src)):
+    if safe.status == UNKNOWN and (_called_names() or _self_rec()):
         # before the sandbox oracle: bounded symbolic unrolling of the caller and its (recursive) callees
         # reaches the trap through an un-inlinable callee, taking a witness only on a fully-unrolled (exact)
         # path -- so the recursive-callee trap (f's `x // gcd(...)`, a callee whose base case traps) refutes.
@@ -1764,7 +1778,7 @@ def _check_core(src, requires, repo, total, prop, target):
             safe = Verdict(REFUTED, prop, target, "implicit contracts (interprocedural unrolling)",
                            counterexample=_icex, counterexample_inputs=_iin,
                            reason="a modeled trap is reachable through an un-inlinable callee (bounded symbolic unrolling)")
-    if safe.status == UNKNOWN and (_called_repo_names(src, repo) or _is_self_recursive(src)):
+    if safe.status == UNKNOWN and (_called_names() or _self_rec()):
         # every symbolic engine abstained on a function whose callee the inliner could not resolve (a recursive
         # callee, e.g. f's `// gcd(...)`, or self-recursion): the isolated sandbox decides a reachable trap the
         # engines could not. Silent when execution is disabled, so a symbolic run still never runs the subject.
@@ -2662,7 +2676,7 @@ def _standalone_def_src(m, drop_receiver=False):
     computing the trap-freedom *verdict*, since a 'trap' pinned only to `self=<value>` is spurious (a receiver
     is an object, not a sampled scalar); a genuine parameter-only trap (a // b) still refutes. The default keeps
     the receiver, naming a real instance method for confirmation and repro (_confirm_method)."""
-    fn = copy.deepcopy(m)
+    fn = core._clone_ast(m)                                   # a fast structural clone (~4x cheaper than deepcopy)
     fn.decorator_list = []
     if drop_receiver and fn.args.args and fn.args.args[0].arg in ("self", "cls"):
         fn.args.args = fn.args.args[1:]                       # receiver -> free opaque name, not a modeled param
@@ -2867,6 +2881,21 @@ def _heap_driver_worthwhile(method_node):
     return has_self_attr and has_div
 
 
+def _class_constructible_no_args(class_node):
+    """Whether `ClassName()` builds with no arguments -- the heap driver constructs the receiver that way, so a
+    class whose __init__ needs a positional argument (the common nn.Module / dataclass-with-fields shape)
+    cannot be driven and the driver is skipped. No own __init__ (a default or inherited constructor) counts as
+    constructible, as does one whose extra positional params all carry defaults or are *args/**kwargs."""
+    init = next((s for s in class_node.body
+                 if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name == "__init__"), None)
+    if init is None:
+        return True
+    a = init.args
+    n_required_pos = (len(a.args) - 1) - len(a.defaults)         # positional params past self with no default
+    n_required_kw = sum(1 for d in a.kw_defaults if d is None)
+    return n_required_pos <= 0 and n_required_kw == 0
+
+
 def _method_heap_refute(module_src, class_name, method_node, total):
     """Find an implicit method bug symbolically by constructing the receiver and invoking the method through
     the heap engine: build `obj = ClassName(); return obj.method(<params>)` over the module's classes (minus
@@ -2906,10 +2935,10 @@ def _method_verdict(module_src, class_node, method_node, total):
     unguarded index). A standalone REFUTED (a parameter-only bug like a // b) already decides and is kept."""
     ms = _standalone_def_src(method_node)                       # keeps self/cls: names a real method for confirm/repro
     v = _safe_check(_standalone_def_src(method_node, drop_receiver=True), {}, None, total)   # receiver opaque, so a
-    if v.status != REFUTED:                                      # trap pinned only to self=<scalar> is not refuted here
-        hv = _method_heap_refute(module_src, class_node.name, method_node, total)
-        if hv is not None:
-            return hv, ms
+    if v.status != REFUTED and _class_constructible_no_args(class_node):   # a non-refuting opaque-self check, with a
+        hv = _method_heap_refute(module_src, class_node.name, method_node, total)   # no-arg-constructible receiver
+        if hv is not None:                                       # to drive: only then can the heap engine reach a
+            return hv, ms                                        # self-state trap the standalone check could not see
     return v, ms
 
 
