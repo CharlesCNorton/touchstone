@@ -859,14 +859,17 @@ class _SafeContainer(_Opaque):
     (IndexError when out of [-len, len)); the oracle samples an indexed parameter as a real list so that
     out-of-range trap is witnessable, and an iteration- or method-only one as a benign stand-in. `immutable`
     marks a tuple, whose item assignment c[i] = v always raises (TypeError)."""
-    __slots__ = ("immutable", "length", "unindexable", "byteslike")
-    def __init__(self, name, immutable=False, length=None, unindexable=False, byteslike=False):
+    __slots__ = ("immutable", "length", "unindexable", "byteslike", "elem")
+    def __init__(self, name, immutable=False, length=None, unindexable=False, byteslike=False, elem=None):
         super().__init__(name)
         self.immutable = immutable
         self.length = length        # an explicit, provably-nonnegative length term (a range); else a fresh
         #                             symbolic length keyed by name (an opaque list/tuple parameter)
         self.unindexable = unindexable   # a set / frozenset: sized and iterable, but s[i] raises TypeError
         self.byteslike = byteslike       # a bytes / bytearray: an element is an int in [0, 255]
+        self.elem = elem            # a _SafeContainer prototype when elements are themselves sequences (a
+        #                             list[list[...]] / list[tuple[...]] parameter); an element c[i] is then a
+        #                             bounds-checked inner sequence with a per-index symbolic length. None = scalar.
 
 
 class _SetExpr(_SafeContainer):
@@ -4138,6 +4141,13 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     and z3.is_expr(idx) and idx.sort() == z3.IntSort():
                 n = _container_len(base, ctx)                # bounds VC: IndexError when the index leaves [-len, len)
                 ctx.traps.append(z3.And(ctx.pc, z3.Or(idx < -n, idx >= n)))
+                if isinstance(base.elem, _SafeContainer):    # list[list[..]] etc.: the element is an inner sequence
+                    pr = base.elem                           # whose length is a per-index uninterpreted function, so a
+                    ilen = z3.Function("ilen_" + base.name, z3.IntSort(), z3.IntSort())(idx)   # len(c[i]) guard
+                    if ctx.facts is not None:                # constrains c[i][j]; nonnegative by construction
+                        ctx.facts.append(ilen >= 0)
+                    return _SafeContainer(base.name + "_e", immutable=pr.immutable, length=ilen,
+                                          unindexable=pr.unindexable, byteslike=pr.byteslike, elem=pr.elem)
                 elem = z3.FreshInt("helem")
                 if base.byteslike and ctx.facts is not None:   # a bytes / bytearray element is exactly an int in [0, 255]
                     ctx.facts.append(z3.And(elem >= 0, elem <= 255))
@@ -4386,6 +4396,26 @@ def _is_object_annotation(ann) -> bool:
     return False
 
 
+def _elem_container_proto(elem_ann):
+    """A _SafeContainer prototype for a sequence's element type when that element is itself a sequence -- a
+    list[list[int]] / list[tuple[int]] / list[bytes] parameter -- else None. The prototype carries the inner
+    sequence's flags (a tuple element is immutable, a bytes element is byteslike); its length is filled per index
+    at subscript time. One level deep: the inner sequence's own elements are left scalar."""
+    if isinstance(elem_ann, ast.Subscript) and isinstance(elem_ann.value, ast.Name):
+        b = elem_ann.value.id
+    elif isinstance(elem_ann, ast.Name):
+        b = elem_ann.id
+    else:
+        return None
+    if b in ("list", "List", "Sequence", "MutableSequence"):
+        return _SafeContainer("elem")
+    if b in ("tuple", "Tuple"):
+        return _SafeContainer("elem", immutable=True)
+    if b in ("bytes", "bytearray"):
+        return _SafeContainer("elem", immutable=(b == "bytes"), byteslike=True)
+    return None
+
+
 def _param_term(arg):
     """A parameter's symbolic term, sorted by its annotation: `int` (and unannotated) -> Int, `bool` ->
     Bool, `float` -> Float64, `str` -> Z3 String, `list` -> a bounds-checked sequence (so an integer index
@@ -4412,10 +4442,10 @@ def _param_term(arg):
             return _DictParam(arg.arg)
     if isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name):
         base = ann.value.id                                 # a parameterized generic -- list[int], dict[str, int],
-        if base in ("list", "List", "Sequence", "MutableSequence"):   # set[T], tuple[...], or a typing alias -- is the
-            return _SafeContainer(arg.arg)                  # same container as its bare form; the element type is
-        if base in ("tuple", "Tuple"):                      # ignored here, exactly as the bare `list` / `dict` are
-            return _SafeContainer(arg.arg, immutable=True)
+        if base in ("list", "List", "Sequence", "MutableSequence"):   # set[T], tuple[...], or a typing alias. A scalar
+            return _SafeContainer(arg.arg, elem=_elem_container_proto(ann.slice))   # element type is still ignored; a
+        if base in ("tuple", "Tuple"):                      # *sequence* element type makes c[i] a nested sequence
+            return _SafeContainer(arg.arg, immutable=True, elem=_elem_container_proto(ann.slice))
         if base in ("set", "frozenset", "Set", "FrozenSet", "MutableSet"):
             return _SafeContainer(arg.arg, unindexable=True)
         if base in ("dict", "Dict", "Mapping", "MutableMapping"):

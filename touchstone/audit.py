@@ -3411,6 +3411,15 @@ def run_self_tests(fast=False):
     assert check("def f(n):\n    total: int = 0\n    total = total + n\n    return total\n").status == PROVED
     assert check("def f(n):\n    x: int\n    return n + 1\n").status == PROVED
 
+    # nested-container parameter modeling: an element of a list[list[T]] parameter is itself a bounds-checked
+    # sequence with a per-index symbolic length, so len(p[i]) and p[i][j] (load and store) decide. The per-index
+    # length is sound: a len(p[i]) guard protects p[i][j] but NOT a different index p[i+1][j].
+    _NL = "p: list[list[int]], i: int, j: int"
+    assert check("def f(%s):\n    if 0<=i<len(p) and 0<=j<len(p[i]):\n        return p[i][j]\n    return 0\n" % _NL).status == PROVED
+    assert check("def f(%s):\n    if 0<=i<len(p):\n        return p[i][j]\n    return 0\n" % _NL).status == REFUTED
+    assert check("def f(%s):\n    if 0<=i<len(p) and 0<=j<len(p[i]) and i+1<len(p):\n        return p[i+1][j]\n    return 0\n" % _NL).status == REFUTED
+    assert check("def f(%s, v: int):\n    if 0<=i<len(p) and 0<=j<len(p[i]):\n        p[i][j] = v\n    return 0\n" % _NL).status == PROVED
+
     # verification-guided repair loop: a counterexample drives a generator to a verified result
     _attempts = iter(["def f(x):\n    return x + 1\n", "def f(x):\n    return 2 * x\n"])
     _r = repair_loop(lambda fb: next(_attempts), ensures="result == 2 * x")
