@@ -3308,6 +3308,49 @@ def run_self_tests(fast=False):
     finally:
         _sh.rmtree(_dcli, ignore_errors=True)
 
+    # inline suppression: a unit carrying `# touchstone: ignore` in its body is dropped from the findings and
+    # counted in suppressed_in_source, while its unmarked sibling still reports.
+    _dsupp = _tf.mkdtemp(prefix="ts_supp_")
+    try:
+        open(_os.path.join(_dsupp, "s.py"), "w").write(
+            "def risky(x):  # touchstone: ignore\n    return 10 // x\ndef other(y):\n    return 10 // y\n")
+        _sr = scan(_dsupp, execute=False, jobs=1)
+        _slocs = {_f["location"] for _f in _sr["findings"]}
+        assert "s.other" in _slocs and "s.risky" not in _slocs and _sr["suppressed_in_source"] == 1
+    finally:
+        _sh.rmtree(_dsupp, ignore_errors=True)
+
+    # report renderings: a Markdown findings table and GitHub Actions annotations, plus the empty case.
+    from .report import scan_to_markdown, scan_to_github
+    _frep = {"target": "t", "executed": False, "functions": 2, "proved": 1, "refuted": 1, "unknown": 0,
+             "findings": [{"location": "m.f", "module": "m", "line": 3, "classification": "bug",
+                           "exception": "ZeroDivisionError", "label": "confirmed bug"}]}
+    _md = scan_to_markdown(_frep)
+    assert _md.startswith("## Touchstone scan") and "| `m.f:3` |" in _md and "ZeroDivisionError" in _md
+    assert scan_to_markdown({"target": "t", "functions": 0, "findings": []}).strip().endswith("No reachable traps found.")
+    _gh = scan_to_github(_frep)
+    assert _gh.startswith("::error file=m.py,line=3,title=") and "::m.f: confirmed bug" in _gh
+
+    # CLI --format dispatch and the init scaffolding (no baseline scan in the test).
+    _dfmt = _tf.mkdtemp(prefix="ts_fmt_")
+    try:
+        open(_os.path.join(_dfmt, "a.py"), "w").write("def trap(x):\n    return 1 // x\n")
+        _bmd = _cio.StringIO()
+        with _ccl.redirect_stdout(_bmd):
+            _cli.main(["scan", _dfmt, "--jobs", "1", "--format", "markdown"])
+        assert "| Location |" in _bmd.getvalue() and "a.trap" in _bmd.getvalue()
+        _bgh = _cio.StringIO()
+        with _ccl.redirect_stdout(_bgh):
+            _cli.main(["scan", _dfmt, "--jobs", "1", "--format", "github"])
+        assert _bgh.getvalue().startswith("::") and "a.trap" in _bgh.getvalue()
+        open(_os.path.join(_dfmt, "pyproject.toml"), "w").write('[project]\nname = "d"\nversion = "0"\n')
+        with _ccl.redirect_stdout(_cio.StringIO()):
+            _rc_init = _cli.main(["init", _dfmt, "--no-baseline"])
+        assert _rc_init == 0 and _os.path.exists(_os.path.join(_dfmt, ".github", "workflows", "touchstone.yml"))
+        assert "[tool.touchstone]" in open(_os.path.join(_dfmt, "pyproject.toml")).read()
+    finally:
+        _sh.rmtree(_dfmt, ignore_errors=True)
+
     # verification-guided repair loop: a counterexample drives a generator to a verified result
     _attempts = iter(["def f(x):\n    return x + 1\n", "def f(x):\n    return 2 * x\n"])
     _r = repair_loop(lambda fb: next(_attempts), ensures="result == 2 * x")

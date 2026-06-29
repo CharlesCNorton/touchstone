@@ -21,6 +21,7 @@
     touchstone repair     --generator CMD [--ensures EXPR] [--before F]    re-run a generator until the property holds
 
   servers and meta:
+    touchstone init                                                      scaffold a CI workflow, config, and a baseline into a project
     touchstone lsp / mcp                                                  the language server / the MCP verification-tools server (stdio)
     touchstone covers                                                     what it can prove, and the modeled subset
     touchstone examples / selftest / demo                                 the capability gallery / the self-tests / the narrated demo
@@ -455,12 +456,19 @@ def _cmd_scan(a):
         return any(f["classification"] in ("bug", "suspected") for f in fs) if rep["executed"] else bool(fs)
     fail = _fail(new_findings if a.baseline else findings)
 
-    if a.sarif:
+    fmt = a.format or ("sarif" if a.sarif else "json" if a.json else "text")   # --json/--sarif are aliases
+    if fmt == "sarif":
         from . import sarif as _sarif
         print(json.dumps(_sarif.scan_to_sarif(rep)))
         return 1 if fail else 0
-    if a.json:
+    if fmt == "json":
         print(json.dumps(rep))
+        return 1 if fail else 0
+    if fmt in ("markdown", "github"):
+        from . import report as _report
+        sys.stdout.write((_report.scan_to_markdown(rep) if fmt == "markdown" else _report.scan_to_github(rep)))
+        if fmt == "markdown":
+            sys.stdout.write("\n")
         return 1 if fail else 0
     if a.quiet:                                            # only the finding lines (tag + location), greppable
         for f in rep["findings"]:
@@ -638,6 +646,76 @@ def _load_tool_config(start=None):
         if parent == d:
             return {}
         d = parent
+
+
+_INIT_WORKFLOW = """\
+name: touchstone
+on: [pull_request]
+permissions:
+  contents: read
+  security-events: write
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: CharlesCNorton/touchstone@%(tag)s
+        with:
+          baseline: .touchstone-baseline.json
+"""
+
+_INIT_CONFIG = """\
+[tool.touchstone]
+# exclude = ["*/migrations/*", "vendor/*"]   # globs dropped from triage
+# fail_on = "bug"                            # bug | suspected | any | none
+# jobs = 8
+"""
+
+
+def _cmd_init(a):
+    """Scaffold touchstone into a project: a GitHub Actions workflow, a [tool.touchstone] config block, and an
+    initial baseline, so the CI / config / baseline pieces are turnkey rather than copied out of the README."""
+    root = a.dir
+    ver = _version()
+    tag = "v" + ver if (ver and ver[0].isdigit() and "+" not in ver) else "main"
+    did = []
+    wf = os.path.join(root, ".github", "workflows", "touchstone.yml")
+    if os.path.exists(wf) and not a.force:
+        did.append("kept    %s (exists; --force to overwrite)" % wf)
+    else:
+        os.makedirs(os.path.dirname(wf), exist_ok=True)
+        with open(wf, "w", encoding="utf-8") as fh:
+            fh.write(_INIT_WORKFLOW % {"tag": tag})
+        did.append("wrote   %s" % wf)
+    pp = os.path.join(root, "pyproject.toml")
+    if os.path.exists(pp):
+        with open(pp, encoding="utf-8") as fh:
+            present = "[tool.touchstone]" in fh.read()
+        if present:
+            did.append("kept    pyproject.toml ([tool.touchstone] already present)")
+        else:
+            with open(pp, "a", encoding="utf-8") as fh:
+                fh.write("\n" + _INIT_CONFIG)
+            did.append("added   [tool.touchstone] to pyproject.toml")
+    else:
+        did.append("no pyproject.toml found; add this block to one:\n\n" + _INIT_CONFIG)
+    bl = os.path.join(root, ".touchstone-baseline.json")
+    if a.no_baseline:
+        did.append("skipped baseline (--no-baseline)")
+    elif os.path.exists(bl) and not a.force:
+        did.append("kept    %s (exists; --force to refresh)" % bl)
+    else:
+        print("scanning %s to establish a baseline..." % root, file=sys.stderr)
+        try:
+            rep = t.scan(root)
+            fps = sorted({t.finding_fingerprint(f) for f in rep["findings"]})
+            _dump_json(bl, fps)
+            did.append("wrote   %s (%d finding(s) recorded)" % (bl, len(fps)))
+        except Exception as e:
+            did.append("baseline scan failed (%s: %s); re-run `touchstone init --force` later" % (type(e).__name__, e))
+    for line in did:
+        print(line)
+    return 0
 
 
 def _cmd_spec(a):
@@ -840,6 +918,9 @@ def build_parser():
     sc.add_argument("--json", action="store_true", help="emit the full report as one JSON object")
     sc.add_argument("--sarif", action="store_true",
                     help="emit the findings as a SARIF 2.1.0 log (for GitHub code scanning or any SARIF viewer)")
+    sc.add_argument("--format", choices=("text", "json", "sarif", "markdown", "github"), default=None,
+                    help="output format (default: text; --json / --sarif are aliases). markdown is a paste-ready "
+                         "findings table; github emits Actions workflow commands for inline PR annotations")
     sc.add_argument("--jobs", "-j", type=int, default=None, metavar="N",
                     help="triage across N worker processes (default: auto -- the CPU count on a sizable repo, "
                          "serial on a small one); jobs=1 forces serial")
@@ -884,6 +965,13 @@ def build_parser():
                     help="comma-separated fnmatch globs to drop from triage (also [tool.touchstone] exclude)")
     cv.add_argument("--json", action="store_true", help="emit the report as one JSON object")
     cv.set_defaults(fn=_cmd_coverage)
+
+    it = sub.add_parser("init",
+                        help="scaffold a CI workflow, a [tool.touchstone] config block, and a baseline into a project")
+    it.add_argument("dir", nargs="?", default=".", help="the project root (default: .)")
+    it.add_argument("--force", action="store_true", help="overwrite an existing workflow and refresh the baseline")
+    it.add_argument("--no-baseline", action="store_true", help="do not run a scan to establish a baseline")
+    it.set_defaults(fn=_cmd_init)
 
     sp = sub.add_parser("spec",
                         help="synthesize a contract (@require / @ensure) a function provably satisfies")

@@ -106,9 +106,13 @@ viewer); `scan --cache FILE` reuses a content-addressed verdict cache so a re-sc
 code; `scan --baseline FILE` reports every finding but exits nonzero only on one not already recorded, to
 adopt the scan on a large codebase without fixing every finding at once; `--exclude` drops vendored or
 generated modules from triage; `scan --fail-on {bug,suspected,any,none}` sets the exit policy; and `--jobs N`
-/ `--progress` set the worker count and print a live triaged-units counter.
+/ `--progress` set the worker count and print a live triaged-units counter. `scan --format
+{text,json,sarif,markdown,github}` picks the output — `markdown` is a paste-ready findings table, `github`
+emits Actions workflow commands that annotate the PR diff inline — and a `# touchstone: ignore` comment in a
+function drops its finding (marking that trap intentional in source).
 
-Defaults can live in `pyproject.toml`, and the scan drops into CI as a GitHub Action or a pre-commit hook:
+`touchstone init` scaffolds the config block, a GitHub Actions workflow, and a baseline in one step; here are
+the pieces it writes, which you can also add by hand:
 
 ```toml
 [tool.touchstone]
@@ -126,7 +130,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: CharlesCNorton/touchstone@v1.15.0
+      - uses: CharlesCNorton/touchstone@v1.16.0
         with:
           baseline: .touchstone-baseline.json   # fail only on a newly introduced trap
 ```
@@ -135,7 +139,7 @@ jobs:
 # .pre-commit-config.yaml -- gate changed functions before each commit
 repos:
   - repo: https://github.com/CharlesCNorton/touchstone
-    rev: v1.15.0
+    rev: v1.16.0
     hooks:
       - id: touchstone-gate
 ```

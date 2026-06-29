@@ -3021,21 +3021,27 @@ def _triage_file_verdicts(src, total=False):
     subset, so a method finding is rarely confirmable)."""
     try:
         repo = load_module(src)
-        body = ast.parse(textwrap.dedent(src)).body
+        dsrc = textwrap.dedent(src)                           # def linenos are relative to the dedented source
+        body = ast.parse(dsrc).body
     except SyntaxError:
-        return [], {}
-    out, locmap = [], {}
+        return [], {}, set()
+    out, locmap, suppressed = [], {}, set()
     for n in body:
         if isinstance(n, ast.FunctionDef) and n.name in repo:
             out.append((n.name, _guarded_fn_check(n, repo[n.name], repo, n.name, total), repo[n.name], repo, n.name, "function", None))
             locmap[n.name] = (None, n.lineno)
+            if _span_suppressed(dsrc, (n.lineno, getattr(n, "end_lineno", n.lineno))):
+                suppressed.add(n.name)
         elif isinstance(n, ast.ClassDef):
             for m in n.body:                                 # the module source + class name, so a method finding
                 if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):   # confirms on a real constructed instance
                     v, ms = _guarded_method_verdict(src, n, m, total)   # standalone + heap driver, under the unit budget
-                    out.append(("%s.%s" % (n.name, m.name), v, ms, {}, m.name, "method", (src, n.name)))
-                    locmap["%s.%s" % (n.name, m.name)] = (None, m.lineno)
-    return out, locmap
+                    lbl = "%s.%s" % (n.name, m.name)
+                    out.append((lbl, v, ms, {}, m.name, "method", (src, n.name)))
+                    locmap[lbl] = (None, m.lineno)
+                    if _span_suppressed(dsrc, (m.lineno, getattr(m, "end_lineno", m.lineno))):
+                        suppressed.add(lbl)
+    return out, locmap, suppressed
 
 
 def _is_test_module(modname):
@@ -3275,24 +3281,40 @@ def _row_from_cache(task, repo, modules, v):
     return (modname, "%s.%s.%s" % (modname, cname, mname), v, "", mname, "method", cname)
 
 
-def _unit_line(modname, modules, line_idx, kind, fname, cname):
-    """The source line of a unit's def in its module, for a finding's physical location (SARIF). The module is
-    parsed once and its def lines memoized in line_idx."""
+def _unit_lines(modname, modules, line_idx, kind, fname, cname):
+    """The (def line, end line) span of a unit in its module: the def line gives a finding's physical location
+    (SARIF), the full span bounds an inline-suppression search. The module is parsed once and memoized."""
     idx = line_idx.get(modname)
     if idx is None:
         idx = {}
         try:
             for n in ast.parse(modules[modname]).body:
                 if isinstance(n, ast.FunctionDef):
-                    idx[("F", _mangle(modname, n.name))] = n.lineno   # a function row's fname slot is its mangled key
-                elif isinstance(n, ast.ClassDef):
+                    idx[("F", _mangle(modname, n.name))] = (n.lineno, getattr(n, "end_lineno", n.lineno))
+                elif isinstance(n, ast.ClassDef):                 # a function row's fname slot is its mangled key
                     for m in n.body:
                         if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                            idx[("M", n.name, m.name)] = m.lineno
+                            idx[("M", n.name, m.name)] = (m.lineno, getattr(m, "end_lineno", m.lineno))
         except (SyntaxError, KeyError):
             pass
         line_idx[modname] = idx
     return idx.get(("F", fname)) if kind == "function" else idx.get(("M", cname, fname))
+
+
+def _span_suppressed(src, span):
+    """Whether an inline `# touchstone: ignore` comment appears within a unit's source span (its def line through
+    its end line), by which the author marks the trap intentional so the finding is dropped. A comment is any line
+    whose `#`-comment carries both `touchstone:` and `ignore`, so `# touchstone: ignore` (with or without the
+    space) is recognized."""
+    lo, hi = span if span else (None, None)
+    if not lo:
+        return False
+    lines = src.splitlines()
+    for i in range(lo - 1, min(hi or lo, len(lines))):
+        c = lines[i].find("#")
+        if c != -1 and "touchstone:" in lines[i][c:] and "ignore" in lines[i][c:]:
+            return True
+    return False
 
 
 def _triage_repo_verdicts(root, total=False, jobs=None, cache=None, progress=None, exclude=None):
@@ -3351,14 +3373,18 @@ def _triage_repo_verdicts(root, total=False, jobs=None, cache=None, progress=Non
         lite[i] = miss_rows[j]                                # cheap-to-serialize non-REFUTED verdicts
         if cache is not None and keys[i] is not None and miss_rows[j][2].status != REFUTED:
             cache[keys[i]] = _verdict_to_cache(miss_rows[j][2])
-    out, locmap, line_idx = [], {}, {}
+    out, locmap, line_idx, suppressed = [], {}, {}, set()
     for (modname, label, v, srcref, fname, kind, cname) in lite:    # re-expand to the full scan rows (repo /
         if kind == "function":                                     # module source filled here, not shipped per row)
             out.append((label, v, repo[srcref], repo, fname, "function", None))
         else:
             out.append((label, v, srcref, {}, fname, "method", (modules[modname], cname)))
-        locmap[label] = (modname, _unit_line(modname, modules, line_idx, kind, fname, cname))
-    return out, locmap
+        span = _unit_lines(modname, modules, line_idx, kind, fname, cname)
+        locmap[label] = (modname, span[0] if span else None)
+        if (v.status == REFUTED or (v.status == UNKNOWN and kind == "function")) \
+                and _span_suppressed(modules.get(modname, ""), span):   # an inline ignore drops this finding
+            suppressed.add(label)
+    return out, locmap, suppressed
 
 
 def _has_explicit_raise(src, exc):
@@ -3781,28 +3807,35 @@ def scan(target, execute=False, total=False, jobs=None, cache=None, progress=Non
     dotted-name / path forms, drops matching modules from triage (vendored or generated code) while still loading
     them for call resolution.
 
-    Returns {target, fetched, executed, functions, proved, refuted, unknown, bugs, input_validation,
-    unconfirmed, findings}, each finding {location, module, line, kind, classification, exception,
-    counterexample, witness, reason, repro, source, severity, label}."""
+    An inline `# touchstone: ignore` comment anywhere in a unit's body drops that unit's finding (marking the
+    trap intentional in source), counted as `suppressed_in_source`. Returns {target, fetched, executed,
+    functions, proved, refuted, unknown, bugs, input_validation, unconfirmed, suppressed_in_source, findings},
+    each finding {location, module, line, kind, classification, exception, counterexample, witness, reason,
+    repro, source, severity, label}."""
     import shutil
     path, single_src, tmp, fetched = _resolve_scan_target(target)
     saved = (core.SANDBOX_SUBJECT, core.ALLOW_SUBJECT_EXECUTION)
     core.SANDBOX_SUBJECT = bool(execute)                        # execute -> sandbox replay + oracle on; else the
     core.ALLOW_SUBJECT_EXECUTION = False                        # code is never run (no in-process path either)
+    n_suppressed = 0
     try:
         if single_src is not None:
-            rows, locmap = _triage_file_verdicts(single_src, total=total)
+            rows, locmap, suppressed = _triage_file_verdicts(single_src, total=total)
         else:
-            rows, locmap = _triage_repo_verdicts(path, total=total, jobs=jobs, cache=cache,
-                                                 progress=progress, exclude=exclude)
-        findings = [_build_finding(label, v, fsrc, frepo, fname, kind, execute, classinfo)
-                    for label, v, fsrc, frepo, fname, kind, classinfo in rows if v.status == REFUTED]
+            rows, locmap, suppressed = _triage_repo_verdicts(path, total=total, jobs=jobs, cache=cache,
+                                                             progress=progress, exclude=exclude)
+        raw = [_build_finding(label, v, fsrc, frepo, fname, kind, execute, classinfo)
+               for label, v, fsrc, frepo, fname, kind, classinfo in rows if v.status == REFUTED]
+        findings = [f for f in raw if f["location"] not in suppressed]   # drop inline `# touchstone: ignore` units
+        n_suppressed = len(raw) - len(findings)
         n_refuted = len(findings)
         if execute:                                            # pursue each symbolic UNKNOWN by guided sandbox fuzzing
             for label, v, fsrc, frepo, fname, kind, classinfo in rows:   # rather than dropping it (a missed bug)
                 if v.status == UNKNOWN and kind == "function":
                     sf = _escalate_unknown(label, fsrc, frepo, fname)
-                    if sf is not None:
+                    if sf is not None and sf["location"] in suppressed:
+                        n_suppressed += 1
+                    elif sf is not None:
                         findings.append(sf)
     finally:
         core.SANDBOX_SUBJECT, core.ALLOW_SUBJECT_EXECUTION = saved
@@ -3835,7 +3868,8 @@ def scan(target, execute=False, total=False, jobs=None, cache=None, progress=Non
     return {"target": target, "fetched": fetched, "executed": bool(execute),
             "functions": len(rows), "proved": proved, "refuted": n_refuted, "unknown": unknown,
             "bugs": cls("bug"), "input_validation": cls("input-validation"), "unconfirmed": cls("unconfirmed"),
-            "context_unreachable": cls("context-unreachable"), "suspected": cls("suspected"), "findings": findings}
+            "context_unreachable": cls("context-unreachable"), "suspected": cls("suspected"),
+            "suppressed_in_source": n_suppressed, "findings": findings}
 
 
 def finding_fingerprint(f):
