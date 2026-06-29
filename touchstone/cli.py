@@ -13,6 +13,9 @@
     touchstone returns    FILE [--func NAME]                               the declared return annotation vs what the body can return
     touchstone leak       FILE [--func NAME]                               every opened resource is closed on every path
     touchstone lock       FILE [--guarded OPS] [--func NAME]               a guarded operation is never reached without a lock held
+    touchstone termination FILE [--func NAME]                              a loop / recursion halts on every input (or a diverging one)
+    touchstone cost       FILE [--func NAME]                               a proven symbolic iteration bound for a counted loop
+    touchstone overflow   FILE [--width N] [--func NAME]                   no signed add/sub/mul wraps a width-N machine integer
 
   triage across a tree:
     touchstone repo       DIR [--total] [--changed PATHS] [--jobs N]       trap freedom of every top-level function in a package
@@ -849,6 +852,35 @@ def _cmd_lock(a):
     return _report(v, json_out=a.json, quiet=a.quiet)
 
 
+def _cmd_termination(a):
+    src = _read(a.file)
+    func = _resolve_target(src, _label(a.file), a.func)
+    v = t.verify_termination("termination", func, src)                    # a loop / for-container ranking function
+    if v.status == "UNKNOWN":
+        rec = t.verify_recursive_termination("termination", func, src)     # self-recursion: a well-founded measure
+        if rec.status != "UNKNOWN":
+            v = rec
+    if v.status == "UNKNOWN":
+        nt = t.verify_nontermination("termination", func, src)             # else exhibit a concrete diverging input
+        if nt.status == "REFUTED":
+            v = nt
+    return _report(v, json_out=a.json, quiet=a.quiet)
+
+
+def _cmd_cost(a):
+    src = _read(a.file)
+    func = _resolve_target(src, _label(a.file), a.func)
+    v = t.verify_iteration_bound("cost", func, src)
+    return _report(v, json_out=a.json, quiet=a.quiet)
+
+
+def _cmd_overflow(a):
+    src = _read(a.file)
+    func = _resolve_target(src, _label(a.file), a.func)
+    v = t.verify_no_overflow("no-overflow", func, src, width=a.width)
+    return _report(v, json_out=a.json, quiet=a.quiet)
+
+
 def _cmd_recheck(a):
     """Re-validate a saved proof bundle (written by `change --bundle` / `gate --bundle`) WITHOUT a fresh
     solve: recheck_bundle re-runs the discharged SMT-LIB queries independently and confirms the content
@@ -1140,6 +1172,26 @@ def build_parser():
                     help="comma-separated operations that require a lock held (default: db.write)")
     lc.add_argument("--func", default=None, help="function to check (default: the one in the file)")
     lc.set_defaults(fn=_cmd_lock)
+
+    tm = sub.add_parser("termination", parents=[verdict],
+                        help="prove a loop or recursion halts on every input (or exhibit a diverging one)")
+    tm.add_argument("file")
+    tm.add_argument("--func", default=None, help="function to check (default: the one in the file)")
+    tm.set_defaults(fn=_cmd_termination)
+
+    co = sub.add_parser("cost", parents=[verdict],
+                        help="prove a symbolic iteration bound for a counted loop")
+    co.add_argument("file")
+    co.add_argument("--func", default=None, help="function to bound (default: the one in the file)")
+    co.set_defaults(fn=_cmd_cost)
+
+    ov = sub.add_parser("overflow", parents=[verdict],
+                        help="prove no signed add/sub/mul wraps a fixed-width machine integer")
+    ov.add_argument("file")
+    ov.add_argument("--width", type=int, default=None, metavar="N",
+                    help="signed machine-integer width in bits (default: the module width, 64)")
+    ov.add_argument("--func", default=None, help="function to check (default: the one in the file)")
+    ov.set_defaults(fn=_cmd_overflow)
 
     rc = sub.add_parser("recheck",
                         help="re-validate a saved proof bundle (from change/gate --bundle) with no fresh solve")

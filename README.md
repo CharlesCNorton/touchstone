@@ -84,9 +84,11 @@ The verbs run from the shell, with the process exit status mirroring the verdict
 touchstone check  d.py                            # trap freedom (and any asserts) for all inputs
 touchstone prove  f.py --ensures 'result == x'    # a postcondition over the parameters and `result`
 touchstone verify count.py                        # the @require / @ensure contracts written in a file
+touchstone verify-all bank.py                     # every @ensure function in a module (a CI gate)
 touchstone equiv  impl.py spec.py --func f        # two implementations agree on every input
 touchstone change before.py after.py              # an edit preserves the code's properties (gate an AI diff)
 touchstone repo   pkg/                            # triage trap freedom across a package
+touchstone coverage pkg/                          # verified-subset coverage of a package, tracked over time
 touchstone scan   owner/repo | URL | path         # an owner/repo slug, any GitHub link, or a path: classify reachable traps
 touchstone gate   --base HEAD~1                   # gate a diff in CI: only the changed functions
 touchstone spec   f.py                            # synthesize a contract the function provably satisfies
@@ -98,6 +100,9 @@ touchstone doctest f.py                           # mine the function's own doct
 touchstone returns f.py                           # the declared `-> T` annotation vs what the body can return
 touchstone leak   f.py                            # every opened resource is closed on every path
 touchstone lock   f.py --guarded db.write         # a guarded operation is never reached without a lock held
+touchstone termination f.py                       # a loop or recursion halts on every input (or a diverging one)
+touchstone cost   f.py                            # a proven symbolic iteration bound for a counted loop
+touchstone overflow f.py --width 16               # no signed add/sub/mul wraps a width-N machine integer
 touchstone recheck bundle.json                    # re-validate a saved proof bundle, no fresh solve
 touchstone covers                                 # what it can prove, the modeled subset, the trust base
 ```
@@ -138,7 +143,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: CharlesCNorton/touchstone@v1.24.0
+      - uses: CharlesCNorton/touchstone@v1.25.0
         with:
           baseline: .touchstone-baseline.json   # fail only on a newly introduced trap
 ```
@@ -147,7 +152,7 @@ jobs:
 # .pre-commit-config.yaml -- gate changed functions before each commit
 repos:
   - repo: https://github.com/CharlesCNorton/touchstone
-    rev: v1.24.0
+    rev: v1.25.0
     hooks:
       - id: touchstone-gate
 ```

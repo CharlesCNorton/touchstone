@@ -2847,7 +2847,8 @@ def run_self_tests(fast=False):
     for _act in _xbp()._actions:
         if getattr(_act, "choices", None):
             _verbs.update(_act.choices)
-    assert {"explain", "repair", "metamorphic", "doctest", "returns", "leak", "lock", "recheck"} <= _verbs, _verbs
+    assert {"explain", "repair", "metamorphic", "doctest", "returns", "leak", "lock", "recheck",
+            "termination", "cost", "overflow"} <= _verbs, _verbs
     _xd = _xtf.mkdtemp(prefix="ts_cli_")
     try:
         _xp = _xos.path.join(_xd, "m.py")
@@ -2916,6 +2917,16 @@ def run_self_tests(fast=False):
         with open(_vtp, "w", encoding="utf-8") as _fh:
             _vjson.dump({**_vbundle, "sha256": "0" * 64}, _fh)
         assert _vrun(["recheck", _vtp]) == 1
+        # termination / cost / overflow: the source-only verdict verbs. A counted loop halts (0) and bounds (0),
+        # a recursion with a well-founded measure halts (0), a divergent loop is REFUTED with a witness (1), and
+        # a + b wraps a signed 8-bit integer (1) while a branch returning 0 / 1 cannot (0).
+        _vcounted = "def f(n):\n    i = 0\n    while i < n:\n        i = i + 1\n    return i\n"
+        assert _vrun(["termination", _w("tmg.py", _vcounted)]) == 0
+        assert _vrun(["termination", _w("tmd.py", "def f(x):\n    while x != 0:\n        x = x + 1\n    return x\n")]) == 1
+        assert _vrun(["termination", _w("tmr.py", "def f(n):\n    if n <= 0:\n        return 0\n    return f(n - 1) + 1\n")]) == 0
+        assert _vrun(["cost", _w("cst.py", _vcounted)]) == 0
+        assert _vrun(["overflow", _w("ovw.py", "def f(a, b):\n    return a + b\n"), "--width", "8"]) == 1
+        assert _vrun(["overflow", _w("ovs.py", "def f(x):\n    if x > 0:\n        return 1\n    return 0\n"), "--width", "64"]) == 0
     finally:
         _vsh.rmtree(_vd, ignore_errors=True)
 

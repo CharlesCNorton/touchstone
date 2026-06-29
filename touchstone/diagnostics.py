@@ -68,6 +68,9 @@ Verbs (touchstone <verb> --help for each):
   returns     the declared return annotation against what the body can return
   leak        every opened resource (open(...)) is closed on every path
   lock        a guarded operation is never reached without a lock held
+  termination a loop or recursion provably halts (or a diverging input is found)
+  cost        a proven symbolic iteration bound for a counted loop
+  overflow    no signed add/sub/mul wraps a width-N machine integer (--width)
   repo / gate triage or gate trap-freedom across a package or a git diff
   scan        point at a repo URL, a .py file URL, or a local path and report reachable traps (bugs)
   coverage    verified-subset coverage of a package, tracked over time
