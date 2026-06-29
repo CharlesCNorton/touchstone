@@ -194,6 +194,13 @@ class _Desugar(ast.NodeTransformer):
         return ast.Assign(targets=[store],
                           value=ast.BinOp(left=load, op=node.op, right=node.value))
 
+    def visit_AnnAssign(self, node):
+        self.generic_visit(node)
+        if node.value is None:
+            return None                                    # a bare annotation `x: T` binds nothing at runtime -> drop
+        return ast.copy_location(                          # `x: T = v` is `x = v` (the annotation has no runtime effect)
+            ast.Assign(targets=[node.target], value=node.value), node)
+
     def visit_Compare(self, node):
         self.generic_visit(node)
         return _unchain_compare(node)                      # a < b < c -> (a<b) and (b<c)

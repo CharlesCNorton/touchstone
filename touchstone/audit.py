@@ -3406,6 +3406,11 @@ def run_self_tests(fast=False):
     finally:
         _sh.rmtree(_dre, ignore_errors=True)
 
+    # annotated assignment is desugared to a plain assignment, so a function using `x: T = v` is decided rather
+    # than abstaining at "statement AnnAssign"; a bare annotation `x: T` binds nothing and is dropped.
+    assert check("def f(n):\n    total: int = 0\n    total = total + n\n    return total\n").status == PROVED
+    assert check("def f(n):\n    x: int\n    return n + 1\n").status == PROVED
+
     # verification-guided repair loop: a counterexample drives a generator to a verified result
     _attempts = iter(["def f(x):\n    return x + 1\n", "def f(x):\n    return 2 * x\n"])
     _r = repair_loop(lambda fb: next(_attempts), ensures="result == 2 * x")
