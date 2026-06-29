@@ -1248,10 +1248,13 @@ def _check_trapfree_symexec(prop, target, src, pre_node, spec, repo, has_pre, tr
 def _trapfree_recursive_callees(src, repo):
     """The in-repo callees reachable from `src` that are self-recursive (which the value-engine inliner cannot
     unfold, bailing the caller to UNKNOWN) and provably trap free standalone, so they can be inlined as a
-    trap-free opaque result. Each is verified by the recursion engine with a trivial postcondition, so a PROVED
-    is exactly trap freedom -- restricted to a callee whose parameters are all integers, where the recursion
-    engine's integer model is sound (a container / string parameter it int-models could vacuously prove, so it
-    is skipped, leaving the caller UNKNOWN). Returns the (possibly empty) frozenset of such callee names."""
+    trap-free opaque result. An all-integer-parameter callee is verified by the recursion engine (its integer
+    model is sound there). A callee with a container / string parameter is verified instead by the container-
+    aware value engine, assuming its own self-call is trap free (the inductive hypothesis): sound for partial
+    trap freedom -- a terminating call is a finite tree whose every body, checked over arbitrary arguments with
+    the sequence model, is trap free, so the whole call is -- and unlike the recursion engine's integer model
+    (which an indexed container could vacuously satisfy) the value engine bounds-checks the container exactly.
+    Returns the (possibly empty) frozenset of such callee names."""
     if not repo:
         return frozenset()
     edges = {k: _called_repo_names(repo[k], repo) for k in repo}
@@ -1265,13 +1268,23 @@ def _trapfree_recursive_callees(src, repo):
     triv = lambda S: z3.BoolVal(True)
     out = set()
     for g in reach:
-        if g not in edges.get(g, set()) or not _all_int_params(repo[g]):
-            continue                                             # not self-recursive, or a non-integer parameter
-        try:
-            v = verify_recursive("tf", g, repo[g], triv, lambda S, r: z3.BoolVal(True))
-        except Exception:
-            v = None
-        if v is not None and v.status == PROVED:                 # the recursion engine proved it trap free
+        if g not in edges.get(g, set()):                          # not self-recursive
+            continue
+        v = None
+        if _all_int_params(repo[g]):
+            try:
+                v = verify_recursive("tf", g, repo[g], triv, lambda S, r: z3.BoolVal(True))
+            except Exception:
+                v = None
+        else:                                                     # a container / string-parameter self-recursion:
+            try:                                                  # check the body with the self-call assumed trap free
+                spec = Ctx(repo); spec.traps = None; spec.pc = z3.BoolVal(True)
+                pn = _strip_old(core.parse_spec("True"))
+                v = _check_trapfree_symexec("trap freedom", g, repo[g], pn, spec, repo, False,
+                                            trapfree_callees=frozenset(out | {g}))
+            except Exception:
+                v = None
+        if v is not None and v.status == PROVED:                  # proved trap free standalone
             out.add(g)
     return frozenset(out)
 

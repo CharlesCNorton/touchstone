@@ -2146,6 +2146,10 @@ class Ctx:
         return r
 
     def inline(self, name: str, argvals: List[z3.ExprRef]) -> z3.ExprRef:
+        if name in self.trapfree_callees:            # a recursive callee verified trap free standalone: a fresh,
+            self.overapprox = True                   # arg-independent result with no imported trap. Returned directly
+            return z3.FreshInt("rcret_" + name)      # (the args are already trap-checked at the call site); no
+        #                                              substitution, whose pairs a container formal cannot satisfy.
         cc = self._contract_for(name)                # a recursive callee the inliner cannot unfold: summarize it by
         if cc is not None and _callee_recursive(self.repo.get(name, ""), name):   # its @ensure contract (modular)
             return self._contract_summary(name, cc, argvals)

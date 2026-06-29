@@ -3420,6 +3420,19 @@ def run_self_tests(fast=False):
     assert check("def f(%s):\n    if 0<=i<len(p) and 0<=j<len(p[i]) and i+1<len(p):\n        return p[i+1][j]\n    return 0\n" % _NL).status == REFUTED
     assert check("def f(%s, v: int):\n    if 0<=i<len(p) and 0<=j<len(p[i]):\n        p[i][j] = v\n    return 0\n" % _NL).status == PROVED
 
+    # a self-recursive function over a list / str parameter is verified trap free through the value engine (its
+    # self-call assumed trap free -- the inductive hypothesis), so a guarded recursive index proves while an
+    # unguarded one still refutes. Triaged with a repo (the self-call is in-repo), exactly as a scan does.
+    _drec = _tf.mkdtemp(prefix="ts_rec_")
+    try:
+        open(_os.path.join(_drec, "r.py"), "w").write(
+            "def g(p: list, i: int):\n    if i < 0 or i >= len(p):\n        return 0\n    return p[i] + g(p, i + 1)\n\n"
+            "def bad(p: list, i: int):\n    if i >= len(p):\n        return 0\n    return p[i] + bad(p, i + 1)\n")
+        _st = dict(verify_repo(_drec))
+        assert _st.get("r.g") == PROVED and _st.get("r.bad") == REFUTED
+    finally:
+        _sh.rmtree(_drec, ignore_errors=True)
+
     # verification-guided repair loop: a counterexample drives a generator to a verified result
     _attempts = iter(["def f(x):\n    return x + 1\n", "def f(x):\n    return 2 * x\n"])
     _r = repair_loop(lambda fb: next(_attempts), ensures="result == 2 * x")
