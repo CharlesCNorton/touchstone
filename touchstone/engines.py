@@ -2707,6 +2707,50 @@ def _triage_check(job):
     return h, status
 
 
+_POOL_ENV = "_TOUCHSTONE_POOL_ACTIVE"          # set in spawn-pool children; marks an unguarded-__main__ re-import
+
+
+def _in_pool_worker():
+    """True when this process is a triage spawn-pool worker re-importing the caller's __main__. A whole-repo entry
+    point (scan / verify_repo / coverage / verify_diff) invoked here is the classic unguarded-`if __name__ ==
+    '__main__'` footgun: the spawn start method re-runs the caller's module in every worker, so an unguarded
+    top-level scan() would recurse into another pool. The flag is inherited from the parent at spawn and is
+    already set while the child re-imports __main__ (before the worker's real task), so the entry point sees it
+    and returns an empty result instead of recursing -- the guard is no longer the caller's responsibility."""
+    return bool(os.environ.get(_POOL_ENV))
+
+
+def _in_child_process():
+    """Whether we are in any spawned/forked child, so a triage stays serial rather than spawn a nested pool."""
+    import multiprocessing as _mp
+    try:
+        return _mp.parent_process() is not None
+    except Exception:
+        return False
+
+
+@contextlib.contextmanager
+def _pool_active():
+    """Mark the spawn window so children inherit _POOL_ENV and recognize themselves as workers; restored after, so
+    a later top-level call in this same process is unaffected (and a pre-existing value is preserved)."""
+    had = os.environ.get(_POOL_ENV)
+    os.environ[_POOL_ENV] = "1"
+    try:
+        yield
+    finally:
+        if had is None:
+            os.environ.pop(_POOL_ENV, None)
+        else:
+            os.environ[_POOL_ENV] = had
+
+
+def _empty_scan_report(target, execute):
+    """The no-op report scan() returns when re-entered inside a pool worker (the footgun guard)."""
+    return {"target": target, "fetched": False, "executed": bool(execute), "functions": 0, "proved": 0,
+            "refuted": 0, "unknown": 0, "bugs": 0, "input_validation": 0, "unconfirmed": 0,
+            "context_unreachable": 0, "suspected": 0, "suppressed_in_source": 0, "findings": []}
+
+
 def _run_triage(work, repo, jobs, progress=None):
     """Discharge the cache-miss items {hash: (hash, src, key, total)} and return {hash: status}. jobs <= 1 runs
     serially (deterministic, the default); jobs > 1 runs a spawn-based process pool capped at the CPU count, so
@@ -2718,13 +2762,14 @@ def _run_triage(work, repo, jobs, progress=None):
     if not items:
         return {}
     n = min(jobs, len(items), os.cpu_count() or 1) if (jobs and jobs > 1) else 1
-    if n > 1:
+    if n > 1 and not _in_child_process():                         # never spawn a nested pool from inside a worker
         import concurrent.futures
         import multiprocessing as _mp
         from . import _partriage                                  # the worker lives in its own module so a spawned
         try:                                                      # worker imports the package through its normal entry
-            with concurrent.futures.ProcessPoolExecutor(max_workers=n, mp_context=_mp.get_context("spawn"),
-                                                        initializer=_partriage.init, initargs=(repo,)) as ex:
+            with _pool_active(), concurrent.futures.ProcessPoolExecutor(   # mark the window: children no-op a
+                    max_workers=n, mp_context=_mp.get_context("spawn"),    # re-entrant top-level scan (footgun)
+                    initializer=_partriage.init, initargs=(repo,)) as ex:
                 out = {}
                 for i, (h, st) in enumerate(ex.map(_partriage.run, items)):   # map yields in submission order
                     out[h] = st
@@ -2787,6 +2832,8 @@ def verify_repo(root, total=False, cache=None, jobs=1, exclude=None, progress=No
     incremental. `jobs > 1` triages the cache misses across that many worker processes (capped at the CPU
     count); the verdicts are the deterministic rlimit-bound ones, identical to a serial run. `exclude`, a list
     of fnmatch globs, drops matching modules from triage while still loading them for call resolution."""
+    if _in_pool_worker():                                     # a worker re-importing an unguarded __main__: no-op
+        return []
     modules = repo_modules(root)
     repo = load_program(modules)                              # the full load set, so excluded modules still resolve
     verdicts = cache if cache is not None else {}
@@ -2803,6 +2850,8 @@ def verify_diff(root, changed, total=False, cache=None, jobs=1, exclude=None, pr
     gate's cost tracks the change rather than the repository size. `changed` is a list of file paths
     relative to `root` (the output of `git diff --name-only`) or dotted module names. Returns
     (module.function, status) for the affected set, ordered."""
+    if _in_pool_worker():                                     # a worker re-importing an unguarded __main__: no-op
+        return []
     modules = repo_modules(root)
     repo = load_program(modules)
     label = _repo_labels(modules)
@@ -2854,6 +2903,8 @@ def coverage(root, history=None, cache=None, jobs=1, exclude=None, progress=None
     and any function that newly refutes -- so verification debt and a regression are visible over time.
     Returns the report dict; append it to a persisted history to track the trend. `jobs > 1` triages across
     that many worker processes."""
+    if _in_pool_worker():                                     # a worker re-importing an unguarded __main__: no-op
+        return {"total": 0, "proved": 0, "refuted": 0, "unknown": 0, "coverage": 0.0, "refuted_functions": []}
     rows = verify_repo(root, cache=cache, jobs=jobs, exclude=exclude, progress=progress)
     proved = sum(1 for _, s in rows if s == PROVED)
     refuted = sorted(n for n, s in rows if s == REFUTED)
@@ -3364,11 +3415,14 @@ def _triage_repo_verdicts(root, total=False, jobs=None, cache=None, progress=Non
     else:
         want = jobs
     n = min(want, len(miss_tasks), os.cpu_count() or 1) if (want and want > 1) else 1
+    if _in_child_process():                                   # inside a worker (an unguarded-__main__ re-import):
+        n = 1                                                 # stay serial, never spawn a nested pool
     miss_rows = None
     if n > 1 and miss_tasks:
         try:                                                  # per-unit tasks across the supervised, crash-tolerant
-            miss_rows = _run_unit_pool(miss_tasks, repo, modules, total, n,   # pool (_run_unit_pool)
-                                       progress=progress, done0=done0, ntotal=ntotal)
+            with _pool_active():                              # mark the window: children no-op a re-entrant scan
+                miss_rows = _run_unit_pool(miss_tasks, repo, modules, total, n,   # pool (_run_unit_pool)
+                                           progress=progress, done0=done0, ntotal=ntotal)
         except Exception:
             miss_rows = None                                  # a pool that cannot start: fall through to serial
     if miss_rows is None:
@@ -3844,6 +3898,8 @@ def scan(target, execute=False, total=False, jobs=None, cache=None, progress=Non
     functions, proved, refuted, unknown, bugs, input_validation, unconfirmed, suppressed_in_source, findings},
     each finding {location, module, line, kind, classification, exception, counterexample, witness, reason,
     repro, source, severity, label}."""
+    if _in_pool_worker():                                       # a worker re-importing an unguarded __main__:
+        return _empty_scan_report(target, execute)              # no-op rather than recurse into a nested pool
     import shutil
     path, single_src, tmp, fetched = _resolve_scan_target(target)
     saved = (core.SANDBOX_SUBJECT, core.ALLOW_SUBJECT_EXECUTION)

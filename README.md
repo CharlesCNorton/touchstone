@@ -132,7 +132,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: CharlesCNorton/touchstone@v1.17.0
+      - uses: CharlesCNorton/touchstone@v1.18.0
         with:
           baseline: .touchstone-baseline.json   # fail only on a newly introduced trap
 ```
@@ -141,7 +141,7 @@ jobs:
 # .pre-commit-config.yaml -- gate changed functions before each commit
 repos:
   - repo: https://github.com/CharlesCNorton/touchstone
-    rev: v1.17.0
+    rev: v1.18.0
     hooks:
       - id: touchstone-gate
 ```
@@ -149,8 +149,11 @@ repos:
 Plain `prove` / `check` analyze symbolically and spawn nothing. `verify_repo(..., jobs=N)` (the `repo` verb's
 parallel triage) and the out-of-process sandbox (only when subject execution is enabled — the differential
 oracle, a recursive-callee trap fallback, `scan --execute`) use the multiprocessing **spawn** start method,
-which re-imports the calling module in each worker. A script that drives those must guard its top-level code
-with `if __name__ == "__main__":`, or the worker re-runs it (you will see the header print once per worker).
+which re-imports the calling module in each worker. Touchstone marks those workers, so a re-entered
+`scan` / `verify_repo` / `coverage` / `verify_diff` no-ops in the worker rather than recursing into a nested
+pool: an unguarded driver still completes with the correct result in the main process. Guarding top-level code
+with `if __name__ == "__main__":` is therefore optional — recommended only to avoid the redundant re-import
+work and any repeated top-level side effects (a stray print per worker).
 
 ```
 $ touchstone prove f.py --ensures 'result == x'

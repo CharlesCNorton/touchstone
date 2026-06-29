@@ -3385,6 +3385,27 @@ def run_self_tests(fast=False):
     finally:
         _sh.rmtree(_dxc, ignore_errors=True)
 
+    # spawn-pool re-entry guard: a worker re-importing an unguarded __main__ has _POOL_ENV set, so a re-entered
+    # whole-repo entry point no-ops (empty result) instead of recursing into a nested pool -- the footgun fix.
+    from . import engines as _eng2
+    _dre = _tf.mkdtemp(prefix="ts_reentry_")
+    try:
+        open(_os.path.join(_dre, "a.py"), "w").write("def trap(x):\n    return 1 // x\n")
+        assert scan(_dre, jobs=1)["functions"] == 1                       # normal: the unit is triaged
+        _had = _os.environ.get(_eng2._POOL_ENV)
+        _os.environ[_eng2._POOL_ENV] = "1"
+        try:                                                             # emulate running inside a pool worker
+            assert scan(_dre, jobs=1)["functions"] == 0 and scan(_dre, jobs=1)["findings"] == []
+            assert verify_repo(_dre) == [] and verify_diff(_dre, ["a.py"]) == [] and coverage(_dre)["total"] == 0
+        finally:
+            if _had is None:
+                _os.environ.pop(_eng2._POOL_ENV, None)
+            else:
+                _os.environ[_eng2._POOL_ENV] = _had
+        assert scan(_dre, jobs=1)["functions"] == 1                       # flag cleared: normal again
+    finally:
+        _sh.rmtree(_dre, ignore_errors=True)
+
     # verification-guided repair loop: a counterexample drives a generator to a verified result
     _attempts = iter(["def f(x):\n    return x + 1\n", "def f(x):\n    return 2 * x\n"])
     _r = repair_loop(lambda fb: next(_attempts), ensures="result == 2 * x")
