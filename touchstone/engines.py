@@ -4855,8 +4855,12 @@ def verify_deductive_auto(prop, target, src, pre, post, repo=None, quad=True) ->
         if isinstance(n, ast.Constant) and isinstance(n.value, int): consts.add(n.value)
     C = _gen_candidates(args + loopvars, sorted(consts), quad)
 
+    try:
+        pre_b = pre(base)                                          # the user precondition, evaluated once
+    except (Unsupported, z3.Z3Exception, TypeError, KeyError, AttributeError):
+        return Verdict(UNKNOWN, prop, target, "Houdini", reason="precondition is outside the modeled subset")
     kept = [(l, p) for (l, p) in C
-            if _solve(z3.And(pre(base), z3.Not(p(init_state))))[0] == PROVED]
+            if _solve(z3.And(pre_b, z3.Not(p(init_state))))[0] == PROVED]
     changed = True
     while changed:
         changed = False
@@ -4865,7 +4869,11 @@ def verify_deductive_auto(prop, target, src, pre, post, repo=None, quad=True) ->
             if _solve(z3.And(inv, guard, z3.Not(p(body_state))))[0] != PROVED:
                 kept.remove((lbl, p)); changed = True
     inv = z3.And(*[p(sym) for _, p in kept]) if kept else z3.BoolVal(True)
-    if _solve_corro(z3.And(inv, z3.Not(guard), z3.Not(post(base, ret_exit))))[0] != PROVED:
+    try:
+        post_holds = _solve_corro(z3.And(inv, z3.Not(guard), z3.Not(post(base, ret_exit))))[0] == PROVED
+    except (Unsupported, z3.Z3Exception, TypeError, KeyError, AttributeError):
+        return Verdict(UNKNOWN, prop, target, "Houdini", reason="postcondition is outside the modeled subset")
+    if not post_holds:
         return Verdict(UNKNOWN, prop, target, "Houdini",
                        reason="no sufficient invariant found in template space")
     kept = _minimize(kept, sym)
@@ -8916,12 +8924,15 @@ def _powersum_invariant(prop, target, src, pre, post, repo=None, maxdeg=8) -> Ve
     inv = z3.And(*conj)
     at_init = z3.substitute(inv, *[(sym[v], init_state[v]) for v in order])
     at_body = z3.substitute(inv, *[(sym[v], body[v]) for v in order])
-    if _solve(z3.And(pre(base), z3.Not(at_init)))[0] != PROVED:
-        return Verdict(UNKNOWN, prop, target, "power-sum invariant", reason="initiation not established")
-    if _solve(z3.And(inv, guard, z3.Not(at_body)))[0] != PROVED:
-        return Verdict(UNKNOWN, prop, target, "power-sum invariant", reason="invariant not preserved")
-    if _solve_corro(z3.And(inv, z3.Not(guard), z3.Not(post(base, ret_exit))))[0] != PROVED:
-        return Verdict(UNKNOWN, prop, target, "power-sum invariant", reason="postcondition not established")
+    try:
+        if _solve(z3.And(pre(base), z3.Not(at_init)))[0] != PROVED:
+            return Verdict(UNKNOWN, prop, target, "power-sum invariant", reason="initiation not established")
+        if _solve(z3.And(inv, guard, z3.Not(at_body)))[0] != PROVED:
+            return Verdict(UNKNOWN, prop, target, "power-sum invariant", reason="invariant not preserved")
+        if _solve_corro(z3.And(inv, z3.Not(guard), z3.Not(post(base, ret_exit))))[0] != PROVED:
+            return Verdict(UNKNOWN, prop, target, "power-sum invariant", reason="postcondition not established")
+    except (Unsupported, z3.Z3Exception, TypeError, KeyError, AttributeError):
+        return Verdict(UNKNOWN, prop, target, "power-sum invariant", reason="specification is outside the modeled subset")
     return Verdict(PROVED, prop, target, "power-sum invariant (interpolated, verified)",
                    reason="closed-form invariant interpolated through the counter and verified inductively")
 
@@ -9057,10 +9068,15 @@ def learn_invariant(prop, target, src, pre, post, repo=None, degree=2, max_degre
                            reason="learned invariant: " + " ; ".join(l for l, _ in kept))
         return None
 
-    for deg in range(degree, max_degree + 1):                      # escalate the polynomial degree on failure
-        got = attempt(deg)
-        if got is not None:
-            return got
+    try:
+        for deg in range(degree, max_degree + 1):                  # escalate the polynomial degree on failure
+            got = attempt(deg)
+            if got is not None:
+                return got
+    except (Unsupported, z3.Z3Exception, TypeError, KeyError, AttributeError):
+        # the postcondition is evaluated lazily inside attempt; if it is outside the modeled subset, abstain
+        return Verdict(UNKNOWN, prop, target, "invariant learning",
+                       reason="postcondition is outside the modeled subset")
     return Verdict(UNKNOWN, prop, target, "invariant learning",
                    reason="learned invariants insufficient for the postcondition")
 
