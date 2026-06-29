@@ -4206,9 +4206,16 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         env2 = dict(env)                                     # a comprehension: trap-check the iterables, element,
         iters = []                                           # and filters with the targets as arbitrary integers
         for gen in node.generators:
-            iters.append(ev(gen.iter, env2, ctx))            # the iterable is evaluated (trap-checked) regardless
-            for t in _target_names(gen.target):
-                env2[t] = z3.FreshInt("hc_" + t)
+            it = ev(gen.iter, env2, ctx)                     # the iterable is evaluated (trap-checked) regardless
+            iters.append(it)
+            if _is_str(it) and isinstance(gen.target, ast.Name):   # iterating a string yields 1-char strings, so the
+                cs = z3.String("hc_" + gen.target.id)              # element's ord(c) / len(c) / c == '?' is modeled
+                if ctx.facts is not None:
+                    ctx.facts.append(z3.Length(cs) == 1)
+                env2[gen.target.id] = cs
+            else:
+                for t in _target_names(gen.target):
+                    env2[t] = z3.FreshInt("hc_" + t)
         # the filters and element run only when the iterable yields at least one element; for a single-generator
         # comprehension over a sized container, condition their traps on len(iterable) >= 1, so a trap in the
         # element is not flagged for an input that empties the iterable -- the 10 // n in [.. for i in range(1, n)]
@@ -4449,7 +4456,12 @@ def _param_term(arg):
         if base in ("list", "List", "Sequence", "MutableSequence"):   # set[T], tuple[...], or a typing alias. A scalar
             return _SafeContainer(arg.arg, elem=_elem_container_proto(ann.slice))   # element type is still ignored; a
         if base in ("tuple", "Tuple"):                      # *sequence* element type makes c[i] a nested sequence
-            return _SafeContainer(arg.arg, immutable=True, elem=_elem_container_proto(ann.slice))
+            sl = ann.slice                                  # tuple[T1, .., Tn] is a fixed-arity tuple of exactly n
+            n = z3.IntVal(1)                                 # elements; tuple[T, ...] is variadic; tuple[T] is a 1-tuple
+            if isinstance(sl, ast.Tuple):
+                n = None if any(isinstance(e, ast.Constant) and e.value is Ellipsis for e in sl.elts) \
+                    else z3.IntVal(len(sl.elts))             # the exact length, so x, y = t (arity n) raises no ValueError
+            return _SafeContainer(arg.arg, immutable=True, length=n, elem=_elem_container_proto(sl))
         if base in ("set", "frozenset", "Set", "FrozenSet", "MutableSet"):
             return _SafeContainer(arg.arg, unindexable=True)
         if base in ("dict", "Dict", "Mapping", "MutableMapping"):
@@ -5073,6 +5085,11 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         if isinstance(e.get(nm), _NoneVal) or nm in bnone:   # a possibly-None var havoc'd to an
                             ctx.none_havoc = True              # int would mask a real None-trap, so withhold PROVED
                         he[nm] = _havoc_val(e.get(nm), nm)      # loop variable and body-written names: arbitrary
+                    if _is_str(itv) and isinstance(s.target, ast.Name):   # iterating a string yields 1-char strings,
+                        cs = z3.String("selem_" + s.target.id)            # so a body doing ord(c) / len(c) / c == '?'
+                        if ctx.facts is not None:                         # decides (an arbitrary char over-approximates
+                            ctx.facts.append(z3.Length(cs) == 1)          # every element); len(c) == 1, no trap
+                        he[s.target.id] = cs
                     body_p = p
                     if isinstance(itv, _DictParam) and isinstance(s.target, ast.Name):
                         kv = he[s.target.id]                  # iterating a dict yields keys: the loop variable is a member

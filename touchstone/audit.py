@@ -3433,6 +3433,19 @@ def run_self_tests(fast=False):
     finally:
         _sh.rmtree(_drec, ignore_errors=True)
 
+    # a fixed-arity tuple parameter (tuple[int, int]) has exactly that many elements, so x, y = t raises no
+    # ValueError and t in bounds proves, while t[2] still refutes and a bare / variadic tuple keeps arbitrary length.
+    assert check("def f(key: tuple[int, int]):\n    n, d = key\n    return n + d\n").status == PROVED
+    assert check("def f(key: tuple[int, int]):\n    return key[2]\n").status == REFUTED
+    assert check("def f(key: tuple):\n    n, d = key\n    return 0\n").status == REFUTED
+
+    # iterating a string parameter binds the element to a 1-char string (a for-loop or a comprehension), so an
+    # element op ord(c) / len(c) decides (an arbitrary char over-approximates every one), while a trapping element
+    # op still refutes.
+    assert check("def f(plain: str):\n    return [ord(c) - 96 for c in plain]\n").status == PROVED
+    assert check("def f(s: str):\n    for c in s:\n        x = ord(c)\n    return 0\n").status == PROVED
+    assert check("def f(s: str):\n    return [10 // (ord(c) - 65) for c in s]\n").status == REFUTED
+
     # verification-guided repair loop: a counterexample drives a generator to a verified result
     _attempts = iter(["def f(x):\n    return x + 1\n", "def f(x):\n    return 2 * x\n"])
     _r = repair_loop(lambda fb: next(_attempts), ensures="result == 2 * x")
