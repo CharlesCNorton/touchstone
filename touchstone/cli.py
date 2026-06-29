@@ -379,9 +379,10 @@ def _cmd_repo(a):
             cache = {}
     jobs = getattr(a, "jobs", 1) or 1
     if a.changed:
-        rows = t.verify_diff(a.dir, [c for c in a.changed.split(",") if c], total=a.total, cache=cache, jobs=jobs)
+        rows = t.verify_diff(a.dir, [c for c in a.changed.split(",") if c], total=a.total, cache=cache,
+                             jobs=jobs, exclude=a.exclude)
     else:
-        rows = t.verify_repo(a.dir, total=a.total, cache=cache, jobs=jobs)
+        rows = t.verify_repo(a.dir, total=a.total, cache=cache, jobs=jobs, exclude=a.exclude)
     if a.cache:
         try:
             with open(a.cache, "w", encoding="utf-8") as fh:
@@ -424,7 +425,7 @@ def _cmd_scan(a):
             print("\rtriaged %d/%d units (%d%%)" % (done, total, pct),
                   end=("\n" if done >= total else ""), file=sys.stderr, flush=True)
     try:
-        rep = t.scan(a.target, execute=a.execute, jobs=a.jobs, cache=cache, progress=progress)
+        rep = t.scan(a.target, execute=a.execute, jobs=a.jobs, cache=cache, progress=progress, exclude=a.exclude)
     except ValueError as e:
         _die(str(e))
     if cache is not None:
@@ -441,7 +442,16 @@ def _cmd_scan(a):
                 f["baselined"] = True
             new_findings = []
 
-    def _fail(fs):                                          # executed: a confirmed/suspected bug; symbolic: any trap
+    def _fail(fs):                                          # --fail-on overrides the default exit policy
+        if a.fail_on == "none":
+            return False
+        if a.fail_on == "any":
+            return bool(fs)
+        if a.fail_on == "bug":
+            return any(f["classification"] == "bug" for f in fs)
+        if a.fail_on == "suspected":
+            return any(f["classification"] in ("bug", "suspected") for f in fs)
+        # default (no --fail-on): executed -> a confirmed/suspected bug; symbolic -> any reachable trap
         return any(f["classification"] in ("bug", "suspected") for f in fs) if rep["executed"] else bool(fs)
     fail = _fail(new_findings if a.baseline else findings)
 
@@ -451,6 +461,12 @@ def _cmd_scan(a):
         return 1 if fail else 0
     if a.json:
         print(json.dumps(rep))
+        return 1 if fail else 0
+    if a.quiet:                                            # only the finding lines (tag + location), greppable
+        for f in rep["findings"]:
+            tag = "  (baselined)" if f.get("baselined") else ""
+            loc = f["location"] + (":%d" % f["line"] if f.get("line") else "")
+            print("%s  %s%s" % (_paint(_SCAN_TAG.get(f["classification"], "REFUTED")), loc, tag))
         return 1 if fail else 0
     where = "fetched" if rep["fetched"] else "local"
     mode = "executed in sandbox" if rep["executed"] else "symbolic, code not run"
@@ -556,7 +572,7 @@ def _cmd_coverage(a):
     import time
     history = _load_json(a.history, [])
     cache = _load_json(a.cache, {})
-    report = t.coverage(a.dir, history=history, cache=cache, jobs=getattr(a, "jobs", 1) or 1)
+    report = t.coverage(a.dir, history=history, cache=cache, jobs=getattr(a, "jobs", 1) or 1, exclude=a.exclude)
     report["time"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     if a.cache:
         _dump_json(a.cache, cache)
@@ -592,6 +608,36 @@ def _dump_json(path, obj):
             json.dump(obj, fh)
     except OSError:
         pass
+
+
+def _as_list(x):
+    """Normalize an exclude value (a comma-separated string from the CLI, or a list from the config) to a list."""
+    if x is None:
+        return None
+    return [p for p in x.split(",") if p] if isinstance(x, str) else [str(p) for p in x]
+
+
+def _load_tool_config(start=None):
+    """The [tool.touchstone] table from the nearest pyproject.toml, walking up from `start` (default the current
+    directory), as a dict of CLI defaults (exclude, budget, jobs, fail_on). Empty when none is found or tomllib is
+    unavailable; a read / parse error is swallowed so a malformed file never breaks a run."""
+    try:
+        import tomllib
+    except Exception:
+        return {}
+    d = os.path.abspath(start or os.getcwd())
+    while True:
+        p = os.path.join(d, "pyproject.toml")
+        if os.path.isfile(p):
+            try:
+                with open(p, "rb") as fh:
+                    return (tomllib.load(fh).get("tool", {}) or {}).get("touchstone", {}) or {}
+            except (OSError, ValueError):
+                return {}
+        parent = os.path.dirname(d)
+        if parent == d:
+            return {}
+        d = parent
 
 
 def _cmd_spec(a):
@@ -707,9 +753,10 @@ def build_parser():
                          help="print only the verdict word; rely on the exit status")
     verdict.add_argument("--timeout", type=int, metavar="MS", default=None,
                          help="hard per-query wall-clock budget in milliseconds")
-    verdict.add_argument("--budget", choices=("standard", "high", "max"), default="standard",
+    verdict.add_argument("--budget", choices=("standard", "high", "max"), default=None,
                          help="solver resource budget (the deterministic rlimit, scaled with the timeouts); "
-                              "a higher budget decides more cases but costs more (default: standard)")
+                              "a higher budget decides more cases but costs more (default: standard, or "
+                              "[tool.touchstone] budget)")
     verdict.add_argument("--repro", action="store_true",
                          help="on a refutation, also emit a runnable failing test that reproduces the counterexample")
     verdict.add_argument("--best-effort", action="store_true",
@@ -773,9 +820,11 @@ def build_parser():
     rp.add_argument("--changed", default=None, metavar="PATHS",
                     help="comma-separated changed files (git diff --name-only); verify only those functions "
                          "and the callers that depend on them")
-    rp.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
+    rp.add_argument("--jobs", "-j", type=int, default=None, metavar="N",
                     help="triage across N worker processes (capped at the CPU count); the verdicts are identical "
-                         "to a serial run")
+                         "to a serial run (default: 1, or [tool.touchstone] jobs)")
+    rp.add_argument("--exclude", type=_as_list, default=None, metavar="GLOBS",
+                    help="comma-separated fnmatch globs to drop from triage (also [tool.touchstone] exclude)")
     rp.add_argument("--sarif", action="store_true",
                     help="emit a SARIF 2.1.0 log (one result per refuted function) for code scanning")
     rp.set_defaults(fn=_cmd_repo)
@@ -802,6 +851,12 @@ def build_parser():
                          "one not in it (adopt a scan on a large repo without fixing every finding at once)")
     sc.add_argument("--update-baseline", action="store_true",
                     help="(re)write the --baseline file from this run's findings, then pass -- establishes or refreshes it")
+    sc.add_argument("--exclude", type=_as_list, default=None, metavar="GLOBS",
+                    help="comma-separated fnmatch globs (module or path form) to drop from triage, e.g. "
+                         "'*/migrations/*,vendor/*'; also settable as a [tool.touchstone] exclude list")
+    sc.add_argument("--fail-on", choices=("bug", "suspected", "any", "none"), default=None,
+                    help="which findings make the exit nonzero (default: executed -> bug/suspected, symbolic -> any)")
+    sc.add_argument("-q", "--quiet", action="store_true", help="print only the finding lines (the tag and location)")
     sc.set_defaults(fn=_cmd_scan)
 
     gt = sub.add_parser("gate", help="gate a diff: verify each changed function preserves its properties "
@@ -822,8 +877,11 @@ def build_parser():
     cv.add_argument("--history", default=None, metavar="FILE",
                     help="JSON history to read the trend from and append this run to")
     cv.add_argument("--cache", default=None, metavar="FILE", help="content-addressed verdict cache (see repo)")
-    cv.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
-                    help="triage across N worker processes (capped at the CPU count); verdicts unchanged")
+    cv.add_argument("--jobs", "-j", type=int, default=None, metavar="N",
+                    help="triage across N worker processes (capped at the CPU count); verdicts unchanged "
+                         "(default: 1, or [tool.touchstone] jobs)")
+    cv.add_argument("--exclude", type=_as_list, default=None, metavar="GLOBS",
+                    help="comma-separated fnmatch globs to drop from triage (also [tool.touchstone] exclude)")
     cv.add_argument("--json", action="store_true", help="emit the report as one JSON object")
     cv.set_defaults(fn=_cmd_coverage)
 
@@ -875,8 +933,15 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    budget = getattr(args, "budget", "standard")
-    if budget != "standard":                                     # scale the deterministic rlimit and the timeouts
+    cfg = _load_tool_config()                                    # [tool.touchstone] defaults; any CLI flag overrides
+    if getattr(args, "exclude", None) is None and cfg.get("exclude") is not None:
+        args.exclude = _as_list(cfg.get("exclude"))
+    if getattr(args, "fail_on", None) is None and cfg.get("fail_on") is not None:
+        args.fail_on = cfg.get("fail_on")
+    if getattr(args, "jobs", "unset") is None and cfg.get("jobs") is not None:
+        args.jobs = int(cfg.get("jobs"))
+    budget = getattr(args, "budget", None) or cfg.get("budget") or "standard"
+    if budget in ("high", "max"):                                # scale the deterministic rlimit and the timeouts
         k = {"high": 8, "max": 64}[budget]
         c = t.core
         t.configure(solve_rlimit=c.SOLVE_RLIMIT * k, fp_solve_rlimit=c.FP_SOLVE_RLIMIT * k,

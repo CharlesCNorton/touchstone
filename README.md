@@ -104,8 +104,41 @@ subset, named with its line) so the next step is clear.
 For triage at scale, `scan` and `repo` emit `--sarif` (a SARIF 2.1.0 log for GitHub code scanning or any
 viewer); `scan --cache FILE` reuses a content-addressed verdict cache so a re-scan only re-triages changed
 code; `scan --baseline FILE` reports every finding but exits nonzero only on one not already recorded, to
-adopt the scan on a large codebase without fixing every finding at once; and `--jobs N` / `--progress` set
-the worker count and print a live triaged-units counter.
+adopt the scan on a large codebase without fixing every finding at once; `--exclude` drops vendored or
+generated modules from triage; `scan --fail-on {bug,suspected,any,none}` sets the exit policy; and `--jobs N`
+/ `--progress` set the worker count and print a live triaged-units counter.
+
+Defaults can live in `pyproject.toml`, and the scan drops into CI as a GitHub Action or a pre-commit hook:
+
+```toml
+[tool.touchstone]
+exclude = ["*/migrations/*", "vendor/*"]   # globs dropped from triage (still loaded for call resolution)
+fail_on = "bug"                            # bug | suspected | any | none
+jobs = 8
+```
+
+```yaml
+# .github/workflows/touchstone.yml -- scan and annotate findings in the Security tab
+permissions:
+  security-events: write
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: CharlesCNorton/touchstone@v1.15.0
+        with:
+          baseline: .touchstone-baseline.json   # fail only on a newly introduced trap
+```
+
+```yaml
+# .pre-commit-config.yaml -- gate changed functions before each commit
+repos:
+  - repo: https://github.com/CharlesCNorton/touchstone
+    rev: v1.15.0
+    hooks:
+      - id: touchstone-gate
+```
 
 Plain `prove` / `check` analyze symbolically and spawn nothing. `verify_repo(..., jobs=N)` (the `repo` verb's
 parallel triage) and the out-of-process sandbox (only when subject execution is enabled — the differential

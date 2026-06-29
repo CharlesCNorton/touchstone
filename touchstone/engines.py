@@ -2762,7 +2762,7 @@ def _triage_collect(modules, repo, total, closure_hash, keys=None):
     return order, work
 
 
-def verify_repo(root, total=False, cache=None, jobs=1):
+def verify_repo(root, total=False, cache=None, jobs=1, exclude=None):
     """Trap-freedom triage of a whole repository on disk: check every top-level function in every module,
     following calls across the resolved cross-module call graph, and check every method inside a class as
     well, returning a list of (module.function or module.Class.method, status). A method is triaged
@@ -2773,18 +2773,19 @@ def verify_repo(root, total=False, cache=None, jobs=1):
     top-level function whose own source and whole transitive callee closure are byte-identical to a previous
     run, or a method whose source is unchanged, is not re-verified, so passing a cache makes a re-run
     incremental. `jobs > 1` triages the cache misses across that many worker processes (capped at the CPU
-    count); the verdicts are the deterministic rlimit-bound ones, identical to a serial run."""
+    count); the verdicts are the deterministic rlimit-bound ones, identical to a serial run. `exclude`, a list
+    of fnmatch globs, drops matching modules from triage while still loading them for call resolution."""
     modules = repo_modules(root)
-    repo = load_program(modules)
+    repo = load_program(modules)                              # the full load set, so excluded modules still resolve
     verdicts = cache if cache is not None else {}
     closure_hash, _ = _closure_hasher(repo)
-    order, work = _triage_collect(modules, repo, total, closure_hash)
+    order, work = _triage_collect(_filter_excluded(modules, exclude), repo, total, closure_hash)
     miss = {h: job for h, job in work.items() if h not in verdicts}
     verdicts.update(_run_triage(miss, repo, jobs))
     return [(name, verdicts[h]) for name, h in order]
 
 
-def verify_diff(root, changed, total=False, cache=None, jobs=1):
+def verify_diff(root, changed, total=False, cache=None, jobs=1, exclude=None):
     """Verify only the functions a change touches: the functions in the `changed` modules and every caller
     whose proof transitively depends on one of them, leaving the rest of the repository unverified, so a
     gate's cost tracks the change rather than the repository size. `changed` is a list of file paths
@@ -2824,6 +2825,8 @@ def verify_diff(root, changed, total=False, cache=None, jobs=1):
     for key in sorted(affected):
         if key not in repo:
             continue
+        if _excluded(label.get(key, key).rsplit(".", 1)[0], exclude):   # drop a change in a user-excluded module
+            continue
         h = closure_hash(key)
         order.append((label.get(key, key), h))
         work.setdefault(h, (h, repo[key], key, total))
@@ -2832,14 +2835,14 @@ def verify_diff(root, changed, total=False, cache=None, jobs=1):
     return [(name, verdicts[h]) for name, h in order]
 
 
-def coverage(root, history=None, cache=None, jobs=1):
+def coverage(root, history=None, cache=None, jobs=1, exclude=None):
     """The verified-subset coverage of a repository: the count and fraction of top-level functions PROVED
     trap-free, with the REFUTED and UNKNOWN counts and the names that refute. When `history` (the list of
     prior reports) is given, the report also carries the change since the last entry -- the coverage delta
     and any function that newly refutes -- so verification debt and a regression are visible over time.
     Returns the report dict; append it to a persisted history to track the trend. `jobs > 1` triages across
     that many worker processes."""
-    rows = verify_repo(root, cache=cache, jobs=jobs)
+    rows = verify_repo(root, cache=cache, jobs=jobs, exclude=exclude)
     proved = sum(1 for _, s in rows if s == PROVED)
     refuted = sorted(n for n, s in rows if s == REFUTED)
     unknown = sum(1 for _, s in rows if s == UNKNOWN)
@@ -3044,6 +3047,23 @@ def _is_test_module(modname):
         return True
     leaf = parts[-1]
     return leaf.startswith("test_") or leaf.endswith("_test") or leaf == "conftest"
+
+
+def _excluded(modname, patterns):
+    """Whether a module is user-excluded from triage -- its dotted name, its slash-path form, or that path with a
+    .py suffix matches any of the fnmatch glob `patterns` (None / empty excludes nothing). An excluded module is
+    still loaded for cross-module call resolution; it is only dropped from the set of units checked and reported,
+    so excluding vendored or generated code does not turn a caller's resolved callee into an UNKNOWN."""
+    if not patterns:
+        return False
+    import fnmatch as _fn
+    path = modname.replace(".", "/")
+    return any(_fn.fnmatch(modname, p) or _fn.fnmatch(path, p) or _fn.fnmatch(path + ".py", p) for p in patterns)
+
+
+def _filter_excluded(modules, patterns):
+    """The modules dict with user-excluded modules removed -- for the triage iteration set, never the load set."""
+    return modules if not patterns else {m: src for m, src in modules.items() if not _excluded(m, patterns)}
 
 
 _PAR_TRIAGE_MIN_MODULES = 8        # below this a scan's repo triage stays serial: the spawn cost would not pay off
@@ -3275,7 +3295,7 @@ def _unit_line(modname, modules, line_idx, kind, fname, cname):
     return idx.get(("F", fname)) if kind == "function" else idx.get(("M", cname, fname))
 
 
-def _triage_repo_verdicts(root, total=False, jobs=None, cache=None, progress=None):
+def _triage_repo_verdicts(root, total=False, jobs=None, cache=None, progress=None, exclude=None):
     """Trap-freedom triage of a package tree, keeping for each function its Verdict plus the source, repo,
     name, and kind a scan needs to confirm and reproduce a finding, and a {label: (module, line)} location map.
     Reuses the same cross-module load_program resolution and the same check, so a callee's trap is seen at the
@@ -3288,7 +3308,8 @@ def _triage_repo_verdicts(root, total=False, jobs=None, cache=None, progress=Non
     stored, so findings stay fresh). `progress(done, total)` is called as units are decided."""
     modules = repo_modules(root)
     repo = load_program(modules, on_collision="skip")         # a scan tolerates a rare mangle collision, not crash
-    items = [(m, src, total) for m, src in sorted(modules.items()) if not _is_test_module(m)]
+    items = [(m, src, total) for m, src in sorted(modules.items())
+             if not _is_test_module(m) and not _excluded(m, exclude)]
     tasks = _build_unit_tasks(items, repo)
     ntotal = len(tasks)
     keyfn = _unit_cache_keyer(repo, modules, core.SANDBOX_SUBJECT, total) if cache is not None else None
@@ -3740,7 +3761,7 @@ def _resolve_scan_target(target):
     return tmp, None, tmp, True
 
 
-def scan(target, execute=False, total=False, jobs=None, cache=None, progress=None):
+def scan(target, execute=False, total=False, jobs=None, cache=None, progress=None, exclude=None):
     """Point Touchstone at a target and return a ranked trap-freedom bug report. The target is resolved
     leniently, so exact URL formatting is not required: an `owner/repo` slug, a scheme-less or full GitHub URL
     (a repo, a blob file link, a tree directory link, or any other page -- reduced to what it references), a
@@ -3756,7 +3777,9 @@ def scan(target, execute=False, total=False, jobs=None, cache=None, progress=Non
     default (a spawn pool capped at the CPU count); pass jobs to set the worker count, or jobs=1 to force serial.
     `cache`, a dict reused across runs (the CLI persists it as JSON), makes a re-scan incremental -- a unit whose
     source and inlined closure are byte-identical to the cached run is not re-triaged. `progress(done, total)` is
-    called as units are decided, for a live counter on a long scan.
+    called as units are decided, for a live counter on a long scan. `exclude`, a list of fnmatch globs over module
+    dotted-name / path forms, drops matching modules from triage (vendored or generated code) while still loading
+    them for call resolution.
 
     Returns {target, fetched, executed, functions, proved, refuted, unknown, bugs, input_validation,
     unconfirmed, findings}, each finding {location, module, line, kind, classification, exception,
@@ -3770,7 +3793,8 @@ def scan(target, execute=False, total=False, jobs=None, cache=None, progress=Non
         if single_src is not None:
             rows, locmap = _triage_file_verdicts(single_src, total=total)
         else:
-            rows, locmap = _triage_repo_verdicts(path, total=total, jobs=jobs, cache=cache, progress=progress)
+            rows, locmap = _triage_repo_verdicts(path, total=total, jobs=jobs, cache=cache,
+                                                 progress=progress, exclude=exclude)
         findings = [_build_finding(label, v, fsrc, frepo, fname, kind, execute, classinfo)
                     for label, v, fsrc, frepo, fname, kind, classinfo in rows if v.status == REFUTED]
         n_refuted = len(findings)

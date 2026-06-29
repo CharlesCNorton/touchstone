@@ -3271,6 +3271,43 @@ def run_self_tests(fast=False):
     assert [_f["location"] for _f in _bknown] == ["p.f"] and [_f["location"] for _f in _bnew] == ["p.g"]
     assert baseline_partition([_bf1], [])[0] == [_bf1]                                        # empty baseline: all new
 
+    # exclude globs: a module matching an fnmatch glob (dotted-name or slash-path form) is dropped from the
+    # triage set of verify_repo / scan, while still loaded for call resolution.
+    from . import engines as _eng
+    assert _eng._excluded("vendor.dep", ["vendor/*"]) and _eng._excluded("pkg.vendor.dep", ["*vendor*"])
+    assert not _eng._excluded("keep.mod", ["vendor/*"]) and not _eng._excluded("any", None)
+    _dex = _tf.mkdtemp(prefix="ts_excl_")
+    try:
+        open(_os.path.join(_dex, "keep.py"), "w").write("def divz(a, b):\n    return a // b\n")
+        _os.makedirs(_os.path.join(_dex, "vendor"))
+        open(_os.path.join(_dex, "vendor", "__init__.py"), "w").write("")
+        open(_os.path.join(_dex, "vendor", "dep.py"), "w").write("def divz(a, b):\n    return a // b\n")
+        _all = {_l for _l, _s in verify_repo(_dex)}
+        _ex = {_l for _l, _s in verify_repo(_dex, exclude=["vendor/*"])}
+        assert "vendor.dep.divz" in _all and "vendor.dep.divz" not in _ex and "keep.divz" in _ex
+        _slocs = {_f["location"] for _f in scan(_dex, execute=False, jobs=1, exclude=["vendor.*"])["findings"]}
+        assert "keep.divz" in _slocs and not any(_l.startswith("vendor.") for _l in _slocs)
+    finally:
+        _sh.rmtree(_dex, ignore_errors=True)
+
+    # CLI exit policy + config: --fail-on sets the scan status, and the [tool.touchstone] table is read from the
+    # nearest pyproject (the keys that back --exclude / --fail-on / --jobs / --budget).
+    from . import cli as _cli
+    import io as _cio, contextlib as _ccl
+    _dcli = _tf.mkdtemp(prefix="ts_cliscan_")
+    try:
+        open(_os.path.join(_dcli, "z.py"), "w").write("def divz(a, b):\n    return a // b\n")
+        with _ccl.redirect_stdout(_cio.StringIO()):
+            _rc_any = _cli.main(["scan", _dcli, "--jobs", "1", "--fail-on", "any"])
+            _rc_none = _cli.main(["scan", _dcli, "--jobs", "1", "--fail-on", "none"])
+            _rc_bug = _cli.main(["scan", _dcli, "--jobs", "1", "--fail-on", "bug"])   # symbolic: no 'bug' class
+        assert _rc_any == 1 and _rc_none == 0 and _rc_bug == 0
+        open(_os.path.join(_dcli, "pyproject.toml"), "w").write(
+            '[tool.touchstone]\nexclude = ["z*"]\nfail_on = "none"\njobs = 2\n')
+        assert _cli._load_tool_config(_dcli) == {"exclude": ["z*"], "fail_on": "none", "jobs": 2}
+    finally:
+        _sh.rmtree(_dcli, ignore_errors=True)
+
     # verification-guided repair loop: a counterexample drives a generator to a verified result
     _attempts = iter(["def f(x):\n    return x + 1\n", "def f(x):\n    return 2 * x\n"])
     _r = repair_loop(lambda fb: next(_attempts), ensures="result == 2 * x")
