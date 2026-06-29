@@ -152,6 +152,20 @@ def _resolve_target(src, path, func):
          "silently" % (path, len(names), ", ".join(names)))
 
 
+def _isolate(src, func):
+    """The named function's source alone (module globals inlined) when the file defines several functions, so
+    the source-only verbs (leak / lock / termination / cost / overflow) analyze `func` rather than the first
+    definition; the source unchanged for a single-function file. _resolve_target has already validated `func`,
+    so this only narrows what the engine sees -- the same target isolation prove / check do internally."""
+    try:
+        fns = [n for n in ast.parse(src).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(fns) <= 1:
+            return src
+        return t.load_module(src)[func]
+    except Exception:
+        return src
+
+
 _CONTRACT_DECOS = frozenset({"require", "requires", "ensure", "ensures"})
 
 
@@ -840,7 +854,7 @@ def _cmd_returns(a):
 def _cmd_leak(a):
     src = _read(a.file)
     func = _resolve_target(src, _label(a.file), a.func)
-    v = t.verify_no_leak("resource safety", func, src)
+    v = t.verify_no_leak("resource safety", func, _isolate(src, func))
     return _report(v, json_out=a.json, quiet=a.quiet)
 
 
@@ -848,20 +862,21 @@ def _cmd_lock(a):
     src = _read(a.file)
     func = _resolve_target(src, _label(a.file), a.func)
     guarded = tuple(g for g in a.guarded.split(",") if g) if a.guarded else ("db.write",)
-    v = t.verify_lock("lock safety", func, src, {}, guarded=guarded)
+    v = t.verify_lock("lock safety", func, _isolate(src, func), {}, guarded=guarded)
     return _report(v, json_out=a.json, quiet=a.quiet)
 
 
 def _cmd_termination(a):
     src = _read(a.file)
     func = _resolve_target(src, _label(a.file), a.func)
-    v = t.verify_termination("termination", func, src)                    # a loop / for-container ranking function
+    fsrc = _isolate(src, func)
+    v = t.verify_termination("termination", func, fsrc)                    # a loop / for-container ranking function
     if v.status == "UNKNOWN":
-        rec = t.verify_recursive_termination("termination", func, src)     # self-recursion: a well-founded measure
+        rec = t.verify_recursive_termination("termination", func, fsrc)     # self-recursion: a well-founded measure
         if rec.status != "UNKNOWN":
             v = rec
     if v.status == "UNKNOWN":
-        nt = t.verify_nontermination("termination", func, src)             # else exhibit a concrete diverging input
+        nt = t.verify_nontermination("termination", func, fsrc)             # else exhibit a concrete diverging input
         if nt.status == "REFUTED":
             v = nt
     return _report(v, json_out=a.json, quiet=a.quiet)
@@ -870,14 +885,14 @@ def _cmd_termination(a):
 def _cmd_cost(a):
     src = _read(a.file)
     func = _resolve_target(src, _label(a.file), a.func)
-    v = t.verify_iteration_bound("cost", func, src)
+    v = t.verify_iteration_bound("cost", func, _isolate(src, func))
     return _report(v, json_out=a.json, quiet=a.quiet)
 
 
 def _cmd_overflow(a):
     src = _read(a.file)
     func = _resolve_target(src, _label(a.file), a.func)
-    v = t.verify_no_overflow("no-overflow", func, src, width=a.width)
+    v = t.verify_no_overflow("no-overflow", func, _isolate(src, func), width=a.width)
     return _report(v, json_out=a.json, quiet=a.quiet)
 
 
