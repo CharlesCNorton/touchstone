@@ -379,11 +379,12 @@ def _cmd_repo(a):
         except (OSError, ValueError):
             cache = {}
     jobs = getattr(a, "jobs", 1) or 1
+    progress = _make_progress() if a.progress else None
     if a.changed:
         rows = t.verify_diff(a.dir, [c for c in a.changed.split(",") if c], total=a.total, cache=cache,
-                             jobs=jobs, exclude=a.exclude)
+                             jobs=jobs, exclude=a.exclude, progress=progress)
     else:
-        rows = t.verify_repo(a.dir, total=a.total, cache=cache, jobs=jobs, exclude=a.exclude)
+        rows = t.verify_repo(a.dir, total=a.total, cache=cache, jobs=jobs, exclude=a.exclude, progress=progress)
     if a.cache:
         try:
             with open(a.cache, "w", encoding="utf-8") as fh:
@@ -419,12 +420,7 @@ def _cmd_scan(a):
     already recorded there. --cache makes a re-scan incremental, --jobs sets the worker count, --progress shows
     a live counter, --sarif emits a code-scanning log, and --repro a runnable failing test per finding."""
     cache = _load_json(a.cache, {}) if a.cache else None
-    progress = None
-    if a.progress:
-        def progress(done, total):
-            pct = (100 * done // total) if total else 100
-            print("\rtriaged %d/%d units (%d%%)" % (done, total, pct),
-                  end=("\n" if done >= total else ""), file=sys.stderr, flush=True)
+    progress = _make_progress() if a.progress else None
     try:
         rep = t.scan(a.target, execute=a.execute, jobs=a.jobs, cache=cache, progress=progress, exclude=a.exclude)
     except ValueError as e:
@@ -580,7 +576,8 @@ def _cmd_coverage(a):
     import time
     history = _load_json(a.history, [])
     cache = _load_json(a.cache, {})
-    report = t.coverage(a.dir, history=history, cache=cache, jobs=getattr(a, "jobs", 1) or 1, exclude=a.exclude)
+    report = t.coverage(a.dir, history=history, cache=cache, jobs=getattr(a, "jobs", 1) or 1, exclude=a.exclude,
+                        progress=_make_progress() if a.progress else None)
     report["time"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     if a.cache:
         _dump_json(a.cache, cache)
@@ -623,6 +620,16 @@ def _as_list(x):
     if x is None:
         return None
     return [p for p in x.split(",") if p] if isinstance(x, str) else [str(p) for p in x]
+
+
+def _make_progress():
+    """A progress callback that prints a single rewriting `triaged N/M units` line to stderr (shared by the
+    scan / repo / coverage verbs)."""
+    def progress(done, total):
+        pct = (100 * done // total) if total else 100
+        print("\rtriaged %d/%d units (%d%%)" % (done, total, pct),
+              end=("\n" if done >= total else ""), file=sys.stderr, flush=True)
+    return progress
 
 
 def _load_tool_config(start=None):
@@ -669,6 +676,8 @@ _INIT_CONFIG = """\
 # exclude = ["*/migrations/*", "vendor/*"]   # globs dropped from triage
 # fail_on = "bug"                            # bug | suspected | any | none
 # jobs = 8
+# baseline = ".touchstone-baseline.json"     # default --baseline path
+# cache = ".touchstone-cache.json"           # default --cache path
 """
 
 
@@ -903,6 +912,7 @@ def build_parser():
                          "to a serial run (default: 1, or [tool.touchstone] jobs)")
     rp.add_argument("--exclude", type=_as_list, default=None, metavar="GLOBS",
                     help="comma-separated fnmatch globs to drop from triage (also [tool.touchstone] exclude)")
+    rp.add_argument("--progress", action="store_true", help="print a live triaged-units counter to stderr")
     rp.add_argument("--sarif", action="store_true",
                     help="emit a SARIF 2.1.0 log (one result per refuted function) for code scanning")
     rp.set_defaults(fn=_cmd_repo)
@@ -963,6 +973,7 @@ def build_parser():
                          "(default: 1, or [tool.touchstone] jobs)")
     cv.add_argument("--exclude", type=_as_list, default=None, metavar="GLOBS",
                     help="comma-separated fnmatch globs to drop from triage (also [tool.touchstone] exclude)")
+    cv.add_argument("--progress", action="store_true", help="print a live triaged-units counter to stderr")
     cv.add_argument("--json", action="store_true", help="emit the report as one JSON object")
     cv.set_defaults(fn=_cmd_coverage)
 
@@ -1028,6 +1039,10 @@ def main(argv=None):
         args.fail_on = cfg.get("fail_on")
     if getattr(args, "jobs", "unset") is None and cfg.get("jobs") is not None:
         args.jobs = int(cfg.get("jobs"))
+    if getattr(args, "baseline", None) is None and cfg.get("baseline") is not None:
+        args.baseline = cfg.get("baseline")
+    if getattr(args, "cache", None) is None and cfg.get("cache") is not None:
+        args.cache = cfg.get("cache")
     budget = getattr(args, "budget", None) or cfg.get("budget") or "standard"
     if budget in ("high", "max"):                                # scale the deterministic rlimit and the timeouts
         k = {"high": 8, "max": 64}[budget]

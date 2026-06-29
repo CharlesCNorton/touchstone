@@ -119,6 +119,8 @@ the pieces it writes, which you can also add by hand:
 exclude = ["*/migrations/*", "vendor/*"]   # globs dropped from triage (still loaded for call resolution)
 fail_on = "bug"                            # bug | suspected | any | none
 jobs = 8
+baseline = ".touchstone-baseline.json"     # default --baseline path
+cache = ".touchstone-cache.json"           # default --cache path
 ```
 
 ```yaml
@@ -130,7 +132,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: CharlesCNorton/touchstone@v1.16.0
+      - uses: CharlesCNorton/touchstone@v1.17.0
         with:
           baseline: .touchstone-baseline.json   # fail only on a newly introduced trap
 ```
@@ -139,7 +141,7 @@ jobs:
 # .pre-commit-config.yaml -- gate changed functions before each commit
 repos:
   - repo: https://github.com/CharlesCNorton/touchstone
-    rev: v1.16.0
+    rev: v1.17.0
     hooks:
       - id: touchstone-gate
 ```

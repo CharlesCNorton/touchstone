@@ -3351,6 +3351,40 @@ def run_self_tests(fast=False):
     finally:
         _sh.rmtree(_dfmt, ignore_errors=True)
 
+    # progress callback on the repo / coverage triage path (verify_repo), reaching the work total.
+    _prog = []
+    _dpg = _tf.mkdtemp(prefix="ts_prog_")
+    try:
+        for _i in range(3):
+            open(_os.path.join(_dpg, "m%d.py" % _i), "w").write("def f%d(a, b):\n    return a // b\n" % _i)
+        verify_repo(_dpg, progress=lambda _d, _t: _prog.append((_d, _t)))
+        assert _prog and _prog[-1] == (3, 3)                              # three distinct units, all reported
+    finally:
+        _sh.rmtree(_dpg, ignore_errors=True)
+
+    # [tool.touchstone] now also supplies baseline / cache path defaults.
+    _dcfg = _tf.mkdtemp(prefix="ts_cfg2_")
+    try:
+        open(_os.path.join(_dcfg, "pyproject.toml"), "w").write('[tool.touchstone]\nbaseline = "b.json"\ncache = "c.json"\n')
+        assert _cli._load_tool_config(_dcfg) == {"baseline": "b.json", "cache": "c.json"}
+    finally:
+        _sh.rmtree(_dcfg, ignore_errors=True)
+
+    # execute-mode caching: a re-scan reuses the cached sandbox confirmation (an `xf` cache entry), and -- the
+    # soundness point -- editing the unit from trapping to safe invalidates it (the confirmation is not stale).
+    _dxc = _tf.mkdtemp(prefix="ts_xcache_")
+    try:
+        open(_os.path.join(_dxc, "a.py"), "w").write("def trap(x):\n    return 1 // x\ndef ok(y):\n    return y + 1\n")
+        _xc = {}
+        _x1 = scan(_dxc, execute=True, jobs=1, cache=_xc)
+        assert any(_k.startswith("xf") for _k in _xc) and _x1["bugs"] == 1
+        _x2 = scan(_dxc, execute=True, jobs=1, cache=_xc)
+        assert _x2["bugs"] == 1 and [_f["location"] for _f in _x1["findings"]] == [_f["location"] for _f in _x2["findings"]]
+        open(_os.path.join(_dxc, "a.py"), "w").write("def trap(x):\n    return x + 1\ndef ok(y):\n    return y + 1\n")
+        assert scan(_dxc, execute=True, jobs=1, cache=_xc)["bugs"] == 0    # re-confirmed, not served stale
+    finally:
+        _sh.rmtree(_dxc, ignore_errors=True)
+
     # verification-guided repair loop: a counterexample drives a generator to a verified result
     _attempts = iter(["def f(x):\n    return x + 1\n", "def f(x):\n    return 2 * x\n"])
     _r = repair_loop(lambda fb: next(_attempts), ensures="result == 2 * x")

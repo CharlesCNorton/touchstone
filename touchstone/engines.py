@@ -2707,13 +2707,14 @@ def _triage_check(job):
     return h, status
 
 
-def _run_triage(work, repo, jobs):
+def _run_triage(work, repo, jobs, progress=None):
     """Discharge the cache-miss items {hash: (hash, src, key, total)} and return {hash: status}. jobs <= 1 runs
     serially (deterministic, the default); jobs > 1 runs a spawn-based process pool capped at the CPU count, so
     each worker gets a core (no oversubscription) and the rlimit-bound verdict is identical to the serial one --
     the triage's wall-clock cost drops with no verdict change. A pool that cannot start (a restricted
-    environment) falls back to serial."""
+    environment) falls back to serial. `progress(done, total)` is called as work items finish."""
     items = list(work.values())
+    total = len(items)
     if not items:
         return {}
     n = min(jobs, len(items), os.cpu_count() or 1) if (jobs and jobs > 1) else 1
@@ -2724,11 +2725,22 @@ def _run_triage(work, repo, jobs):
         try:                                                      # worker imports the package through its normal entry
             with concurrent.futures.ProcessPoolExecutor(max_workers=n, mp_context=_mp.get_context("spawn"),
                                                         initializer=_partriage.init, initargs=(repo,)) as ex:
-                return dict(ex.map(_partriage.run, items))
+                out = {}
+                for i, (h, st) in enumerate(ex.map(_partriage.run, items)):   # map yields in submission order
+                    out[h] = st
+                    if progress:
+                        progress(i + 1, total)
+                return out
         except Exception:
             pass                                                  # a pool that cannot start: fall through to serial
     _triage_init(repo)
-    return dict(_triage_check(job) for job in items)
+    out = {}
+    for i, job in enumerate(items):
+        h, st = _triage_check(job)
+        out[h] = st
+        if progress:
+            progress(i + 1, total)
+    return out
 
 
 def _triage_collect(modules, repo, total, closure_hash, keys=None):
@@ -2762,7 +2774,7 @@ def _triage_collect(modules, repo, total, closure_hash, keys=None):
     return order, work
 
 
-def verify_repo(root, total=False, cache=None, jobs=1, exclude=None):
+def verify_repo(root, total=False, cache=None, jobs=1, exclude=None, progress=None):
     """Trap-freedom triage of a whole repository on disk: check every top-level function in every module,
     following calls across the resolved cross-module call graph, and check every method inside a class as
     well, returning a list of (module.function or module.Class.method, status). A method is triaged
@@ -2781,11 +2793,11 @@ def verify_repo(root, total=False, cache=None, jobs=1, exclude=None):
     closure_hash, _ = _closure_hasher(repo)
     order, work = _triage_collect(_filter_excluded(modules, exclude), repo, total, closure_hash)
     miss = {h: job for h, job in work.items() if h not in verdicts}
-    verdicts.update(_run_triage(miss, repo, jobs))
+    verdicts.update(_run_triage(miss, repo, jobs, progress=progress))
     return [(name, verdicts[h]) for name, h in order]
 
 
-def verify_diff(root, changed, total=False, cache=None, jobs=1, exclude=None):
+def verify_diff(root, changed, total=False, cache=None, jobs=1, exclude=None, progress=None):
     """Verify only the functions a change touches: the functions in the `changed` modules and every caller
     whose proof transitively depends on one of them, leaving the rest of the repository unverified, so a
     gate's cost tracks the change rather than the repository size. `changed` is a list of file paths
@@ -2831,18 +2843,18 @@ def verify_diff(root, changed, total=False, cache=None, jobs=1, exclude=None):
         order.append((label.get(key, key), h))
         work.setdefault(h, (h, repo[key], key, total))
     miss = {h: job for h, job in work.items() if h not in verdicts}
-    verdicts.update(_run_triage(miss, repo, jobs))                # serial (default) or jobs worker processes
+    verdicts.update(_run_triage(miss, repo, jobs, progress=progress))   # serial (default) or jobs worker processes
     return [(name, verdicts[h]) for name, h in order]
 
 
-def coverage(root, history=None, cache=None, jobs=1, exclude=None):
+def coverage(root, history=None, cache=None, jobs=1, exclude=None, progress=None):
     """The verified-subset coverage of a repository: the count and fraction of top-level functions PROVED
     trap-free, with the REFUTED and UNKNOWN counts and the names that refute. When `history` (the list of
     prior reports) is given, the report also carries the change since the last entry -- the coverage delta
     and any function that newly refutes -- so verification debt and a regression are visible over time.
     Returns the report dict; append it to a persisted history to track the trend. `jobs > 1` triages across
     that many worker processes."""
-    rows = verify_repo(root, cache=cache, jobs=jobs, exclude=exclude)
+    rows = verify_repo(root, cache=cache, jobs=jobs, exclude=exclude, progress=progress)
     proved = sum(1 for _, s in rows if s == PROVED)
     refuted = sorted(n for n, s in rows if s == REFUTED)
     unknown = sum(1 for _, s in rows if s == UNKNOWN)
@@ -3787,6 +3799,26 @@ def _resolve_scan_target(target):
     return tmp, None, tmp, True
 
 
+def _exec_finding_keyer(rows, total):
+    """A keyer for execute-mode sandbox outcomes (a REFUTED finding's confirmation, an UNKNOWN function's
+    escalation fuzzing) -- the costs symbolic triage does not cover. A function keys on its closure hash, a
+    method on its module source plus its class/method name: the same content the verdict cache keys on, but in a
+    distinct namespace (the `ns` prefix) so the symbolic and execute caches never collide. Reuse is sound because
+    the confirmation / fuzzing is deterministic and a byte-identical closure replays to the same outcome."""
+    repo = next((r[3] for r in rows if r[5] == "function"), {})
+    closure_hash, _ = _closure_hasher(repo) if repo else (None, None)
+    tflag = 1 if total else 0
+
+    def key(ns, label, fname, kind, classinfo):
+        if kind == "function":
+            return None if closure_hash is None else "%s%d\0%s" % (ns, tflag, closure_hash(fname))
+        module_src, cname = classinfo
+        blob = "M\0%s\0%s\0%s" % (cname, label.rsplit(".", 1)[-1], module_src)
+        return "%s%d\0%s" % (ns, tflag, hashlib.sha256(blob.encode("utf-8")).hexdigest())
+
+    return key
+
+
 def scan(target, execute=False, total=False, jobs=None, cache=None, progress=None, exclude=None):
     """Point Touchstone at a target and return a ranked trap-freedom bug report. The target is resolved
     leniently, so exact URL formatting is not required: an `owner/repo` slug, a scheme-less or full GitHub URL
@@ -3824,7 +3856,18 @@ def scan(target, execute=False, total=False, jobs=None, cache=None, progress=Non
         else:
             rows, locmap, suppressed = _triage_repo_verdicts(path, total=total, jobs=jobs, cache=cache,
                                                              progress=progress, exclude=exclude)
-        raw = [_build_finding(label, v, fsrc, frepo, fname, kind, execute, classinfo)
+        ekey = _exec_finding_keyer(rows, total) if (execute and cache is not None) else None   # cache sandbox work
+
+        def _confirm(label, v, fsrc, frepo, fname, kind, classinfo):
+            k = ekey("xf", label, fname, kind, classinfo) if ekey else None
+            if k is not None and k in cache:
+                return dict(cache[k])                          # reuse the cached confirmation (skip the sandbox)
+            f = _build_finding(label, v, fsrc, frepo, fname, kind, execute, classinfo)
+            if k is not None:
+                cache[k] = f
+            return f
+
+        raw = [_confirm(label, v, fsrc, frepo, fname, kind, classinfo)
                for label, v, fsrc, frepo, fname, kind, classinfo in rows if v.status == REFUTED]
         findings = [f for f in raw if f["location"] not in suppressed]   # drop inline `# touchstone: ignore` units
         n_suppressed = len(raw) - len(findings)
@@ -3832,7 +3875,13 @@ def scan(target, execute=False, total=False, jobs=None, cache=None, progress=Non
         if execute:                                            # pursue each symbolic UNKNOWN by guided sandbox fuzzing
             for label, v, fsrc, frepo, fname, kind, classinfo in rows:   # rather than dropping it (a missed bug)
                 if v.status == UNKNOWN and kind == "function":
-                    sf = _escalate_unknown(label, fsrc, frepo, fname)
+                    k = ekey("xe", label, fname, kind, classinfo) if ekey else None
+                    if k is not None and k in cache:           # cached escalation outcome (a finding, or 0 = none)
+                        sf = dict(cache[k]) if cache[k] else None
+                    else:
+                        sf = _escalate_unknown(label, fsrc, frepo, fname)
+                        if k is not None:
+                            cache[k] = sf if sf is not None else 0
                     if sf is not None and sf["location"] in suppressed:
                         n_suppressed += 1
                     elif sf is not None:
