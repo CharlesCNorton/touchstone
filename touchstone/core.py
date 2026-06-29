@@ -3044,6 +3044,9 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if op is ast.MatMult:                                # a @ b: matrix multiply, not element-wise
                 return _matmul(l, r, ctx)
             return _nd_binop(l, r, ctx)
+        if op is ast.Mod and _is_str(l):                     # str % args -- printf formatting, even when args is a
+            _note_overapprox(ctx, "string % formatting")     # tuple (which would otherwise look like a tuple op); a
+            return z3.FreshConst(_SS, "strmod")               # trap-free string, the args already trap-checked
         if isinstance(l, tuple) or isinstance(r, tuple):
             if op is ast.Add:
                 if isinstance(l, tuple) and isinstance(r, tuple):
@@ -3059,7 +3062,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     if ctx.traps is not None:
                         ctx.traps.append(ctx.pc)
                     return _Opaque("seqop")
-                if _TRAPFREE:                                # seq * a symbolic int: trap free, length opaque
+                if _TRAPFREE:                                # seq * a symbolic int: trap free; the length is the count
+                    if z3.is_expr(kv) and kv.sort() == z3.IntSort():   # times the repeated width, clamped at 0 (Python
+                        return _SafeContainer("seqrep",                # gives [] for a non-positive count), so [0] * n
+                                              length=z3.If(kv >= 0, z3.IntVal(len(tv)) * kv, z3.IntVal(0)))   # has len n
                     return _SafeContainer("seqrep")
                 raise Unsupported("tuple repetition by a non-constant count")
             if ctx.traps is not None:                        # any other operator on a list/tuple (-, /, //, **, &, ...) is a TypeError
@@ -3110,11 +3116,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 if ctx.traps is not None:
                     ctx.traps.append(ctx.pc)
                 return _Opaque("strop")
-            if op is ast.Mod:                                # str % ... is printf-style formatting (may or may not raise): unmodeled
-                if BEST_EFFORT:                              # assume the format matches its arguments (lower trust)
-                    _best_effort_assume()
-                    return _Opaque("be_strmod")
-                raise Unsupported("string % formatting")
+            if op is ast.Mod:                                # str % args: printf-style formatting, over-approximated
+                _note_overapprox(ctx, "string % formatting")  # as a trap-free string -- the same assume-the-format-
+                return z3.FreshConst(_SS, "strmod")           # matches over-approximation the f-string / print() paths
+                #                                               make; the arguments were already trap-checked
             if ctx.traps is not None:                        # str with -, /, //, **, shifts, or bitwise: TypeError
                 ctx.traps.append(ctx.pc)
             return _Opaque("strop")
@@ -4817,6 +4822,8 @@ def _havoc_val(prev, nm):
     (a missed PROVED), never a wrong verdict."""
     if isinstance(prev, _SafeContainer):
         return _SafeContainer("hv_" + nm, byteslike=prev.byteslike, unindexable=prev.unindexable)
+    if _is_str(prev):
+        return z3.String("hv_" + nm)        # a string accumulator (out = out + c) stays a string, not an int
     return z3.FreshInt("hv_" + nm)
 
 
@@ -5026,6 +5033,11 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                     else:                                     # statement body: opaque value, not modeled if called
                         e2[s.name] = _Closure(s.name)
                     nxt.append((e2, p))
+                elif (_TRAPFREE and isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
+                      and _is_noreturn_call(s.value, e)):
+                    for a2 in s.value.args:                   # sys.exit / os._exit / exit() / quit(): trap-check the
+                        if not isinstance(a2, ast.Starred):    # arguments, then terminate the path (SystemExit is an
+                            ev(a2, e, ctx)                     # intentional exit, not a modeled crash) -- no fall-through
                 elif isinstance(s, ast.Expr):                 # bare expression statement: for its traps only
                     ev(s.value, e, ctx)
                     c = s.value                               # a method call on a name may mutate it, so forget
@@ -5050,6 +5062,11 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         if isinstance(e.get(nm), _NoneVal) or nm in bnone:   # a None that may survive the loop
                             ctx.none_havoc = True              # (0 iterations, or a body None-write) is masked by
                         he[nm] = _havoc_val(e.get(nm), nm)       # this fresh int, so a PROVED here is withheld
+                    for _cn, _cs in _loop_counters(s.body).items():   # a monotonic counter (i = i + c) only moves away
+                        _init = e.get(_cn)                            # from its start, so the havoc'd value keeps that
+                        if (z3.is_expr(_init) and _init.sort() == z3.IntSort() and ctx.facts is not None
+                                and z3.is_expr(he.get(_cn)) and he[_cn].sort() == z3.IntSort()):
+                            ctx.facts.append(he[_cn] >= _init if _cs > 0 else he[_cn] <= _init)   # i >= 0: p[i] proves
                     ctx.pc = p
                     c = ev_bool(s.test, he, ctx)              # the guard is trap-checked and constrains the body
                     walk(s.body, he, z3.And(p, c))            # one arbitrary iteration under the guard
@@ -5090,6 +5107,15 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         if ctx.facts is not None:                         # decides (an arbitrary char over-approximates
                             ctx.facts.append(z3.Length(cs) == 1)          # every element); len(c) == 1, no trap
                         he[s.target.id] = cs
+                    elif isinstance(itv, _SafeContainer) and isinstance(itv.elem, _SafeContainer) \
+                            and isinstance(s.target, ast.Name):           # iterating a nested container (for row in g)
+                        _pr = itv.elem                                    # yields inner sequences -- an arbitrary one of
+                        _il = z3.FreshInt("ielem_" + s.target.id)         # nonnegative length, so for x in row decides
+                        if ctx.facts is not None:
+                            ctx.facts.append(_il >= 0)
+                        he[s.target.id] = _SafeContainer("ielem_" + s.target.id, immutable=_pr.immutable,
+                                                         length=_il, unindexable=_pr.unindexable,
+                                                         byteslike=_pr.byteslike, elem=_pr.elem)
                     body_p = p
                     if isinstance(itv, _DictParam) and isinstance(s.target, ast.Name):
                         kv = he[s.target.id]                  # iterating a dict yields keys: the loop variable is a member
@@ -6493,6 +6519,16 @@ def _trap_or(traps, subs=None) -> z3.ExprRef:
 def escalate(v: Verdict) -> Verdict:
     print(f"        -> escalate [{v.prop}]: UNKNOWN ({v.reason})")
     return v
+
+
+def _is_noreturn_call(call, env):
+    """Whether a call terminates the program -- sys.exit / os._exit / os.abort (module-qualified, the module not
+    shadowed by a local) or a bare exit() / quit() -- so it raises SystemExit / ends the process rather than
+    falling through. The path stops there (no modeled crash), exactly as a `raise` does."""
+    f = call.func
+    if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id not in env:
+        return (f.value.id, f.attr) in {("sys", "exit"), ("os", "_exit"), ("os", "abort")}
+    return isinstance(f, ast.Name) and f.id in ("exit", "quit") and f.id not in env
 
 
 def _apply_assigns(stmts, state, ctx, raise_is_trap=False):

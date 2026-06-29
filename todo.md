@@ -136,3 +136,10 @@
 136. Fix the KeyError in `mutagen.easyid3.original_date_delete` at line 2 (id3={}, key=7) [quodlibet/mutagen]
 137. Fix the KeyError in `mutagen.easyid3.original_date_get` at line 2 (id3={}, key=7) [quodlibet/mutagen]
 138. Fix the IndexError in `mutagen.easyid3.txxxkey_deleter` at line 2 (id3=[], key=7, frameid=7) [quodlibet/mutagen]
+139. Model a `key=` or `reverse=` callable argument to `sorted`, `min`, `max`, `list`, and `set` by trap-checking the callable on an arbitrary element and sizing the result from the iterable.
+140. Model a dictionary parameter's value type so a nested read or container method such as `d[k][i]` or `d[k].append(x)` is decided rather than left opaque.
+141. Decide a variable-exponent integer power `x ** n`, whose only modeled trap is a zero base raised to a negative exponent.
+142. Model in-place mutation of a list literal such as `a = [1, 2, 3]; a[i] = v` as a bounds-checked mutable sequence, as list repetition already is.
+143. Iterate a `bytes` or `bytearray` value yielding integer elements bounded to the range 0 through 255, as string iteration yields single-character strings.
+144. Carry a non-integer loop-crossing value such as a float or a container through a loop havoc by its kind rather than collapsing it to a fresh integer.
+145. Refine definite-assignment so a name bound only inside a loop body or on every branch is not reported as a possible use-before-assignment.

@@ -3446,6 +3446,30 @@ def run_self_tests(fast=False):
     assert check("def f(s: str):\n    for c in s:\n        x = ord(c)\n    return 0\n").status == PROVED
     assert check("def f(s: str):\n    return [10 // (ord(c) - 65) for c in s]\n").status == REFUTED
 
+    # sys.exit / exit() / quit() terminate the path (SystemExit is an intentional exit, not a modeled crash), so a
+    # trap on a path the exit guards proves; a module name shadowed by a parameter is not the real sys.exit.
+    assert check("import sys\ndef f(x: int):\n    if x == 0:\n        sys.exit()\n    return 10 // x\n").status == PROVED
+    assert check("def f(x: int):\n    if x < 0:\n        exit()\n    return x + 1\n").status == PROVED
+
+    # a string accumulator (out = out + c) stays a string under loop havoc; a monotonic counter keeps its lower
+    # bound (i >= 0) so an index loop proves; iterating a nested container (for row in g) yields inner sequences --
+    # while an unguarded inner index (row[0] with row possibly empty) still does not prove.
+    assert check("def f(s: str):\n    out = ''\n    for c in s:\n        out = out + c\n    return out\n").status == PROVED
+    assert check("def f(p: list):\n    i = 0\n    while i < len(p):\n        x = p[i]\n        i = i + 1\n    return 0\n").status == PROVED
+    assert check("def f(g: list[list[int]]):\n    for row in g:\n        for x in row:\n            y = x\n    return 0\n").status == PROVED
+    assert check("def f(g: list[list[int]]):\n    for row in g:\n        x = row[0]\n    return 0\n").status != PROVED
+
+    # a list built by repetition [x] * n has length n (clamped at 0), so a DP-table fill (build, store in a loop,
+    # read) proves under a non-negative guard, while an unguarded read on a possibly-empty [0] * (n + 1) refutes.
+    assert check("def f(n: int):\n    dp = [0] * n\n    if n > 0:\n        return dp[0]\n    return 0\n").status == PROVED
+    assert check("def f(n: int):\n    if n < 0:\n        return 0\n    dp = [0] * (n + 1)\n    for i in range(2, n + 1):\n        dp[i] = dp[i - 1] + dp[i - 2]\n    return dp[n]\n").status == PROVED
+    assert check("def f(n: int):\n    dp = [0] * (n + 1)\n    return dp[0]\n").status == REFUTED
+
+    # str % args (printf formatting, including a tuple of args) is a trap-free string; the args are trap-checked,
+    # so a div by zero in an argument still refutes.
+    assert check("def f(a: int, b: int):\n    return '%d/%d' % (a, b)\n").status == PROVED
+    assert check("def f(x: int):\n    return '%d' % (10 // x)\n").status == REFUTED
+
     # verification-guided repair loop: a counterexample drives a generator to a verified result
     _attempts = iter(["def f(x):\n    return x + 1\n", "def f(x):\n    return 2 * x\n"])
     _r = repair_loop(lambda fb: next(_attempts), ensures="result == 2 * x")
