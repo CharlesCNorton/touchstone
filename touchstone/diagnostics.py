@@ -71,11 +71,13 @@ Verbs (touchstone <verb> --help for each):
   termination a loop or recursion provably halts (or a diverging input is found)
   cost        a proven symbolic iteration bound for a counted loop
   overflow    no signed add/sub/mul wraps a width-N machine integer (--width)
+  explain     restate a verdict and show a refutation's path and the live values along it
   repo / gate triage or gate trap-freedom across a package or a git diff
   scan        point at a repo URL, a .py file URL, or a local path and report reachable traps (bugs)
   coverage    verified-subset coverage of a package, tracked over time
   spec        synthesize a contract (@require / @ensure) a function provably satisfies
   infer       sound over-approximate types of a return and its locals
+  repair      re-run a generator command until the verifier signs off on a fix
   recheck     re-validate a saved proof bundle (change / gate --bundle) with no fresh solve
   covers      this reference
 Add --repro to any verdict verb to emit a runnable failing test from a refutation.

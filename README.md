@@ -143,7 +143,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: CharlesCNorton/touchstone@v1.25.0
+      - uses: CharlesCNorton/touchstone@v1.25.1
         with:
           baseline: .touchstone-baseline.json   # fail only on a newly introduced trap
 ```
@@ -152,7 +152,7 @@ jobs:
 # .pre-commit-config.yaml -- gate changed functions before each commit
 repos:
   - repo: https://github.com/CharlesCNorton/touchstone
-    rev: v1.25.0
+    rev: v1.25.1
     hooks:
       - id: touchstone-gate
 ```

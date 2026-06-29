@@ -1,6 +1,6 @@
 # Touchstone pre-commit hooks. Add to a repo's .pre-commit-config.yaml, e.g.
 #   - repo: https://github.com/CharlesCNorton/touchstone
-#     rev: v1.25.0
+#     rev: v1.25.1
 #     hooks:
 #       - id: touchstone-gate
 - id: touchstone-gate

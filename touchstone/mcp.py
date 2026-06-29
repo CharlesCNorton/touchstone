@@ -19,7 +19,7 @@ def _server_version():
         from importlib.metadata import version
         return version("touchstone-prover")
     except Exception:
-        return "0.9.2"
+        return "0+unknown"
 
 
 _TOOLS = [
@@ -99,8 +99,8 @@ def _scan_text(rep):
              % (rep["target"], "fetched" if rep["fetched"] else "local", mode,
                 rep["functions"], rep["proved"], rep["refuted"], rep["unknown"])]
     if rep["executed"]:
-        lines.append("classified: %d bug(s), %d input-validation, %d unconfirmed"
-                     % (rep["bugs"], rep["input_validation"], rep["unconfirmed"]))
+        lines.append("classified: %d bug(s), %d suspected, %d input-validation, %d unconfirmed"
+                     % (rep["bugs"], rep.get("suspected", 0), rep["input_validation"], rep["unconfirmed"]))
     for f in rep["findings"]:
         line = "[%s] %s -- %s" % (f["classification"], f["location"], f["label"])
         if f["exception"]:
