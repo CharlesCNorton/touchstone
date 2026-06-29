@@ -63,11 +63,17 @@ Verbs (touchstone <verb> --help for each):
   prove       a postcondition over the parameters and `result` (--ensures), under a --requires precondition
   equiv       two implementations agree on every input
   change      a proposed edit preserves the code's properties (gate an AI diff), with a proof bundle
+  metamorphic an oracle-free property of a unary function: idempotent f(f(x))==f(x) / involution f(f(x))==x
+  doctest     the function's own doctests, mined into prove obligations
+  returns     the declared return annotation against what the body can return
+  leak        every opened resource (open(...)) is closed on every path
+  lock        a guarded operation is never reached without a lock held
   repo / gate triage or gate trap-freedom across a package or a git diff
   scan        point at a repo URL, a .py file URL, or a local path and report reachable traps (bugs)
   coverage    verified-subset coverage of a package, tracked over time
   spec        synthesize a contract (@require / @ensure) a function provably satisfies
   infer       sound over-approximate types of a return and its locals
+  recheck     re-validate a saved proof bundle (change / gate --bundle) with no fresh solve
   covers      this reference
 Add --repro to any verdict verb to emit a runnable failing test from a refutation.
 

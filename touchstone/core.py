@@ -3045,8 +3045,13 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 return _matmul(l, r, ctx)
             return _nd_binop(l, r, ctx)
         if op is ast.Mod and _is_str(l):                     # str % args -- printf formatting, even when args is a
-            _note_overapprox(ctx, "string % formatting")     # tuple (which would otherwise look like a tuple op); a
-            return z3.FreshConst(_SS, "strmod")               # trap-free string, the args already trap-checked
+            if not z3.is_string_value(l) and _TRAPFREE and not BEST_EFFORT:   # tuple (which would look like a tuple op)
+                # a NON-constant format string can mismatch its args at runtime (a TypeError / ValueError the engine
+                # does not model), so trap freedom abstains rather than claim the % cannot raise; a CONSTANT format
+                # string stays the assume-the-args-match over-approximation (trap free, with the args trap-checked).
+                raise Unsupported("string formatting with a non-constant format string may raise (not modeled)")
+            _note_overapprox(ctx, "string % formatting")     # a trap-free string, the args already trap-checked
+            return z3.FreshConst(_SS, "strmod")
         if isinstance(l, tuple) or isinstance(r, tuple):
             if op is ast.Add:
                 if isinstance(l, tuple) and isinstance(r, tuple):
@@ -4542,6 +4547,29 @@ def _target_names(t):
     return {n.id for n in ast.walk(t) if isinstance(n, ast.Name)}
 
 
+def _recv_root_name(node):
+    """The root name a method-call receiver is rooted at -- `a`, `a[i]`, `a.b`, and `a[i].b` all root at `a` --
+    or None. A mutating method reached through any of these can change the object `a` holds, so the value
+    engine forgets `a` after such a call: `[[0]] * 2` aliases ONE inner row (sequence repetition replicates the
+    reference), so an append through `a[0]` grows `a[1]` too, and the engine -- which models a list as an
+    immutable tuple -- must not read the stale pre-mutation row (a false `len(a[1]) == 1`)."""
+    while isinstance(node, (ast.Subscript, ast.Attribute)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _holds_identity(val, obj):
+    """Whether `val` IS `obj`, or is a tuple transitively containing it by object identity -- used to forget
+    every name that aliases or shares the object a mutating method just changed in place. The value engine
+    models a list as an immutable tuple with no shared identity, so `b = a` (an alias) and `[[0]] * 2` (a shared
+    inner row) both let a mutation through one name leave another name's stale value behind; this finds them."""
+    if val is obj:
+        return True
+    if isinstance(val, tuple):
+        return any(_holds_identity(x, obj) for x in val)
+    return False
+
+
 def _assigns_none(stmts):
     """Names a statement list assigns the None literal to directly (`nm = None`), so a loop havoc of nm
     would unsoundly drop the possibility that it is None (and mask a later None-in-arithmetic trap)."""
@@ -5040,10 +5068,21 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                             ev(a2, e, ctx)                     # intentional exit, not a modeled crash) -- no fall-through
                 elif isinstance(s, ast.Expr):                 # bare expression statement: for its traps only
                     ev(s.value, e, ctx)
-                    c = s.value                               # a method call on a name may mutate it, so forget
-                    if (isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)   # the name: a later read is
-                            and isinstance(c.func.value, ast.Name) and c.func.value.id in e):   # opaque, not stale
-                        e2 = dict(e); e2[c.func.value.id] = _Opaque(c.func.value.id); nxt.append((e2, p))
+                    c = s.value                               # a method call on a name -- or on a subscript /
+                    rn = (_recv_root_name(c.func.value)       # attribute of one (a[0].append(x), self.xs.pop())
+                          if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) else None)
+                    if rn is not None and rn in e:            # -- may mutate the container, so forget the ROOT
+                        e2 = dict(e); e2[rn] = _Opaque(rn)    # name: a later read is opaque, not a stale value.
+                        if c.func.attr in _MUTATING_METHODS:  # a mutator (append/pop/...) changes the object in
+                            try:                              # place; the value engine has no shared identity, so an
+                                _obj = ev(c.func.value, e, ctx)   # alias (b = a) or a shared row ([[0]]*2) would read
+                            except Unsupported:               # a stale value -- forget every name that aliases or
+                                _obj = None                   # transitively contains the mutated object, by identity
+                            if _obj is not None:
+                                for _nm in list(e2):
+                                    if _nm != rn and _holds_identity(e2[_nm], _obj):
+                                        e2[_nm] = _Opaque(_nm)
+                        nxt.append((e2, p))
                     else:
                         nxt.append((e, p))
                 elif isinstance(s, ast.ClassDef) and not s.decorator_list:
@@ -6584,10 +6623,11 @@ def _apply_assigns(stmts, state, ctx, raise_is_trap=False):
             st = merged
         elif isinstance(s, ast.Expr):
             ev(s.value, st, ctx)                             # bare expression statement: for its traps only
-            c = s.value                                      # a method call on a name may mutate it: forget the
-            if (isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)   # name (fresh value) so a later
-                    and isinstance(c.func.value, ast.Name) and c.func.value.id in st):   # read is not a stale value
-                st = dict(st); st[c.func.value.id] = z3.FreshInt("mut_" + c.func.value.id)
+            c = s.value                                      # a method call on a name -- or a subscript / attribute
+            rn = (_recv_root_name(c.func.value)              # of one -- may mutate the container, so forget the
+                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) else None)   # ROOT name (a fresh
+            if rn is not None and rn in st:                  # value) so a later read is not a stale pre-mutation one
+                st = dict(st); st[rn] = z3.FreshInt("mut_" + rn)
         elif BEST_EFFORT:                                    # an unmodeled statement: havoc the names it assigns (lower trust)
             _best_effort_assume()
             st = dict(st)

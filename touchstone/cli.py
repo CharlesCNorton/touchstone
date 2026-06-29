@@ -8,6 +8,11 @@
     touchstone equiv      IMPL SPEC --func NAME                            two implementations agree on every input
     touchstone change     BEFORE AFTER [--func NAME] [--ensures EXPR]      a change preserves the code's properties (gate an AI diff)
     touchstone explain    FILE [--ensures EXPR] [--func NAME]              check / prove, then show a refutation's path and live values
+    touchstone metamorphic FILE [--relation idempotent|involution]         an oracle-free metamorphic property of a unary function
+    touchstone doctest    FILE [--func NAME]                               mine the function's doctests into prove obligations
+    touchstone returns    FILE [--func NAME]                               the declared return annotation vs what the body can return
+    touchstone leak       FILE [--func NAME]                               every opened resource is closed on every path
+    touchstone lock       FILE [--guarded OPS] [--func NAME]               a guarded operation is never reached without a lock held
 
   triage across a tree:
     touchstone repo       DIR [--total] [--changed PATHS] [--jobs N]       trap freedom of every top-level function in a package
@@ -21,6 +26,7 @@
     touchstone repair     --generator CMD [--ensures EXPR] [--before F]    re-run a generator until the property holds
 
   servers and meta:
+    touchstone recheck    BUNDLE.json                                    re-validate a saved proof bundle with no fresh solve
     touchstone init                                                      scaffold a CI workflow, config, and a baseline into a project
     touchstone lsp / mcp                                                  the language server / the MCP verification-tools server (stdio)
     touchstone covers                                                     what it can prove, and the modeled subset
@@ -786,6 +792,88 @@ def _cmd_infer(a):
     return 0
 
 
+def _cmd_metamorphic(a):
+    src = _read(a.file)
+    func = _resolve_target(src, _label(a.file), a.func)
+    v = t.verify_metamorphic(src, relation=a.relation, target=func)
+    return _report(v, json_out=a.json, quiet=a.quiet)
+
+
+def _cmd_doctest(a):
+    """Mine a function's doctests into prove obligations, one line per example. The exit status is
+    REFUTED-dominant (nonzero if any example is refuted), so it drops into a CI gate; a file with no
+    minable doctests is a clean no-op, not an error (mining is opportunistic, unlike `verify`)."""
+    src = _read(a.file)
+    _require_func(src, _label(a.file), a.func)
+    results = t.prove_doctests(src, target=a.func)
+    if not results:
+        print("note: no doctest examples to verify (an example must be f(literals) -> literal)", file=sys.stderr)
+        return 0
+    if a.json:
+        print(json.dumps([{"example": ex, "status": v.status, "property": v.prop, "technique": v.technique,
+                           "counterexample": v.counterexample, "reason": v.reason or None} for ex, v in results]))
+    elif a.quiet:
+        for ex, v in results:
+            print("%s  %s" % (_paint(v.status), ex))
+    else:
+        width = max(len(ex) for ex, _ in results)
+        for ex, v in results:
+            print("%s  %s" % (_paint(v.status, 7), ex.ljust(width)))
+            if v.status == "REFUTED" and v.counterexample:
+                print("    counterexample: %s" % v.counterexample)
+            elif v.status == "UNKNOWN" and v.reason:
+                print("    reason: %s" % v.reason)
+    statuses = {v.status for _, v in results}
+    return 1 if "REFUTED" in statuses else 2 if "UNKNOWN" in statuses else 0
+
+
+def _cmd_returns(a):
+    src = _read(a.file)
+    func = _resolve_target(src, _label(a.file), a.func)
+    v = t.check_return_annotation(src, target=func)
+    return _report(v, json_out=a.json, quiet=a.quiet)
+
+
+def _cmd_leak(a):
+    src = _read(a.file)
+    func = _resolve_target(src, _label(a.file), a.func)
+    v = t.verify_no_leak("resource safety", func, src)
+    return _report(v, json_out=a.json, quiet=a.quiet)
+
+
+def _cmd_lock(a):
+    src = _read(a.file)
+    func = _resolve_target(src, _label(a.file), a.func)
+    guarded = tuple(g for g in a.guarded.split(",") if g) if a.guarded else ("db.write",)
+    v = t.verify_lock("lock safety", func, src, {}, guarded=guarded)
+    return _report(v, json_out=a.json, quiet=a.quiet)
+
+
+def _cmd_recheck(a):
+    """Re-validate a saved proof bundle (written by `change --bundle` / `gate --bundle`) WITHOUT a fresh
+    solve: recheck_bundle re-runs the discharged SMT-LIB queries independently and confirms the content
+    hash, so CI re-checks a saved certificate rather than racing the solver. Accepts one bundle or a list."""
+    bundle = _load_json(a.bundle, None)
+    if bundle is None:
+        _die("cannot read proof bundle %s" % a.bundle)
+    bundles = bundle if isinstance(bundle, list) else [bundle]
+    verified = failed = skipped = 0
+    for b in bundles:
+        if not (isinstance(b, dict) and b.get("checkable")):
+            skipped += 1                                          # a CHC-loop bundle carries no re-runnable query
+            continue
+        if t.recheck_bundle(b).get("verified"):
+            verified += 1
+        else:
+            failed += 1
+    if a.json:
+        print(json.dumps({"bundles": len(bundles), "verified": verified, "failed": failed, "skipped": skipped}))
+    else:
+        print("recheck %s: %d verified, %d failed, %d not independently checkable"
+              % (a.bundle, verified, failed, skipped))
+    return 1 if failed else 0
+
+
 def _cmd_examples(a):
     from . import examples
     bad = examples.run()
@@ -1018,6 +1106,46 @@ def build_parser():
     rep.add_argument("--rounds", type=int, default=5, help="maximum repair rounds (default: 5)")
     rep.add_argument("--json", action="store_true", help="emit the outcome as one JSON object")
     rep.set_defaults(fn=_cmd_repair)
+
+    mm = sub.add_parser("metamorphic", parents=[verdict],
+                        help="verify an oracle-free metamorphic property of a unary function (no reference impl)")
+    mm.add_argument("file")
+    mm.add_argument("--relation", choices=("idempotent", "involution"), default="idempotent",
+                    help="idempotent: f(f(x)) == f(x); involution: f(f(x)) == x (default: idempotent)")
+    mm.add_argument("--func", default=None, help="function to check (default: the one in the file)")
+    mm.set_defaults(fn=_cmd_metamorphic)
+
+    dt = sub.add_parser("doctest", parents=[verdict],
+                        help="mine a function's doctests into prove obligations; nonzero exit if any is refuted")
+    dt.add_argument("file")
+    dt.add_argument("--func", default=None, help="function whose doctests to verify (default: the first)")
+    dt.set_defaults(fn=_cmd_doctest)
+
+    rt = sub.add_parser("returns", parents=[verdict],
+                        help="check a function's declared return annotation against what its body can return")
+    rt.add_argument("file")
+    rt.add_argument("--func", default=None, help="function to check (default: the one in the file)")
+    rt.set_defaults(fn=_cmd_returns)
+
+    lk = sub.add_parser("leak", parents=[verdict],
+                        help="prove every opened resource (open(...)) is closed on every path")
+    lk.add_argument("file")
+    lk.add_argument("--func", default=None, help="function to check (default: the one in the file)")
+    lk.set_defaults(fn=_cmd_leak)
+
+    lc = sub.add_parser("lock", parents=[verdict],
+                        help="prove a guarded operation is never reached without a lock held, on any path")
+    lc.add_argument("file")
+    lc.add_argument("--guarded", default=None, metavar="OPS",
+                    help="comma-separated operations that require a lock held (default: db.write)")
+    lc.add_argument("--func", default=None, help="function to check (default: the one in the file)")
+    lc.set_defaults(fn=_cmd_lock)
+
+    rc = sub.add_parser("recheck",
+                        help="re-validate a saved proof bundle (from change/gate --bundle) with no fresh solve")
+    rc.add_argument("bundle", help="a proof-bundle JSON file (one bundle, or a list of them)")
+    rc.add_argument("--json", action="store_true", help="emit the result as one JSON object")
+    rc.set_defaults(fn=_cmd_recheck)
 
     for name, fn, helptext in (("examples", _cmd_examples, "run the capability gallery"),
                                ("selftest", _cmd_selftest, "run the self-test suite"),

@@ -1072,6 +1072,85 @@ def differential_method_audit():
     return {"checks": checks, "proved": proved, "refuted": refuted, "unknown": unknown}
 
 
+def _grammar_program(rng):
+    """A random loop-free program over the container grammar -- list literals, [x] * n repetition (the shared-row
+    alias), `b = a` aliasing, indexing, append / item-store mutation, and one level of nesting -- returning an int
+    (a len or an element). It deliberately COMPOSES aliasing x mutation x repetition, the interaction a
+    single-construct corpus misses (the [[0]] * 2 shared-row trap). The body is `def f():` over literal seeds, so
+    CPython gives one deterministic answer the symbolic verdict is differentially checked against."""
+    sm = lambda: str(rng.randint(0, 3))
+    lst = lambda: "[" + ", ".join(sm() for _ in range(rng.randint(1, 3))) + "]"
+    seed = rng.choice([
+        lambda: "a = " + lst(),                                  # a flat list of ints
+        lambda: "a = [%s] * %d" % (lst(), rng.randint(2, 3)),    # repetition: the rows are ONE shared inner list
+        lambda: "a = [%s, %s]" % (lst(), lst()),                 # separately-written rows
+        lambda: "a = [%s] * %d" % (sm(), rng.randint(2, 4)),     # flat repetition of an int (immutable: safe)
+    ])
+    lines, aliased = [seed()], False
+    for _ in range(rng.randint(1, 4)):
+        k = rng.random()
+        if k < 0.2 and not aliased:
+            lines.append("b = a"); aliased = True                # alias, so a later mutation is seen through b too
+        elif k < 0.45:
+            lines.append("a.append(%s)" % sm())                  # mutate a directly
+        elif k < 0.7:
+            lines.append("a[0].append(%s)" % sm())               # mutate THROUGH a subscript (the [[0]]*2 shape)
+        elif k < 0.85:
+            lines.append("a[%d] = %s" % (rng.randint(0, 1), sm()))   # item store
+        elif aliased:
+            lines.append("b.append(%s)" % sm())                  # mutate through the alias
+        else:
+            lines.append("a.append(%s)" % sm())
+    reads = ["return len(a)", "return len(a[0])", "return a[0]", "return a[1]"]
+    if aliased:
+        reads += ["return len(b)", "return b[0]", "return len(b[0])"]
+    lines.append(rng.choice(reads))
+    return "def f():\n" + "".join("    " + s + "\n" for s in lines)
+
+
+def differential_grammar_audit(trials=150, seed=20260628):
+    """A GENERATIVE differential check of the container-grammar translation against CPython -- the defense against
+    TRANSLATION bugs, which corroboration (two solvers on ONE translation) cannot catch. Each random program
+    (composing aliasing / mutation / repetition -- the interaction the curated corpus missed) is run in the
+    sandbox for its deterministic CPython answer, and the symbolic verdict is required to AGREE or abstain, never
+    disagree: a REFUTED of a value CPython returns, a PROVED of a value it does not, a PROVED trap-freedom of a
+    function that raises a modeled trap, or a REFUTED trap-freedom of a clean run is a translation bug
+    (SoundnessError). This is exactly the check the [[0]] * 2 shared-row bug failed. Needs ALLOW_SUBJECT_EXECUTION."""
+    if not core.ALLOW_SUBJECT_EXECUTION:
+        raise RuntimeError("differential_grammar_audit requires ALLOW_SUBJECT_EXECUTION")
+    rng = random.Random(seed)
+    checks = value_checks = trap_checks = 0
+    for _ in range(trials):
+        src = _grammar_program(rng)
+        out = core.sandbox_run_batch(src, {}, "f", [[]])         # CPython's answer: ('ok', int) / ('nonint',) / ('trap',)
+        if out is None:
+            return {"available": False, "checks": 0}             # no sandbox in this environment: skip cleanly
+        res = out[0]
+        if res[0] == "ok":                                       # a clean int return: the engine must agree on it
+            v = res[1]
+            if prove(src, "result == %d" % v, target="f").status == REFUTED:
+                raise SoundnessError("translation bug: REFUTED a postcondition CPython satisfies "
+                                     "(result == %d) for:\n%s" % (v, src))
+            for w in (v + 1, v - 1):                             # ...and must not prove a value CPython contradicts
+                if prove(src, "result == %d" % w, target="f").status == PROVED:
+                    raise SoundnessError("translation bug: PROVED result == %d but CPython returns %d for:\n%s"
+                                         % (w, v, src))
+            value_checks += 1
+        if res[0] in ("ok", "nonint"):                           # a clean run: trap freedom must not be REFUTED
+            if check(src, target="f").status == REFUTED:
+                raise SoundnessError("translation bug: REFUTED trap freedom of a function CPython runs cleanly:\n%s" % src)
+            trap_checks += 1
+        elif res[0] == "trap":                                   # CPython raised: if a MODELED trap, no false PROVED
+            typed = core.sandbox_run_batch_typed(src, {}, "f", [[]])
+            if typed and typed[0][0] == "raise" and typed[0][1] in core._MODELED_TRAP_NAMES:
+                if check(src, target="f").status == PROVED:
+                    raise SoundnessError("translation bug: PROVED trap freedom but CPython raises %s:\n%s"
+                                         % (typed[0][1], src))
+                trap_checks += 1
+        checks += 1
+    return {"trials": trials, "checks": checks, "value_checks": value_checks, "trap_checks": trap_checks}
+
+
 def differential_sound_inference_audit():
     """Hold sound return-type inference against concrete execution. For each corpus function the inferred
     type set, when a claim is made, must contain type(f(...)).__name__ on every sampled input -- a proven
@@ -2768,7 +2847,7 @@ def run_self_tests(fast=False):
     for _act in _xbp()._actions:
         if getattr(_act, "choices", None):
             _verbs.update(_act.choices)
-    assert {"explain", "repair"} <= _verbs, _verbs
+    assert {"explain", "repair", "metamorphic", "doctest", "returns", "leak", "lock", "recheck"} <= _verbs, _verbs
     _xd = _xtf.mkdtemp(prefix="ts_cli_")
     try:
         _xp = _xos.path.join(_xd, "m.py")
@@ -2789,6 +2868,56 @@ def run_self_tests(fast=False):
             assert _xrc2 == 0 and "PROVED" in _xb2.getvalue(), _xb2.getvalue()
     finally:
         _xsh.rmtree(_xd, ignore_errors=True)
+
+    # the CLI surfaces the library's argv-expressible verbs -- metamorphic / doctest / returns / leak / lock
+    # (the source-only, string-arg properties) and recheck (re-validate a saved bundle) -- each driven end to
+    # end here so the gate locks the wiring and the exit-status contract (0 PROVED/verified, 1 REFUTED/failed).
+    import io as _vio, contextlib as _vcl, tempfile as _vtf, os as _vos, shutil as _vsh, json as _vjson
+    from .cli import main as _vmain
+
+    def _vrun(argv):
+        _b = _vio.StringIO()
+        with _vcl.redirect_stdout(_b):
+            return _vmain(argv)
+
+    _vd = _vtf.mkdtemp(prefix="ts_cliverbs_")
+    try:
+        def _w(name, body):
+            p = _vos.path.join(_vd, name)
+            with open(p, "w", encoding="utf-8") as _fh:
+                _fh.write(body)
+            return p
+        # metamorphic: idempotent (PROVED), a non-idempotent (REFUTED), and an involution via --relation
+        assert _vrun(["metamorphic", _w("mi.py", "def f(x):\n    if x < 0:\n        return 0\n    return x\n")]) == 0
+        assert _vrun(["metamorphic", _w("mn.py", "def f(x):\n    return x + 1\n")]) == 1
+        assert _vrun(["metamorphic", _w("mv.py", "def f(x):\n    return -x\n"), "--relation", "involution"]) == 0
+        # doctest: a correct example proves (0), a wrong one refutes (1); a no-doctest file is a clean no-op (0)
+        assert _vrun(["doctest", _w("dg.py", "def sq(x):\n    '''\n    >>> sq(3)\n    9\n    '''\n    return x * x\n")]) == 0
+        assert _vrun(["doctest", _w("db.py", "def sq(x):\n    '''\n    >>> sq(3)\n    10\n    '''\n    return x * x\n")]) == 1
+        assert _vrun(["doctest", _w("dn.py", "def f(x):\n    return x\n")]) == 0
+        # returns: a fall-through / wrong-type return under -> int refutes (1), a consistent one proves (0)
+        assert _vrun(["returns", _w("rb.py", "def f() -> int:\n    return None\n")]) == 1
+        assert _vrun(["returns", _w("rg.py", "def f() -> int:\n    return 5\n")]) == 0
+        # leak: an unclosed handle refutes (1), a closed one proves (0)
+        assert _vrun(["leak", _w("lkb.py", "def f():\n    x = open('a')\n    return 0\n")]) == 1
+        assert _vrun(["leak", _w("lkg.py", "def f():\n    x = open('a')\n    x.close()\n    return 0\n")]) == 0
+        # lock: an unprotected guarded op refutes (1), a protected one proves (0); --guarded names the op
+        assert _vrun(["lock", _w("lcb.py", "def save(x):\n    db.write(x)\n")]) == 1
+        assert _vrun(["lock", _w("lcg.py", "def save(x):\n    acquire_lock()\n    db.write(x)\n")]) == 0
+        assert _vrun(["lock", _w("lco.py", "def save(x):\n    log.append(x)\n"), "--guarded", "log.append"]) == 1
+        # recheck: a re-checkable bundle verifies (0), a tampered one fails (1), both through the CLI
+        _vbundle = change_bundle("def f(a):\n    return a + a\n", "def f(a):\n    return 2 * a\n")
+        assert _vbundle["checkable"], _vbundle
+        _vbp = _vos.path.join(_vd, "ok.json")
+        with open(_vbp, "w", encoding="utf-8") as _fh:
+            _vjson.dump(_vbundle, _fh)
+        assert _vrun(["recheck", _vbp]) == 0
+        _vtp = _vos.path.join(_vd, "bad.json")
+        with open(_vtp, "w", encoding="utf-8") as _fh:
+            _vjson.dump({**_vbundle, "sha256": "0" * 64}, _fh)
+        assert _vrun(["recheck", _vtp]) == 1
+    finally:
+        _vsh.rmtree(_vd, ignore_errors=True)
 
     # separation logic with a recursive predicate (list well-formedness)
     assert verify_list_segment("sl", "lseg").status == PROVED
@@ -3464,6 +3593,28 @@ def run_self_tests(fast=False):
     assert check("def f(n: int):\n    dp = [0] * n\n    if n > 0:\n        return dp[0]\n    return 0\n").status == PROVED
     assert check("def f(n: int):\n    if n < 0:\n        return 0\n    dp = [0] * (n + 1)\n    for i in range(2, n + 1):\n        dp[i] = dp[i - 1] + dp[i - 2]\n    return dp[n]\n").status == PROVED
     assert check("def f(n: int):\n    dp = [0] * (n + 1)\n    return dp[0]\n").status == REFUTED
+    # SOUNDNESS: sequence repetition [x] * n replicates the REFERENCE, so [[0]] * 2 is two names for ONE inner
+    # row -- an append through a[0] grows a[1] too (real Python: len(a[1]) == 2). The value engine models a list
+    # as an immutable tuple and cannot track the mutation, so a mutating method reached through a subscript /
+    # attribute receiver forgets the root container rather than silently no-op'ing it; the later read then
+    # abstains (UNKNOWN) instead of returning the stale pre-mutation row (a false PROVED of len(a[1]) == 1 and
+    # REFUTED of len(a[1]) == 2 -- the verdict exactly backwards).
+    _alias = "def f():\n    a = [[0]] * 2\n    a[0].append(1)\n    return len(a[1])\n"
+    assert prove(_alias, "result == 1", target="f").status == UNKNOWN, prove(_alias, "result == 1", target="f")
+    assert prove(_alias, "result == 2", target="f").status == UNKNOWN, prove(_alias, "result == 2", target="f")
+    # even with separately-written rows the value engine cannot model the append's effect, so a read of the
+    # mutated row abstains rather than be proved wrong (len(a[0]) is really 2 after the append, not 1).
+    assert prove("def f():\n    a = [[0], [0]]\n    a[0].append(1)\n    return len(a[0])\n",
+                 "result == 1", target="f").status == UNKNOWN
+    # the bare-name append-then-read is forgotten the same way (already sound; locked here as a regression guard)
+    assert prove("def f():\n    a = [0]\n    a.append(1)\n    return len(a)\n", "result == 1", target="f").status == UNKNOWN
+    # the same staleness reached through an ALIAS: b = a makes b and a one object, so b.append grows a too (real
+    # Python len(a) == 3). Forgetting only the receiver b is not enough -- a aliases it -- so the engine forgets
+    # every name that shares the mutated object (found by the generative grammar fuzzer below, not the curated list).
+    assert prove("def f():\n    a = [2, 3]\n    b = a\n    b.append(3)\n    return len(a)\n",
+                 "result == 2", target="f").status == UNKNOWN
+    assert prove("def f():\n    a = [2, 3]\n    b = a\n    b.append(3)\n    return len(a)\n",
+                 "result == 3", target="f").status == UNKNOWN
 
     # str % args (printf formatting, including a tuple of args) is a trap-free string; the args are trap-checked,
     # so a div by zero in an argument still refutes.
@@ -5950,6 +6101,7 @@ def run_self_tests(fast=False):
         _si = _sl = {"claims": 1, "runs": 1, "abstain": 1}
         _rf = {"checks": 1, "constructs": 40}
         _erf = {"checks": 10001, "constructs": 20}
+        _dg = {"checks": 1, "value_checks": 1, "trap_checks": 1}
     else:
         core.ALLOW_SUBJECT_EXECUTION = True
         try:
@@ -5962,6 +6114,7 @@ def run_self_tests(fast=False):
             _sl = differential_sound_local_audit()              # sound local-variable inference: over-approximation holds
             _rf = refinement_audit(per=25)                      # each modeled construct refines CPython
             _erf = exhaustive_refinement_audit()                # and the integer constructs refine it on EVERY box input
+            _dg = differential_grammar_audit(trials=120)        # generative container-grammar translation check
         finally:
             core.ALLOW_SUBJECT_EXECUTION = False
     assert _dm2["checks"] > 0 and _dm2["proved"] > 0, _dm2   # method calls vs CPython, 0 contradictions
@@ -5973,6 +6126,11 @@ def run_self_tests(fast=False):
     # the integer fragment of the core is confirmed equal to CPython on every input of a bounded box, not
     # only on sampled points: a bounded proof of the integer encodings the Rocq proof does not reach.
     assert _erf["checks"] > 10000 and _erf["constructs"] >= 20, _erf
+    # the generative container-grammar fuzzer: aliasing x mutation x repetition programs, each differentially
+    # checked against CPython -- the defense against TRANSLATION bugs that corroboration (two solvers on one
+    # translation) cannot catch. A PROVED of the wrong value / a REFUTED of the right one is a SoundnessError;
+    # this is the check the [[0]] * 2 shared-row bug failed.
+    assert _dg["checks"] > 0 and _dg["value_checks"] > 0 and _dg["trap_checks"] > 0, _dg
     # the differential CPython oracle reaches the heap engine too: object/list/dict
     #       programs are verified and cross-checked against real execution, proving and refuting both.
     assert _dh["exec_checks"] > 0 and _dh["proved"] > 0 and _dh["refuted"] > 0, _dh
@@ -7781,6 +7939,8 @@ __all__ = [
     '_bit_eq',
     'differential_typed_audit',
     'differential_method_audit',
+    '_grammar_program',
+    'differential_grammar_audit',
     'differential_sound_inference_audit',
     'differential_sound_local_audit',
     'verification_benchmark',

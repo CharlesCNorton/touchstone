@@ -93,6 +93,12 @@ touchstone spec   f.py                            # synthesize a contract the fu
 touchstone infer  m.py                            # sound over-approximate types of a return and its locals
 touchstone explain f.py --ensures 'result == x'   # restate a verdict and the reason behind it in plain terms
 touchstone repair f.py --generator CMD            # drive a generator until the verifier signs off on a fix
+touchstone metamorphic f.py --relation idempotent # an oracle-free property of a unary function (no spec needed)
+touchstone doctest f.py                           # mine the function's own doctests into prove obligations
+touchstone returns f.py                           # the declared `-> T` annotation vs what the body can return
+touchstone leak   f.py                            # every opened resource is closed on every path
+touchstone lock   f.py --guarded db.write         # a guarded operation is never reached without a lock held
+touchstone recheck bundle.json                    # re-validate a saved proof bundle, no fresh solve
 touchstone covers                                 # what it can prove, the modeled subset, the trust base
 ```
 
@@ -132,7 +138,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: CharlesCNorton/touchstone@v1.23.0
+      - uses: CharlesCNorton/touchstone@v1.24.0
         with:
           baseline: .touchstone-baseline.json   # fail only on a newly introduced trap
 ```
@@ -141,7 +147,7 @@ jobs:
 # .pre-commit-config.yaml -- gate changed functions before each commit
 repos:
   - repo: https://github.com/CharlesCNorton/touchstone
-    rev: v1.23.0
+    rev: v1.24.0
     hooks:
       - id: touchstone-gate
 ```
