@@ -3887,6 +3887,18 @@ def run_self_tests(fast=False):
     finally:
         core.SANDBOX_SUBJECT, core.ALLOW_SUBJECT_EXECUTION = _sb, _ae
 
+    # a single-loop prove whose PRECONDITION is outside the modeled subset -- a free name not among the
+    # parameters, or an unmodeled call -- abstains rather than crashing: prove routes the loop through verify_chc,
+    # whose bmc_check fallback evaluates the precondition as pre(base) and must catch an untranslatable one and
+    # return UNKNOWN, the way the straight-line path already does; a translatable precondition on the same loop
+    # still proves. (The pre evaluation sat outside bmc_check's guard, so an untranslatable precondition crashed
+    # prove instead of yielding a verdict; bmc_check now guards the pre/post evaluation like the loop engines.)
+    assert prove(counter, "result == n", requires="n >= 0 or zzz >= 0").status == UNKNOWN     # free name in the precondition
+    assert prove(counter, "result == n", requires="ghost(n) > 0").status == UNKNOWN           # unmodeled call in the precondition
+    assert bmc_check("bmc-badpre", "f", counter, lambda S: S["nope"] >= 0,                    # the engine directly: a precondition
+                     lambda S, r: r >= 0).status == UNKNOWN                                   # raising KeyError abstains, not crash
+    assert prove(counter, "result == n", requires="n >= 0").status == PROVED                  # a translatable precondition still proves
+
     # 59-60. strings and dictionaries via Z3 theories
     assert verify_string_property("str", "s").status == PROVED
     assert verify_dict_property("dict", "d").status == PROVED

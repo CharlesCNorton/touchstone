@@ -8776,6 +8776,8 @@ def bmc_check(prop, target, src, pre, post, k=12, repo=None) -> Verdict:
     ctx = Ctx(repo or {})
     try:
         base = {a.arg: _param_term(a) for a in fn.args.args}      # typed: float params reason under IEEE-754
+        pre_b = pre(base)                                         # evaluated under the guard, so an untranslatable
+        #                                                          precondition (a free name, an unmodeled call) abstains
         ctx.traps = []; ctx.pc = z3.BoolVal(True)
         cur = _apply_assigns(init, base, ctx)
         exit_bad, reached = [], z3.BoolVal(True)
@@ -8786,9 +8788,9 @@ def bmc_check(prop, target, src, pre, post, k=12, repo=None) -> Verdict:
             reached = z3.And(reached, g)
             cur = _apply_assigns(loop.body, cur, ctx)
         ctx.traps = None
-    except Unsupported as u:
+    except (Unsupported, z3.Z3Exception, TypeError, KeyError, AttributeError) as u:
         return Verdict(UNKNOWN, prop, target, "BMC", reason=str(u))
-    st, model = _solve(z3.And(pre(base), z3.Or(*exit_bad)))
+    st, model = _solve(z3.And(pre_b, z3.Or(*exit_bad)))
     if st == REFUTED:
         cex = ", ".join(f"{a}={model.eval(base[a], model_completion=True)}" for a in args)
         return Verdict(REFUTED, prop, target, f"BMC(k={k})",
