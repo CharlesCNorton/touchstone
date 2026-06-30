@@ -2346,6 +2346,67 @@ def run_self_tests(fast=False):
     assert check("import itertools\ndef f(a: list, b: list):\n    return 10 // (len(list(itertools.chain(a, b))) + 1)\n").status == PROVED   # list(it) is sized
     assert check("import itertools\ndef f(a: list, b: list):\n    t = 0\n    for x in itertools.chain(a, b):\n        t = 1\n    return t\n").status == PROVED   # iterating is fine
     assert check("def f(xs: list):\n    return list(reversed(xs))\n").status == PROVED
+    # itertools.accumulate(it[, func]): list(accumulate(xs)) is trap free; a trapping func (a // b) refutes; the
+    # iterator is unsized, so len(accumulate(xs)) and accumulate(xs)[i] are TypeErrors.
+    assert check("import itertools\ndef f(xs: list):\n    return list(itertools.accumulate(xs))\n").status == PROVED
+    assert check("import itertools\ndef f(xs: list):\n    return list(itertools.accumulate(xs, lambda a, b: a // b))\n").status == REFUTED
+    assert check("import itertools\ndef f(xs: list):\n    return len(itertools.accumulate(xs))\n").status == REFUTED
+    assert check("import itertools\ndef f(xs: list):\n    t = 0\n    for x in itertools.accumulate(xs):\n        t = 1\n    return t\n").status == PROVED
+    # statistics.mean / median / stdev / ... raise StatisticsError on too few data points (< 1 for the mean family,
+    # < 2 for stdev / variance); a len guard removes it. The result is a float.
+    assert check("import statistics\ndef f(xs: list):\n    return statistics.mean(xs)\n").status == REFUTED
+    assert check("import statistics\ndef f(xs: list):\n    if xs:\n        return statistics.mean(xs)\n    return 0.0\n").status == PROVED
+    assert check("import statistics\ndef f(xs: list):\n    return statistics.stdev(xs)\n").status == REFUTED
+    assert check("import statistics\ndef f(xs: list):\n    if len(xs) >= 2:\n        return statistics.stdev(xs)\n    return 0.0\n").status == PROVED
+    assert check("import statistics\ndef f(xs: list):\n    if len(xs) >= 1:\n        return statistics.stdev(xs)\n    return 0.0\n").status == REFUTED   # 1 point still raises
+    # random.choice(seq) IndexErrors on empty; random.sample(seq, k) ValueErrors if k out of [0, len]; random.randint(a,
+    # b) ValueErrors if a > b. choice returns an element, sample a list of length k. A guard removes each trap.
+    assert check("import random\ndef f(xs: list):\n    return random.choice(xs)\n").status == REFUTED
+    assert check("import random\ndef f(xs: list):\n    if xs:\n        return random.choice(xs) + 1\n    return 0\n").status == PROVED
+    assert check("import random\ndef f(xs: list):\n    return random.sample(xs, 3)\n").status == REFUTED
+    assert check("import random\ndef f(xs: list, k: int):\n    if 0 <= k <= len(xs):\n        return 10 // (len(random.sample(xs, k)) - k + 1)\n    return 0\n").status == PROVED
+    assert check("import random\ndef f(a: int, b: int):\n    return random.randint(a, b)\n").status == REFUTED
+    assert check("import random\ndef f(a: int, b: int):\n    if a <= b:\n        return random.randint(a, b)\n    return 0\n").status == PROVED
+    assert check("import random\ndef f():\n    return random.randint(1, 6)\n").status == PROVED
+    # heapq.heappop(h) IndexErrors on an empty heap; returns an element. Modeled only when h is popped exactly once
+    # (mutate_once); two pops under a len >= 1 guard ABSTAIN (the second could empty -- not a false PROVED).
+    assert check("import heapq\ndef f(h: list):\n    return heapq.heappop(h)\n").status == REFUTED
+    assert check("import heapq\ndef f(h: list):\n    if h:\n        return heapq.heappop(h) + 1\n    return 0\n").status == PROVED
+    assert check("import heapq\ndef f(h: list):\n    if len(h) >= 1:\n        a = heapq.heappop(h)\n        b = heapq.heappop(h)\n        return a + b\n    return 0\n").status == UNKNOWN
+    # deque.popleft() raises IndexError on an empty deque, so it is a trapping method: an opaque receiver abstains
+    # to UNKNOWN rather than being assumed trap-free (which would falsely PROVE deque(xs).popleft() for an empty xs).
+    assert check("import collections\ndef f(d):\n    return d.popleft()\n").status == UNKNOWN
+    assert check("import collections\ndef f(xs: list):\n    return collections.deque(xs).popleft()\n").status == UNKNOWN
+    # math.prod(iterable) is trap free (empty -> start=1); the result is an arbitrary int that can be 0, so
+    # 10 // math.prod(xs) refutes. A non-scalar-numeric sequence (list of lists) declines.
+    assert check("import math\ndef f(xs: list):\n    return math.prod(xs) + 1\n").status == PROVED
+    assert check("import math\ndef f(xs: list):\n    return 10 // math.prod(xs)\n").status == REFUTED
+    assert check("import math\ndef f(xs: list[list]):\n    return math.prod(xs)\n").status == UNKNOWN
+    # math.fsum(iterable) is a trap-free float reduction (empty -> 0.0); the result can be 0.0, so 10 // math.fsum(xs)
+    # refutes (float floor-division by zero).
+    assert check("import math\ndef f(xs: list):\n    return math.fsum(xs) / 2\n").status == PROVED
+    assert check("import math\ndef f(xs: list):\n    return 10 // math.fsum(xs)\n").status == REFUTED
+    assert check("import math\ndef f(xs: list[list]):\n    return math.fsum(xs)\n").status == UNKNOWN
+    # string module constants (string.digits / ascii_lowercase / ...) are fixed literals, so an index bounds-checks
+    # against the exact length (digits is 10), len() is exact, and string methods apply.
+    assert check("import string\ndef f(i: int):\n    return string.digits[i]\n").status == REFUTED
+    assert check("import string\ndef f(i: int):\n    if 0 <= i < 10:\n        return string.digits[i]\n    return ''\n").status == PROVED
+    assert check("import string\ndef f():\n    return string.digits[20]\n").status == REFUTED   # len 10
+    assert check("import string\ndef f():\n    return 10 // len(string.digits)\n").status == PROVED
+    assert check("import string\ndef f():\n    return string.ascii_uppercase.lower()\n").status == PROVED
+    # os.path.split / splitext / splitdrive return a 2-tuple of strings (never raise on str input); basename / dirname
+    # / join / normpath return a string; exists / isfile / isdir / isabs return a bool. So splitext(p)[1] is a string,
+    # [2] is an out-of-range IndexError, and unpacking root, ext = splitext(p) decides.
+    assert check("import os\ndef f(p: str):\n    return os.path.splitext(p)[1].lower()\n").status == PROVED
+    assert check("import os\ndef f(p: str):\n    root, ext = os.path.splitext(p)\n    return root + ext\n").status == PROVED
+    assert check("import os\ndef f(p: str):\n    return os.path.splitext(p)[2]\n").status == REFUTED   # 2-tuple, [2] OOB
+    assert check("import os\ndef f(p: str):\n    return os.path.basename(p).startswith('x')\n").status == PROVED
+    assert check("import os\ndef f(p: str):\n    if os.path.exists(p):\n        return 1\n    return 0\n").status == PROVED
+    # a nested loop's inner-body first iteration is exact (the first element of an arbitrary row), so an unguarded
+    # inner trap refutes (10 // x on a zero element); a trap-free or guarded inner body proves.
+    assert check("def f(m: list[list]):\n    s = 0\n    for row in m:\n        for x in row:\n            s = 10 // x\n    return s\n").status == REFUTED
+    assert check("def f(m: list[list]):\n    s = 0\n    for row in m:\n        for x in row:\n            s = s + x\n    return s\n").status == PROVED
+    assert check("def f(m: list[list]):\n    s = 0\n    for row in m:\n        for x in row:\n            if x != 0:\n                s = 10 // x\n    return s\n").status == PROVED
     # sorted/min/max key= lambda applied to a freely-chosen element: a trap-free key proves, a dividing key refutes.
     # min/max also refute on an empty iterable (no guard / default=). A bare builtin key (len/abs) is declined.
     assert check("def f(xs: list):\n    return sorted(xs, key=lambda x: x + 1)\n").status == PROVED

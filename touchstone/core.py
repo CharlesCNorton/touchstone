@@ -762,10 +762,14 @@ _OPERATOR_CMP = {"lt": ast.Lt, "le": ast.LtE, "eq": ast.Eq, "ne": ast.NotEq, "gt
 _F64 = z3.Float64()
 import math as _math
 import struct as _struct
+import string as _pystr
 # math module float constants, exact as IEEE-754 doubles: math.pi / math.e / math.tau / math.inf / math.nan,
 # and the same bare names under `from math import pi`. Reading one never traps, so arithmetic over it is modeled.
 _MATH_CONSTS = {"pi": z3.FPVal(_math.pi, _F64), "e": z3.FPVal(_math.e, _F64), "tau": z3.FPVal(_math.tau, _F64),
                 "inf": z3.fpPlusInfinity(_F64), "nan": z3.fpNaN(_F64)}
+# string module constants are fixed literals, so string.digits[i] bounds-checks against length 10, etc.
+_STRING_CONSTS = {n: getattr(_pystr, n) for n in ("ascii_lowercase", "ascii_uppercase", "ascii_letters", "digits",
+                  "hexdigits", "octdigits", "punctuation", "whitespace", "printable")}
 _RM = z3.RNE()
 
 
@@ -1054,7 +1058,7 @@ _TRANSCENDENTAL = {"sin", "cos", "exp", "log"}
 # Builtin methods that can raise a modeled trap on valid inputs; an unmodeled call to one stays UNKNOWN.
 # Every other method is assumed trap free (the modular notion). differential_method_audit guards the set.
 _TRAPPING_METHODS = frozenset({
-    "pop", "remove", "index", "rindex", "popitem", "sort",          # list / dict / set value traps
+    "pop", "popleft", "remove", "index", "rindex", "popitem", "sort",   # list / deque / dict / set value traps
     "encode", "decode", "format", "format_map", "translate", "join",  # str / bytes encode / format traps
     "split", "rsplit", "splitlines", "maketrans", "fromhex", "to_bytes", "from_bytes",
 })
@@ -2766,6 +2770,12 @@ _NN_ACTIVATION_TRAPFREE = frozenset({
     "prelu", "threshold", "sigmoid", "dropout", "alpha_dropout",
 })
 
+# statistics reducers whose only trap is too-few data points (StatisticsError). geometric_mean / harmonic_mean
+# (value-domain traps) and median_grouped (interval params) are excluded -- they stay UNKNOWN.
+_STATISTICS_REDUCERS = frozenset({
+    "mean", "fmean", "median", "median_low", "median_high", "mode", "stdev", "variance", "pstdev", "pvariance",
+})
+
 
 def _functional_call(name, node, env, ctx):
     """A `torch.nn.functional.X(tensor, ...)` call: an elementwise activation or normalization preserves the
@@ -3989,6 +3999,23 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             return _Opaque("besteffort")
         raise Unsupported(f"unmodeled call {name}(...) at line {getattr(node, 'lineno', '?')}")
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        if (isinstance(node.func.value, ast.Attribute) and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "os" and node.func.value.attr == "path" and "os" not in env):
+            # os.path string functions never raise on str input. split / splitext / splitdrive return a 2-tuple of
+            # strings; basename / dirname / join / normpath / normcase / commonprefix return a string; isabs / exists /
+            # isfile / isdir / islink / lexists / ismount return a bool. Filesystem-raising ones (getsize, ...) decline.
+            ospm = node.func.attr
+            if ospm in ("split", "splitext", "splitdrive", "basename", "dirname", "join", "normpath", "normcase",
+                        "commonprefix", "isabs", "exists", "isfile", "isdir", "islink", "lexists", "ismount"):
+                for a in node.args:
+                    ev(a.value if isinstance(a, ast.Starred) else a, env, ctx)   # trap-check arguments
+                for kw in node.keywords:
+                    ev(kw.value, env, ctx)
+                if ospm in ("split", "splitext", "splitdrive"):
+                    return (z3.FreshConst(z3.StringSort(), "osp_a"), z3.FreshConst(z3.StringSort(), "osp_b"))
+                if ospm in ("isabs", "exists", "isfile", "isdir", "islink", "lexists", "ismount"):
+                    return z3.FreshConst(z3.BoolSort(), "osp_b")
+                return z3.FreshConst(z3.StringSort(), "osp")
         if isinstance(node.func.value, ast.Name):            # module function: math.fabs(x), ...
             qual = node.func.value.id + "." + node.func.attr
             if qual == "math.sqrt" and len(node.args) == 1:
@@ -4124,6 +4151,35 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                                          else z3.Length(p) if _is_str(p) else z3.IntVal(len(p)))
                     return _SafeContainer("product", length=total, unsized=True)
                 return _Opaque("product")
+            if (node.func.value.id == "itertools" and node.func.attr == "accumulate"
+                    and "itertools" not in env and 1 <= len(node.args) <= 2 and not node.keywords):
+                # itertools.accumulate(it[, func]) yields len(it) running accumulations (a lazy iterator). The default
+                # (add) is trap free; a positional func lambda is applied to a freely-chosen (acc, element) pair so a
+                # trapping func (a // b) refutes. Modeled for a symbolic container.
+                it = ev(node.args[0], env, ctx)
+                if isinstance(it, _SafeContainer):
+                    if len(node.args) == 2:
+                        fn = node.args[1]
+                        lam = ev(fn, env, ctx) if isinstance(fn, ast.Lambda) else \
+                            (env.get(fn.id) if isinstance(fn, ast.Name) else None)
+                        acc = _container_element(it, ctx)
+                        elem = _container_element(it, ctx)
+                        saved = ctx.pc
+                        ctx.pc = z3.And(ctx.pc, _container_len(it, ctx) >= 2)   # func runs only on >= 2 elements
+                        try:
+                            if isinstance(lam, _Lambda) and len(lam.params) == 2:
+                                le = dict(lam.env)
+                                le[lam.params[0]] = acc
+                                le[lam.params[1]] = elem
+                                ev(lam.body, le, ctx)
+                            elif isinstance(fn, ast.Name) and fn.id in ctx.repo:
+                                ctx.inline(fn.id, [acc, elem])
+                            else:
+                                raise Unsupported("itertools.accumulate with a non-modeled func")
+                        finally:
+                            ctx.pc = saved
+                    return _SafeContainer("accumulate", length=_container_len(it, ctx), unsized=True)
+                raise Unsupported("itertools.accumulate over a non-container iterable")
             if (node.func.value.id == "functools" and node.func.attr == "reduce"
                     and "functools" not in env and 2 <= len(node.args) <= 3 and not node.keywords):
                 # functools.reduce(f, it[, init]): apply f to a freely-chosen (acc, element) pair so a trapping step
@@ -4155,6 +4211,82 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                         ctx.traps.append(z3.And(ctx.pc, _container_len(seq, ctx) <= 0))
                     return _Opaque("reduce")
                 raise Unsupported("functools.reduce over a non-container iterable")
+            if (node.func.value.id == "statistics" and "statistics" not in env
+                    and node.func.attr in _STATISTICS_REDUCERS and len(node.args) == 1 and not node.keywords):
+                # statistics.mean / median / stdev / ... raises StatisticsError on too few data points (< 1 for the
+                # mean family, < 2 for stdev / variance); the result is a float. A len guard removes the trap.
+                seq = ev(node.args[0], env, ctx)
+                if isinstance(seq, _SafeContainer) and ctx.traps is not None:
+                    need = 2 if node.func.attr in ("stdev", "variance") else 1
+                    ctx.traps.append(z3.And(ctx.pc, _container_len(seq, ctx) < need))
+                    return z3.FreshConst(_F64, "stat")
+                raise Unsupported("statistics reducer over a non-container")
+            if (node.func.value.id == "random" and node.func.attr == "choice"
+                    and "random" not in env and len(node.args) == 1 and not node.keywords):
+                # random.choice(seq): IndexError on an empty sequence; returns an element.
+                seq = ev(node.args[0], env, ctx)
+                if isinstance(seq, _SafeContainer) and not seq.unindexable and not seq.unsized and ctx.traps is not None:
+                    ctx.traps.append(z3.And(ctx.pc, _container_len(seq, ctx) <= 0))
+                    return _container_element(seq, ctx)
+                if _is_str(seq):
+                    if ctx.traps is not None:
+                        ctx.traps.append(z3.And(ctx.pc, z3.Length(seq) == 0))
+                    c = z3.FreshConst(z3.StringSort(), "choice")
+                    if ctx.facts is not None:
+                        ctx.facts.append(z3.Length(c) == 1)
+                    return c
+                raise Unsupported("random.choice over a non-sequence")
+            if (node.func.value.id == "random" and node.func.attr == "sample"
+                    and "random" not in env and len(node.args) == 2 and not node.keywords):
+                # random.sample(seq, k): ValueError if k < 0 or k > len(seq); returns a list of length k.
+                seq = ev(node.args[0], env, ctx)
+                k = ev(node.args[1], env, ctx)
+                if isinstance(seq, _SafeContainer) and z3.is_expr(k) and z3.is_int(k) and ctx.traps is not None:
+                    ctx.traps.append(z3.And(ctx.pc, z3.Or(k < 0, k > _container_len(seq, ctx))))
+                    return _SafeContainer("sample", length=k)
+                raise Unsupported("random.sample over a non-container / non-integer k")
+            if (node.func.value.id == "random" and node.func.attr == "randint"
+                    and "random" not in env and len(node.args) == 2 and not node.keywords):
+                # random.randint(a, b): ValueError if a > b; returns an int in [a, b].
+                a0 = _as_int(ev(node.args[0], env, ctx))
+                b0 = _as_int(ev(node.args[1], env, ctx))
+                if ctx.traps is not None:
+                    ctx.traps.append(z3.And(ctx.pc, a0 > b0))
+                r = z3.FreshInt("randint")
+                if ctx.facts is not None:
+                    ctx.facts.append(z3.And(r >= a0, r <= b0))
+                return r
+            if (node.func.value.id == "heapq" and node.func.attr == "heappop"
+                    and "heapq" not in env and len(node.args) == 1 and not node.keywords):
+                # heapq.heappop(h): IndexError on an empty heap; returns an element. Modeled only when h is popped
+                # exactly once (mutate_once), so the stable length is exact; repeated pops / a push abstain.
+                seq = ev(node.args[0], env, ctx)
+                nm = node.args[0].id if isinstance(node.args[0], ast.Name) else None
+                if (isinstance(seq, _SafeContainer) and not seq.unindexable and not seq.unsized
+                        and ctx.traps is not None and nm is not None and nm in ctx.mutate_once):
+                    ctx.traps.append(z3.And(ctx.pc, _container_len(seq, ctx) <= 0))
+                    return _container_element(seq, ctx)
+                raise Unsupported("heapq.heappop of a non-container / multiply-mutated heap")
+            if (node.func.value.id == "math" and node.func.attr == "prod"
+                    and "math" not in env and len(node.args) == 1):
+                # math.prod(iterable, *, start=1): the product of a scalar numeric sequence, trap free (empty -> start).
+                # The result is an arbitrary int -- it can be 0 (a zero element), so 10 // math.prod(xs) refutes.
+                seq = ev(node.args[0], env, ctx)
+                for kw in node.keywords:
+                    ev(kw.value, env, ctx)                   # start= is trap-checked
+                if (isinstance(seq, _SafeContainer) and not seq.unindexable and not seq.unsized
+                        and seq.elem is None):
+                    return z3.FreshInt("prod")
+                raise Unsupported("math.prod over a non-scalar-numeric sequence")
+            if (node.func.value.id == "math" and node.func.attr == "fsum"
+                    and "math" not in env and len(node.args) == 1 and not node.keywords):
+                # math.fsum(iterable): the exact float sum of a scalar numeric sequence, trap free (empty -> 0.0). The
+                # result is an arbitrary float that can be 0.0, so 10 // math.fsum(xs) refutes (float floor-div by 0).
+                seq = ev(node.args[0], env, ctx)
+                if (isinstance(seq, _SafeContainer) and not seq.unindexable and not seq.unsized
+                        and seq.elem is None):
+                    return z3.FreshConst(_F64, "fsum")
+                raise Unsupported("math.fsum over a non-scalar-numeric sequence")
             if (node.func.value.id == "struct" and node.func.attr == "calcsize"
                     and "struct" not in env and len(node.args) == 1 and not node.keywords):
                 # struct.calcsize(fmt): for a string LITERAL the size is exactly CPython's -- a valid format string
@@ -4635,6 +4767,9 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         if (isinstance(node.value, ast.Name) and node.value.id == "math" and "math" not in env
                 and node.attr in _MATH_CONSTS):
             return _MATH_CONSTS[node.attr]                   # math.pi / math.e / math.tau / math.inf / math.nan
+        if (isinstance(node.value, ast.Name) and node.value.id == "string" and "string" not in env
+                and node.attr in _STRING_CONSTS):
+            return z3.StringVal(_STRING_CONSTS[node.attr])   # string.ascii_lowercase / digits / punctuation / ...
         v = ev(node.value, env, ctx)
         if isinstance(v, _Complex):
             if node.attr == "real":
@@ -5157,6 +5292,12 @@ def _mutate_once_containers(fn):
                 tracked[nm] = tracked.get(nm, 0) + 1
             elif n.func.attr in _MUTATING_METHODS:
                 other.add(nm)
+            if nm == "heapq" and n.args and isinstance(n.args[0], ast.Name):
+                hn = n.args[0].id                            # heapq.heappop(h) pops h; heappush / heapify / ... mutate it
+                if n.func.attr == "heappop":
+                    tracked[hn] = tracked.get(hn, 0) + 1
+                elif n.func.attr in ("heappush", "heapify", "heapreplace", "heappushpop"):
+                    other.add(hn)
         elif isinstance(n, (ast.Assign, ast.AugAssign)):
             targets = n.targets if isinstance(n, ast.Assign) else [n.target]
             for t in targets:
@@ -5724,7 +5865,9 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         # the first iteration is exact (pre-loop accumulators, a freely-chosen element), so a trap
                         # here is real and witnessable -- it refutes even though later iterations are havoc'd.
                         st, se, sh = ctx.traps, ctx.exact_traps, ctx.havoc
-                        first = []; ctx.traps, ctx.exact_traps = first, None
+                        first = []; ctx.traps, ctx.exact_traps, ctx.havoc = first, None, False
+                        #  reset havoc so `clean` reflects only THIS body's over-approximation, not an enclosing loop's
+                        #  -- a nested inner loop's first iteration (first element of an arbitrary row) is itself exact
                         e1 = dict(e); _fe = z3.FreshInt("fe_" + s.target.id)
                         if itv.byteslike and not itv.unindexable and ctx.facts is not None:   # a bytes / bytearray
                             ctx.facts.append(z3.And(_fe >= 0, _fe <= 255))                     # element is an int in
