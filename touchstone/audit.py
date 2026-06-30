@@ -2296,9 +2296,8 @@ def run_self_tests(fast=False):
     assert check("def f(s: str, sep: str):\n    return s.split(sep, 1)\n").status == REFUTED
     assert check("def f(s: str):\n    return s.replace(\"a\", \"b\", 1)\n").status == PROVED
     assert check("def f(s: str):\n    return \" \".join(s.split())\n").status == PROVED   # join a split (string) seq
-    # split / rsplit with a separator always yield at least the whole string, so the result has length >= 1 and [0] /
-    # [-1] are in bounds: those index loads are PROVED, and an element is a string (so [0].upper() is fine). split()
-    # on whitespace and splitlines() can return [] (e.g. "".split() == []), so [0] there stays a refutable IndexError.
+    # split/rsplit with a separator yield >= 1 part, so [0]/[-1] are in bounds and an element is a string; split() on
+    # whitespace and splitlines() can be empty, so [0] there is a refutable IndexError.
     assert check("def f(s: str):\n    return s.split(',')[0]\n").status == PROVED
     assert check("def f(s: str):\n    return s.split(',')[-1]\n").status == PROVED
     assert check("def f(s: str):\n    return s.rsplit('/', 1)[-1]\n").status == PROVED
@@ -2309,10 +2308,8 @@ def run_self_tests(fast=False):
     assert check("def f(s: str):\n    return s.split(',')[5]\n").status == REFUTED           # only >= 1, [5] may be OOB
     assert check("def f(s: str, i: int):\n    return s.split(',')[i]\n").status == REFUTED   # unguarded symbolic index
     assert check("def f(s: str, i: int):\n    p = s.split(',')\n    if 0 <= i < len(p):\n        return p[i]\n    return ''\n").status == PROVED
-    # map(str, X) / map(repr, X) is a lazy iterator of strings (str / repr is total), so sep.join(map(str, X)) is a
-    # trap-free string -- the most common list-to-string idiom. The iterator is NOT sized or subscriptable, so len()
-    # of it is the TypeError CPython raises and an index abstains; a non-string map function (map(abs, X)) is not
-    # assumed to yield strings, so the join stays UNKNOWN (it could TypeError on a non-string part).
+    # map(str, X) / map(repr, X) yields strings, so sep.join(...) is a trap-free string; the iterator is unsized, so
+    # len() of it is a TypeError and it[i] abstains. A non-string map function (map(abs, X)) stays UNKNOWN.
     assert check("def f(xs: list):\n    return ''.join(map(str, xs))\n").status == PROVED
     assert check("def f(xs: list):\n    return ','.join(map(str, xs))\n").status == PROVED
     assert check("def f(n: int):\n    return ' '.join(map(str, range(n)))\n").status == PROVED
@@ -2321,24 +2318,36 @@ def run_self_tests(fast=False):
     assert check("def f(xs: list):\n    return len(map(str, xs))\n").status == REFUTED       # map has no len(): TypeError
     assert check("def f(xs: list):\n    return map(str, xs)[0]\n").status == UNKNOWN          # map not subscriptable
     assert check("def f(xs: list):\n    return ','.join(map(abs, xs))\n").status == UNKNOWN   # abs may not yield a str
-    # a generator expression whose element is a string -- (str(x) for x in xs), (f'{x}' for ...) -- is likewise a lazy
-    # iterator of strings, so sep.join(<that generator>) is a trap-free string. A non-string-element generator stays
-    # UNKNOWN (it could TypeError in join).
+    # a string-element generator (str(x) for x in xs) is likewise an iterator of strings: sep.join(...) proves; a
+    # non-string-element generator stays UNKNOWN.
     assert check("def f(xs: list):\n    return ','.join(str(x) for x in xs)\n").status == PROVED
     assert check("def f(n: int):\n    return '/'.join(str(i) for i in range(n))\n").status == PROVED
     assert check("def f(xs: list):\n    return ','.join(x for x in xs)\n").status == UNKNOWN     # elements not proven str
-    # a sequence's truthiness (`if c:` / `if not c:`) is tied to the SAME length its c[i] bounds check uses, including
-    # for a list comprehension or split result whose length term is explicit (not len_<name>) -- so an emptiness guard
-    # written as truthiness proves the guarded access safe, where previously it spuriously refuted as out-of-range.
+    # a sequence's truthiness uses the same length its c[i] bounds check uses (the explicit length of a comprehension
+    # or split result), so `if c: c[0]` proves.
     assert check("def f(xs: list):\n    c = [x + 1 for x in xs]\n    if c:\n        return c[0]\n    return 0\n").status == PROVED
     assert check("def f(xs: list):\n    c = [x + 1 for x in xs]\n    return c[0]\n").status == REFUTED   # unguarded: may be empty
     assert check("def f(s: str):\n    parts = s.split()\n    if parts:\n        return parts[0]\n    return ''\n").status == PROVED
     assert check("def f(s: str):\n    parts = s.split()\n    return parts[0]\n").status == REFUTED   # ''.split() == []
-    # sorted / min / max with a key= lambda: the key is applied to a freely-chosen element so its per-element traps
-    # surface. sorted is total (no empty trap) so a trap-free key proves; a key that divides by the element refutes
-    # (sorted([0], key=lambda x: 10 // x) raises). min / max additionally raise ValueError on an empty iterable, so an
-    # unguarded max(xs, key=...) refutes on that; a non-empty guard or default= removes it. A bare builtin key (len /
-    # abs), whose safety depends on the element's runtime type, is declined -- UNKNOWN, never a guess.
+    # functools.reduce(f, list[, init]): a total step proves, a trapping step (a // b) refutes, no-init empty refutes
+    # (TypeError); a concrete-tuple iterable declines.
+    assert check("import functools\ndef f(xs: list):\n    return functools.reduce(lambda a, b: a + b, xs, 0)\n").status == PROVED
+    assert check("import functools\ndef f(xs: list):\n    return functools.reduce(lambda a, b: a // b, xs, 100)\n").status == REFUTED
+    assert check("import functools\ndef f(xs: list):\n    return functools.reduce(lambda a, b: a + b, xs)\n").status == REFUTED   # empty: TypeError
+    assert check("import functools\ndef f(xs: list):\n    if xs:\n        return functools.reduce(lambda a, b: a + b, xs)\n    return 0\n").status == PROVED
+    assert check("import functools\ndef f():\n    return functools.reduce(lambda a, b: a // b, (1, 2, 3))\n").status == UNKNOWN   # tuple declines
+    # a lazy iterator (zip / itertools.chain / reversed / ...) has no len() and is not subscriptable: len(it) and it[i]
+    # are TypeErrors; only list(it) / sorted(it) / a for-loop consume it.
+    assert check("import itertools\ndef f(a: list, b: list):\n    return len(itertools.chain(a, b))\n").status == REFUTED
+    assert check("def f(a: list, b: list):\n    return len(zip(a, b))\n").status == REFUTED
+    assert check("def f(xs: list):\n    return len(reversed(xs))\n").status == REFUTED
+    assert check("import itertools\ndef f(a: list, b: list):\n    return 10 // (len(itertools.chain(a, b)) + 1)\n").status == REFUTED
+    assert check("import itertools\ndef f(a: list, b: list):\n    return itertools.chain(a, b)[0]\n").status == REFUTED   # not subscriptable
+    assert check("import itertools\ndef f(a: list, b: list):\n    return 10 // (len(list(itertools.chain(a, b))) + 1)\n").status == PROVED   # list(it) is sized
+    assert check("import itertools\ndef f(a: list, b: list):\n    t = 0\n    for x in itertools.chain(a, b):\n        t = 1\n    return t\n").status == PROVED   # iterating is fine
+    assert check("def f(xs: list):\n    return list(reversed(xs))\n").status == PROVED
+    # sorted/min/max key= lambda applied to a freely-chosen element: a trap-free key proves, a dividing key refutes.
+    # min/max also refute on an empty iterable (no guard / default=). A bare builtin key (len/abs) is declined.
     assert check("def f(xs: list):\n    return sorted(xs, key=lambda x: x + 1)\n").status == PROVED
     assert check("def f(xs: list):\n    return sorted(xs, key=lambda x: -x)\n").status == PROVED
     assert check("def f(xs: list):\n    return sorted(xs, key=lambda x: 10 // x)\n").status == REFUTED   # zero element
@@ -2535,9 +2544,8 @@ def run_self_tests(fast=False):
     assert check("def f(d: dict, k):\n    v = d.get(k)\n    if v is None:\n        return 0\n    return v + 1\n").status == PROVED
     assert check("def f(d: dict, k):\n    x = d.get(k)\n    if x:\n        return x + 1\n    return 0\n").status == PROVED   # truthiness guard
     assert check("def f(d: dict, k):\n    return d.get(k)\n").status == PROVED                # returning None is fine
-    # len() of a dict, a dict view, or any opaque container is nonnegative (a negative __len__ raises ValueError in
-    # CPython), so len(d) + 1 can never reach 0: 10 // (len(d) + 1) is trap free, not a spurious ZeroDivisionError.
-    # An empty dict still makes the unguarded 10 // len(d) refutable (len may be 0).
+    # len() of a dict / view / opaque container is nonnegative, so len(d) + 1 >= 1 and 10 // (len(d) + 1) is trap free;
+    # the unguarded 10 // len(d) still refutes (empty dict).
     assert check("def f(d: dict):\n    return 10 // (len(d) + 1)\n").status == PROVED
     assert check("def f(d: dict):\n    return 10 // (len(d.keys()) + 1)\n").status == PROVED
     assert check("def f(d: dict):\n    return 10 // (len(d.values()) + 1)\n").status == PROVED
@@ -7694,11 +7702,8 @@ def run_self_tests(fast=False):
     assert check(_to + "def f():\n    return torch.where(torch.zeros(2, 3) > 0, torch.zeros(2, 3), torch.ones(2, 3))[0, 0]\n", target="f").status == PROVED
     assert check(_to + "def f():\n    return torch.zeros(2, 3).softmax(1).cumsum(0).sum()\n", target="f").status == PROVED
     assert check(_to + "def f():\n    a = torch.zeros(5)\n    return a.nonzero()\n", target="f").status == PROVED   # data-dependent shape: opaque, trap free
-    # an elementwise activation / unary-math FUNCTION (torch.relu(x), F.gelu(x)) on a bare, un-annotated tensor
-    # parameter is trap free even without a tracked shape -- it matches the x.relu() method form, and takes no axis
-    # or shape argument that could be out of range. A dim-taking op (softmax(dim=...)), a shape-changing layer
-    # (reshape / linear / layer_norm), or a reduction stays UNKNOWN on an opaque arg (its dim / shape may not be
-    # valid); a trap inside an argument expression is still caught.
+    # an elementwise activation (torch.relu(x), F.gelu(x)) on a bare tensor param is trap free (no axis/shape arg). A
+    # dim-taking op (softmax), a shape-changing layer (reshape/linear/layer_norm), or a reduction stays UNKNOWN.
     _tf = "import torch\nimport torch.nn.functional as F\n"
     assert check(_tf + "def f(x):\n    return torch.relu(x)\n", target="f").status == PROVED
     assert check(_tf + "def f(x):\n    return torch.sigmoid(x)\n", target="f").status == PROVED

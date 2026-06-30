@@ -877,14 +877,16 @@ class _SafeContainer(_Opaque):
     (IndexError when out of [-len, len)); the oracle samples an indexed parameter as a real list so that
     out-of-range trap is witnessable, and an iteration- or method-only one as a benign stand-in. `immutable`
     marks a tuple, whose item assignment c[i] = v always raises (TypeError)."""
-    __slots__ = ("immutable", "length", "unindexable", "byteslike", "elem")
-    def __init__(self, name, immutable=False, length=None, unindexable=False, byteslike=False, elem=None):
+    __slots__ = ("immutable", "length", "unindexable", "byteslike", "elem", "unsized")
+    def __init__(self, name, immutable=False, length=None, unindexable=False, byteslike=False, elem=None, unsized=False):
         super().__init__(name)
         self.immutable = immutable
         self.length = length        # an explicit, provably-nonnegative length term (a range); else a fresh
         #                             symbolic length keyed by name (an opaque list/tuple parameter)
         self.unindexable = unindexable   # a set / frozenset: sized and iterable, but s[i] raises TypeError
         self.byteslike = byteslike       # a bytes / bytearray: an element is an int in [0, 255]
+        self.unsized = unsized      # a lazy iterator (zip / itertools.chain / ...): `length` is the count it yields
+        #                             (list(it) / sorted(it) / a for-loop size correctly), but len(it) / it[i] TypeError
         self.elem = elem            # a _SafeContainer prototype when elements are themselves sequences (a
         #                             list[list[...]] / list[tuple[...]] parameter); an element c[i] is then a
         #                             bounds-checked inner sequence with a per-index symbolic length. None = scalar.
@@ -964,12 +966,10 @@ class _MapVal(_Opaque):
 
 
 class _StrSeq(_Opaque):
-    """A sequence of strings: the result of str.split / rsplit / splitlines, or a map(str, ...) / map(repr, ...) over
-    an iterable. `length` is its (nonnegative) symbolic length -- >= 1 for split / rsplit with a non-empty separator
-    (which always yields at least the whole string), unconstrained for split() on whitespace or splitlines (which can
-    be empty). len() reads it; an index returns a fresh string, bounds-checked against it, so s.split(sep)[0] /
-    s.rsplit(sep)[-1] decide. `unsized` marks a lazy map iterator: sep.join(it) is a trap-free string (every part is
-    a string), but len(it) is the TypeError CPython raises and it is not subscriptable, so both are withheld."""
+    """A sequence of strings (str.split / rsplit / splitlines, or map(str/repr, ...)). `length` is its nonnegative
+    length: >= 1 for split/rsplit with a separator, unconstrained for split()/splitlines. An index returns a fresh
+    string bounds-checked against `length`. `unsized` marks a lazy iterator: join(it) is a string, but len(it) and
+    it[i] are TypeErrors."""
     __slots__ = ("length", "unsized")
     def __init__(self, name, length=None, unsized=False):
         super().__init__(name)
@@ -1692,15 +1692,12 @@ def _as_bool(x, ctx=None):
         return z3.BoolVal(False)                             # guard a possibly-None value (the value engine's own None,
         #                                                       beyond the literal-None cases the None engine catches)
     if isinstance(x, _StrSeq) and not x.unsized and x.length is not None:
-        return x.length != 0                                 # a sized string sequence (a split result) is truthy iff
-        #                  non-empty, tied to the same length its [i] bounds check uses -- so `if parts: parts[0]`
-        #                  proves (an unsized map / generator iterator is always truthy, so it falls through below)
-    if isinstance(x, _SafeContainer):                        # a sequence is truthy iff non-empty: tie `if c:` /
+        return x.length != 0                                 # a sized split result is truthy iff non-empty, tied to
+        #                  its [i] bounds-check length (an unsized iterator falls through -- always truthy)
+    if isinstance(x, _SafeContainer) and not x.unsized:      # truthy iff non-empty, using the SAME length its c[i]
         n = x.length if getattr(x, "length", None) is not None else z3.Int("len_" + x.name)
-        return n != 0                                        # `if not c:` to the SAME length the c[i] / min(c) bounds
-        #                  check uses -- the explicit length of a comprehension / split result, else the by-name
-        #                  length of a parameter -- so an emptiness guard written as truthiness (not only len(c) > 0)
-        #                  proves the guarded access safe (a list-comprehension's len term is explicit, not len_<name>)
+        return n != 0                                        # bounds check uses (explicit for a comprehension / split
+        #                  result, else by name), so `if c: c[0]` proves
     if isinstance(x, _NdArray):                              # bool(ndarray / Series) is a ValueError for more than one
         raise Unsupported("truth value of an array is ambiguous "   # element (numpy/pandas), so its truthiness is not
                           "(use .any() / .all() or a size check)")  # a benign bool -- abstain rather than over-approximate
@@ -2745,9 +2742,9 @@ def _torch_func(name, node, env, ctx):
         return _Opaque(name)                                 # data-dependent shape: trap-free, opaque
     if args and isinstance(args[0], _NdArray):               # a tensor-first function reuses the method model
         return _nd_method(args[0], name, args[1:], node, env, ctx)
-    if name in _NN_ACTIVATION_TRAPFREE:                       # an activation on a tensor whose shape is not tracked:
-        return _Opaque(name)                                 # shape-opaque but always trap free (a unary-math name
-    return None                                              # is excluded so it reaches its scalar model instead)
+    if name in _NN_ACTIVATION_TRAPFREE:                       # an activation on a shape-untracked tensor: trap free
+        return _Opaque(name)
+    return None
 
 
 # torch.nn.functional layers that preserve the input shape (elementwise activations and normalization). The
@@ -2760,12 +2757,9 @@ _F_SHAPE_PRESERVING = frozenset({
     "batch_norm", "group_norm", "instance_norm", "local_response_norm", "normalize", "rms_norm",
 })
 
-# torch.nn activations that take no axis / shape argument and never raise on a tensor (unlike softmax / cumsum, whose
-# dim can be out of range, or layer_norm / a reduction, whose shape can mismatch or be empty). A call to one of these
-# is trap free regardless of whether the input's shape is tracked, so torch.relu(x) / F.gelu(x) decide on a bare
-# (un-annotated) tensor parameter exactly as the x.relu() method form already does. A unary-math name (abs / sqrt /
-# exp / sin / ...) is deliberately EXCLUDED: it resolves through the more precise scalar np.abs / np.sqrt / math.*
-# model on a non-tensor argument (which a trap-free opaque would shadow, losing e.g. np.abs(x) >= 0).
+# torch.nn activations taking no axis/shape argument: never raise on a tensor, so torch.relu(x) / F.gelu(x) on a
+# bare (shape-untracked) tensor param is trap free. Unary-math names (abs/sqrt/exp/sin) are excluded -- they resolve
+# through the scalar np.abs / math.* model, which a trap-free opaque would shadow (losing np.abs(x) >= 0).
 _NN_ACTIVATION_TRAPFREE = frozenset({
     "relu", "relu6", "gelu", "silu", "elu", "selu", "celu", "leaky_relu", "rrelu", "hardtanh", "hardswish",
     "hardsigmoid", "hardshrink", "softshrink", "tanhshrink", "mish", "logsigmoid", "softplus", "softsign",
@@ -2781,8 +2775,8 @@ def _functional_call(name, node, env, ctx):
     for kw in node.keywords:
         ev(kw.value, env, ctx)
     if not (args and isinstance(args[0], _NdArray)):
-        if name in _NN_ACTIVATION_TRAPFREE:                  # an activation on a bare tensor parameter: trap free
-            return _Opaque(name)                             # even without a tracked shape (F.relu(x) / F.gelu(x))
+        if name in _NN_ACTIVATION_TRAPFREE:                  # F.relu(x) / F.gelu(x) on a bare tensor param: trap free
+            return _Opaque(name)
         return None
     if name in _F_SHAPE_PRESERVING:
         return _NdArray(args[0].shape)
@@ -3657,11 +3651,11 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     ctx.traps.append(ctx.pc)                      # set / frozenset: reversed() raises TypeError
                 return _Opaque("reversed")                        # poison: never trusted once the trap fires
             if isinstance(x, _SafeContainer):                     # list / bytes / range: a reversed sized sequence
-                return _SafeContainer("reversed", byteslike=x.byteslike, length=_container_len(x, ctx))
+                return _SafeContainer("reversed", byteslike=x.byteslike, length=_container_len(x, ctx), unsized=True)
             if _is_str(x):
-                return _SafeContainer("reversed", length=z3.Length(x))
+                return _SafeContainer("reversed", length=z3.Length(x), unsized=True)
             if isinstance(x, tuple):                              # a list / tuple literal of known length
-                return _SafeContainer("reversed", length=z3.IntVal(len(x)))
+                return _SafeContainer("reversed", length=z3.IntVal(len(x)), unsized=True)
             if isinstance(x, (_DictParam, _DictLit, _MapVal, _DefaultDict, _Opaque)):
                 return _Opaque("reversed")                        # dict (3.8+) / opaque iterable: lazy, trap free
             if BEST_EFFORT:
@@ -3689,11 +3683,9 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             return _Opaque("next")
         if name in ("sorted", "list") and name not in ctx.repo and len(node.args) == 1 and (
                 not node.keywords or (name == "sorted" and all(kw.arg in ("reverse", "key") for kw in node.keywords))):
-            # sorted(it[, reverse=bool][, key=f]) and list(it) build a NEW list of the same length as the iterable,
-            # indexable -- model it as a sized container so sorted(nums)[0] / list(xs)[i] bounds-check against that
-            # length. reverse= changes order only (no trap, no length change): it is trap-checked then ignored. A key=
-            # callable is applied to a freely-chosen element so its per-element traps surface (a lambda or repo function;
-            # a bare builtin key declines to UNKNOWN). An opaque / non-iterable argument is declined.
+            # sorted(it[, reverse][, key=f]) / list(it): a sized container of the iterable's length. reverse= is
+            # trap-checked then ignored; a key= lambda is applied to a freely-chosen element (per-element traps
+            # surface; a bare builtin key declines). A non-iterable argument is declined.
             x = ev(node.args[0], env, ctx)                    # the iterable is trap-checked as it is evaluated
             for kw in node.keywords:
                 if kw.arg == "key":
@@ -3817,13 +3809,13 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 return z3.IntVal(len(a))
             if _is_str(a):
                 return z3.Length(a)
-            if isinstance(a, _StrSeq):                       # the length of a split result: its stable symbolic
-                if a.unsized:                                # a lazy map(str, ...) iterator is not sized: len() is the
-                    if ctx.traps is not None:                # TypeError CPython raises ("object of type 'map' has no
-                        ctx.traps.append(ctx.pc)             # len()"), so every input reaching it traps
+            if isinstance(a, _StrSeq):
+                if a.unsized:                                # a lazy map(str, ...) iterator has no len(): TypeError
+                    if ctx.traps is not None:
+                        ctx.traps.append(ctx.pc)
                     return z3.FreshInt("maplen")
-                if a.length is not None:                     # length (>= 1 for split with a separator, else >= 0), so
-                    return a.length                          # split(sep)[0] / [-1] are in bounds and len() is exact
+                if a.length is not None:                     # split(sep) is >= 1 part, so split(sep)[0] / [-1] decide
+                    return a.length
                 if ctx.facts is not None:
                     _note_overapprox(ctx, "len of a split result")
                     r = z3.FreshInt("splitlen")
@@ -3843,12 +3835,16 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     return z3.FreshInt("ndlen")
                 return a.shape[0]
             if _TRAPFREE and isinstance(a, _SafeContainer):  # a container parameter: a stable nonneg length,
+                if a.unsized:                                # a lazy iterator (zip / chain / ...) has no len(): the
+                    if ctx.traps is not None:                # an iterator has no len(): TypeError
+                        ctx.traps.append(ctx.pc)
+                    return z3.FreshInt("iterlen")
                 return _container_len(a, ctx)                # shared with the bounds check on a[i]
             if _TRAPFREE and isinstance(a, _Opaque):         # other opaque container (dict / view / attribute / call
-                r = z3.FreshInt("hlen")                      # result): len() is nonnegative for every Python object
-                if ctx.facts is not None:                    # (a negative __len__ raises ValueError), so constrain it
-                    ctx.facts.append(r >= 0)                 # -- else len(d) + 1 spuriously reaches 0 and 10 // it
-                return r                                      # fabricates a ZeroDivisionError that cannot occur
+                r = z3.FreshInt("hlen")                      # result): len() is nonnegative, so 10 // (len(d) + 1)
+                if ctx.facts is not None:                    # is trap free, not a spurious ZeroDivisionError
+                    ctx.facts.append(r >= 0)
+                return r
             if BEST_EFFORT:                                  # len of an unmodeled value: a nonneg int (lower trust)
                 _best_effort_assume()
                 return z3.FreshInt("be_len")
@@ -3930,7 +3926,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 m = lens[0]
                 for ln in lens[1:]:
                     m = z3.If(ln < m, ln, m)
-                return _SafeContainer("zip", length=m)
+                return _SafeContainer("zip", length=m, unsized=True)
             return _Opaque("zip")                            # an iterable of tuples; a for-loop over it havocs the targets
         if name == "Fraction" and 1 <= len(node.args) <= 2:  # exact rational over Z3 Real
             num = _to_real(ev(node.args[0], env, ctx))
@@ -4066,7 +4062,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     for p in parts:
                         total = total + (_container_len(p, ctx) if isinstance(p, _SafeContainer)
                                          else z3.Length(p) if _is_str(p) else z3.IntVal(len(p)))
-                    return _SafeContainer("chain", length=total)
+                    return _SafeContainer("chain", length=total, unsized=True)
                 return _Opaque("chain")                        # lazy construction raises nothing; consuming an opaque
                 #                                                argument (list(chain(...))) then abstains, as before
             if (node.func.value.id == "itertools" and node.func.attr == "repeat"
@@ -4078,7 +4074,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 cnt = ev(node.args[1], env, ctx)
                 if z3.is_expr(cnt) and (z3.is_int(cnt) or z3.is_bool(cnt)):
                     k = _as_int(cnt)
-                    return _SafeContainer("repeat", length=z3.If(k >= 0, k, z3.IntVal(0)))
+                    return _SafeContainer("repeat", length=z3.If(k >= 0, k, z3.IntVal(0)), unsized=True)
                 raise Unsupported("itertools.repeat with a non-integer count")
             if (node.func.value.id == "itertools" and node.func.attr == "islice"
                     and "itertools" not in env and len(node.args) == 2 and not node.keywords):
@@ -4092,12 +4088,12 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 n = (_container_len(it, ctx) if isinstance(it, _SafeContainer)
                      else z3.Length(it) if _is_str(it) else z3.IntVal(len(it)))
                 if isinstance(node.args[1], ast.Constant) and node.args[1].value is None:
-                    return _SafeContainer("islice", length=n)   # islice(it, None) -> all of it
+                    return _SafeContainer("islice", length=n, unsized=True)   # islice(it, None) -> all of it
                 if z3.is_expr(stop) and z3.is_int(stop):
                     if ctx.traps is not None:
                         ctx.traps.append(z3.And(ctx.pc, stop < 0))   # ValueError: a negative stop
                     return _SafeContainer("islice", length=z3.If(stop < 0, z3.IntVal(0),
-                                                                  z3.If(stop < n, stop, n)))   # min(stop, len(it))
+                                                                  z3.If(stop < n, stop, n)), unsized=True)   # min(stop, len)
                 raise Unsupported("itertools.islice with a non-integer stop")
             if (node.func.value.id == "itertools" and node.func.attr == "zip_longest"
                     and "itertools" not in env):
@@ -4113,7 +4109,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                         ln = (_container_len(p, ctx) if isinstance(p, _SafeContainer)
                               else z3.Length(p) if _is_str(p) else z3.IntVal(len(p)))
                         m = ln if m is None else z3.If(ln > m, ln, m)
-                    return _SafeContainer("zip_longest", length=m)
+                    return _SafeContainer("zip_longest", length=m, unsized=True)
                 return _Opaque("zip_longest")
             if (node.func.value.id == "itertools" and node.func.attr == "product"
                     and "itertools" not in env and not node.keywords):
@@ -4126,8 +4122,39 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     for p in parts:
                         total = total * (_container_len(p, ctx) if isinstance(p, _SafeContainer)
                                          else z3.Length(p) if _is_str(p) else z3.IntVal(len(p)))
-                    return _SafeContainer("product", length=total)
+                    return _SafeContainer("product", length=total, unsized=True)
                 return _Opaque("product")
+            if (node.func.value.id == "functools" and node.func.attr == "reduce"
+                    and "functools" not in env and 2 <= len(node.args) <= 3 and not node.keywords):
+                # functools.reduce(f, it[, init]): apply f to a freely-chosen (acc, element) pair so a trapping step
+                # (a // b) refutes and a total step proves; result opaque. No init + empty iterable is a TypeError.
+                # Modeled only for a symbolic container (a concrete tuple would need a precise fold); f a 2-arg lambda.
+                seq = ev(node.args[1], env, ctx)
+                init = ev(node.args[2], env, ctx) if len(node.args) == 3 else None
+                fn = node.args[0]
+                lam = ev(fn, env, ctx) if isinstance(fn, ast.Lambda) else \
+                    (env.get(fn.id) if isinstance(fn, ast.Name) else None)
+                if isinstance(seq, _SafeContainer):
+                    acc = init if init is not None else _container_element(seq, ctx)
+                    elem = _container_element(seq, ctx)
+                    saved = ctx.pc
+                    ctx.pc = z3.And(ctx.pc, _container_len(seq, ctx) >= 1)   # f runs only on a non-empty iterable
+                    try:
+                        if isinstance(lam, _Lambda) and len(lam.params) == 2:
+                            le = dict(lam.env)
+                            le[lam.params[0]] = acc
+                            le[lam.params[1]] = elem
+                            ev(lam.body, le, ctx)                # surface a per-step trap (a // b on a zero element)
+                        elif isinstance(fn, ast.Name) and fn.id in ctx.repo:
+                            ctx.inline(fn.id, [acc, elem])
+                        else:
+                            raise Unsupported("functools.reduce with a non-modeled function (a 2-arg lambda or repo fn)")
+                    finally:
+                        ctx.pc = saved
+                    if init is None and ctx.traps is not None:    # reduce of an empty iterable with no initial: TypeError
+                        ctx.traps.append(z3.And(ctx.pc, _container_len(seq, ctx) <= 0))
+                    return _Opaque("reduce")
+                raise Unsupported("functools.reduce over a non-container iterable")
             if (node.func.value.id == "struct" and node.func.attr == "calcsize"
                     and "struct" not in env and len(node.args) == 1 and not node.keywords):
                 # struct.calcsize(fmt): for a string LITERAL the size is exactly CPython's -- a valid format string
@@ -4509,9 +4536,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         if _is_str(base):
             return _str_subscript(base, node.slice, env, ctx)
         if _TRAPFREE and isinstance(base, _StrSeq) and base.length is not None:
-            # a split / rsplit / splitlines result: an integer index is IndexError-checked against its length (>= 1
-            # for split with a separator, so [0] / [-1] are safe), and an element is a fresh string (so [i].upper()
-            # works). A slice is another string list of arbitrary length.
+            # a split result: an index is IndexError-checked against its length, an element is a fresh string, a slice
+            # is another string list.
             if isinstance(node.slice, ast.Slice):
                 for b in (node.slice.lower, node.slice.upper, node.slice.step):
                     if b is not None:
@@ -4550,6 +4576,18 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     return ctx.dval_cache[ck]
                 return z3.FreshInt("dval")
             raise Unsupported("dict subscript with an unmodeled key type")
+        if _TRAPFREE and isinstance(base, _SafeContainer) and base.unsized:
+            # a lazy iterator (zip / itertools.chain / ...) is not subscriptable: it[i] / it[a:b] are TypeErrors.
+            # Trap-check the index / slice bounds, then refute.
+            if isinstance(node.slice, ast.Slice):
+                for b in (node.slice.lower, node.slice.upper, node.slice.step):
+                    if b is not None:
+                        ev(b, env, ctx)
+            else:
+                ev(node.slice, env, ctx)
+            if ctx.traps is not None:
+                ctx.traps.append(ctx.pc)
+            return _Opaque("itersub")
         if _TRAPFREE and isinstance(base, _Opaque) and not isinstance(base, _DictLit):
             if isinstance(node.slice, ast.Slice):            # a slice of an opaque value never traps (Python clamps),
                 if isinstance(base, _SafeContainer) and not base.unindexable:   # a list / tuple / bytes slice is a
@@ -4661,9 +4699,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         else:
             elt_val = ev(node.elt, env2, ctx)
         ctx.pc = old_pc
-        # a generator expression whose element is a string -- (str(x) for x in xs), (f"{x}" for ...), (p.name for ...)
-        # -- is a lazy iterator of strings, so sep.join(genexp) is a trap-free string (like map(str, xs)); it is not
-        # sized or subscriptable, so len() of it is a TypeError and an index abstains.
+        # a string-element generator (str(x) for x in xs) is an unsized iterator of strings: sep.join(it) proves.
         if isinstance(node, ast.GeneratorExp) and elt_val is not None and _is_str(elt_val):
             return _StrSeq("genstr", unsized=True)
         # a single-generator list comprehension [e for x in it] is a NEW sized list, so model it as a container
@@ -4711,9 +4747,8 @@ def _container_len(c, ctx):
 
 
 def _container_element(container, ctx):
-    """A fresh value standing for an arbitrary element of `container` -- the same kind container[i] yields: an inner
-    sequence for list[list[..]] / list[str], a byte in [0, 255] for bytes / bytearray, an int otherwise (the modeled
-    subset treats a plain list's elements as ints, as len(c)-guarded c[i] arithmetic already does)."""
+    """A fresh value for an arbitrary element of `container`, the same kind container[i] yields: an inner sequence for
+    list[list]/list[str], a byte in [0,255] for bytes/bytearray, else an int."""
     if isinstance(container, _SafeContainer):
         if isinstance(container.elem, _SafeContainer):
             pr = container.elem
@@ -4730,11 +4765,9 @@ def _container_element(container, ctx):
 
 
 def _apply_key_callable(keynode, container, env, ctx):
-    """Apply a sorted / min / max key= callable to a freely-chosen element of `container` so the callable's per-element
-    traps surface (key=lambda x: 10 // x refutes on a zero element; key=lambda x: x + 1 is trap free). The trap is
-    guarded by the container being non-empty -- an empty iterable never calls the key -- so it refutes exactly when
-    CPython would. A lambda or an in-repo function is applied; any other callable (a bare builtin like len / abs, whose
-    safety depends on the element's runtime type) is declined, leaving the verdict UNKNOWN."""
+    """Apply a sorted/min/max key= callable to a freely-chosen element so its per-element traps surface (key=lambda x:
+    10 // x refutes); guarded by the container being non-empty. A lambda or repo function is applied; a bare builtin
+    key (len/abs, element-type-dependent) is declined to UNKNOWN."""
     lam = ev(keynode, env, ctx) if isinstance(keynode, ast.Lambda) else \
         (env.get(keynode.id) if isinstance(keynode, ast.Name) else None)
     elem = _container_element(container, ctx)
