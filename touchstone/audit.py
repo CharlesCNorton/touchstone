@@ -2289,6 +2289,15 @@ def run_self_tests(fast=False):
     assert check("def f(s: str):\n    return s.encode()\n").status == PROVED
     assert check("def f(s: str):\n    return s.encode()[0]\n").status == REFUTED
     assert check("def f(s: str):\n    if len(s) >= 1:\n        return s.encode()[0]\n    return 0\n").status == PROVED
+    # an explicit utf-8 codec (the utf-8 family by name, case- and separator-insensitive) is also total; a lossy
+    # codec (ascii / latin-1) or a non-utf-8 / non-constant / keyword-hidden codec can raise UnicodeEncodeError,
+    # so it stays UNKNOWN -- in particular s.encode(encoding='ascii') must NOT be PROVED (it raises on non-ASCII).
+    assert check("def f(s: str):\n    return s.encode('utf-8')\n").status == PROVED
+    assert check("def f(s: str):\n    return s.encode('UTF_8')\n").status == PROVED
+    assert check("def f(s: str):\n    b = s.encode('utf-8')\n    return len(b) >= len(s)\n").status == PROVED
+    assert check("def f(s: str):\n    return s.encode('ascii')\n").status == UNKNOWN
+    assert check("def f(s: str):\n    return s.encode(encoding='ascii')\n").status == UNKNOWN   # lossy codec: not total
+    assert check("def f(s: str, enc: str):\n    return s.encode(enc)\n").status == UNKNOWN       # non-constant codec
     # str search with a position window: find/rfind with a start (and end) bound is a sound index in [-1, len(s))
     # (never raises), and index(sub, start) raises ValueError when the substring is absent from s[start:], so a parser
     # scanning with src.find(sep, pos, end) and a later end + 1 is decided rather than left dark.
@@ -2731,6 +2740,14 @@ def run_self_tests(fast=False):
     _v3 = check("def f(d, k):\n    return d[k]\n")
     assert _v3.status == REFUTED and "modeled as a list" in _v3.reason
     assert "modeled as a list" not in (check("def f(d: dict, k):\n    return d[k]\n").reason or "")
+    # dict | dict (PEP 584): a new dict, the key-set union, never raising, with size in [max(len a, len b), len a +
+    # len b]; membership is its own, so c = a | b then a guarded c[k] decides and an unguarded one refutes. The
+    # always-true size bounds prove; a sometimes-false claim (== len a + len b) stays UNKNOWN (the merge is abstract).
+    assert check("def f(a: dict, b: dict, k):\n    c = a | b\n    if k in c:\n        return c[k]\n    return 0\n").status == PROVED
+    assert check("def f(a: dict, b: dict, k):\n    c = a | b\n    return c[k]\n").status == REFUTED
+    assert prove("def f(a: dict, b: dict):\n    return a | b\n", "len(result) >= len(a)", target="f").status == PROVED
+    assert prove("def f(a: dict, b: dict):\n    return a | b\n", "len(result) <= len(a) + len(b)", target="f").status == PROVED
+    assert prove("def f(a: dict, b: dict):\n    return a | b\n", "len(result) == len(a) + len(b)", target="f").status == UNKNOWN
     # a dict parameter's value type is modeled (dict[K, V] / typing.Dict[K, V]): a read-only dict[str, list] read d[k]
     # is a stable list, so a len(d[k]) > 0 guard proves d[k][0], an unguarded d[k][0] refutes (it may be empty), and
     # d[k].append / len(d[k]) decide; dict[str, str] read d[k] is a string (d[k].upper()). A bare dict (no value type)

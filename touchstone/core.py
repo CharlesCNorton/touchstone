@@ -1658,12 +1658,17 @@ def _str_call(meth, s, a, ctx, kwnames=None):
         return _StrSeq("splitlines", length=k)
     if meth == "format" and z3.is_string_value(s):           # a literal format string: sound over-approximation
         return _str_format(s.as_string(), a, ctx, kwnames)   # (a non-literal receiver / format_map stays UNKNOWN)
-    if meth == "encode" and not a and z3.is_expr(s) and s.sort() == z3.StringSort() and ctx.facts is not None:
-        # s.encode(): the default utf-8 encodes every str without raising, producing bytes of length >= len(s)
-        # (each character is one to four bytes), so a later encode()[i] under a len(s) guard stays sound. A custom
-        # encoding argument can raise (UnicodeEncodeError), so the one-arg form is left UNKNOWN.
-        k = z3.FreshInt("enc"); ctx.facts.append(k >= 0)
-        return _SafeContainer("encoded", byteslike=True, length=z3.Length(s) + k)
+    if meth == "encode" and z3.is_expr(s) and s.sort() == z3.StringSort() and ctx.facts is not None and not kwnames:
+        # s.encode() / s.encode('utf-8'): the default utf-8 -- and the utf-8 family by name -- encodes every str
+        # without raising, producing bytes of length >= len(s) (each character is one to four bytes), so a later
+        # encode()[i] under a len(s) guard stays sound. A lossy codec (ascii / latin-1) can raise UnicodeEncodeError,
+        # and a keyword form (encoding= / errors=) hides the codec, so only a no-arg or explicit-utf-8 positional
+        # form is modeled; anything else is left UNKNOWN.
+        _u8 = not a or (len(a) == 1 and z3.is_string_value(a[0])
+                        and a[0].as_string().lower().replace("-", "").replace("_", "") in ("utf8", "u8"))
+        if _u8:
+            k = z3.FreshInt("enc"); ctx.facts.append(k >= 0)
+            return _SafeContainer("encoded", byteslike=True, length=z3.Length(s) + k)
     return None
 
 
@@ -3122,6 +3127,16 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             return _Opaque("noneop")
         if op in (ast.BitOr, ast.BitAnd, ast.Sub, ast.BitXor) and _is_set_like(l) and _is_set_like(r):
             return _set_binop({ast.BitOr: "|", ast.BitAnd: "&", ast.Sub: "-", ast.BitXor: "^"}[op], l, r, ctx)
+        if op is ast.BitOr and isinstance(l, (_DictParam, _DictLit, _MapVal)) \
+                and isinstance(r, (_DictParam, _DictLit, _MapVal)):
+            # dict | dict (PEP 584): a new dict whose keys are the union of the two, never raising. Its size is in
+            # [max(len a, len b), len a + len b]; membership is its own, so c = a | b then a guarded c[k] / len(c)
+            # decides while an unguarded c[k] still refutes (a regular dict's read may KeyError).
+            merged = _DictParam(z3.FreshInt("dmerge").decl().name())
+            if ctx.facts is not None:
+                la, lb, lm = _container_len(l, ctx), _container_len(r, ctx), _container_len(merged, ctx)
+                ctx.facts.append(z3.And(lm >= la, lm >= lb, lm <= la + lb))
+            return merged
         if isinstance(l, _NdArray) or isinstance(r, _NdArray):   # element-wise ndarray arithmetic (broadcasting)
             if op is ast.MatMult:                                # a @ b: matrix multiply, not element-wise
                 return _matmul(l, r, ctx)
