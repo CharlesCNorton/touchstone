@@ -299,7 +299,9 @@ class _Desugar(ast.NodeTransformer):
         """The constant rows a for-iterable yields, each row a list of element exprs (one for a
         plain element, several for enumerate/zip), or None if not a constant iterable."""
         if isinstance(it, (ast.Tuple, ast.List)):
-            return [[el] for el in it.elts]
+            if any(isinstance(el, ast.Starred) for el in it.elts):
+                return None                                  # a star-unpacked literal is not constant rows; the normal
+            return [[el] for el in it.elts]                  # for-loop path handles it as a sized container
         if isinstance(it, ast.Call) and isinstance(it.func, ast.Name):
             if it.func.id == "enumerate" and len(it.args) == 1:
                 inner = self._const_rows(it.args[0])
@@ -881,8 +883,9 @@ class _SafeContainer(_Opaque):
     (IndexError when out of [-len, len)); the oracle samples an indexed parameter as a real list so that
     out-of-range trap is witnessable, and an iteration- or method-only one as a benign stand-in. `immutable`
     marks a tuple, whose item assignment c[i] = v always raises (TypeError)."""
-    __slots__ = ("immutable", "length", "unindexable", "byteslike", "elem", "unsized")
-    def __init__(self, name, immutable=False, length=None, unindexable=False, byteslike=False, elem=None, unsized=False):
+    __slots__ = ("immutable", "length", "unindexable", "byteslike", "elem", "unsized", "tuple_arity")
+    def __init__(self, name, immutable=False, length=None, unindexable=False, byteslike=False, elem=None,
+                 unsized=False, tuple_arity=None):
         super().__init__(name)
         self.immutable = immutable
         self.length = length        # an explicit, provably-nonnegative length term (a range); else a fresh
@@ -894,6 +897,9 @@ class _SafeContainer(_Opaque):
         self.elem = elem            # a _SafeContainer prototype when elements are themselves sequences (a
         #                             list[list[...]] / list[tuple[...]] parameter); an element c[i] is then a
         #                             bounds-checked inner sequence with a per-index symbolic length. None = scalar.
+        self.tuple_arity = tuple_arity   # N when each element is a fixed N-tuple of scalars (zip / enumerate /
+        #                             dict.items): an element is a Python N-tuple, so c[i][0..N-1] decide, c[i] + 1
+        #                             is a TypeError (abstains, never a false PROVED), and a, b = c[i] unpacks.
 
 
 class _SetExpr(_SafeContainer):
@@ -3037,16 +3043,16 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     if _TRAPFREE:                            # the value engine: the term's sort is the value's real type,
                         if not (scalar and _const_format_spec_safe(part.format_spec, v)):   # so a type-compatible spec is safe
                             raise Unsupported("f-string format spec")
-                        return _Opaque("fstr")               # (the whole f-string is then an opaque string)
+                        return z3.FreshConst(_SS, "fstr")    # the whole f-string is a string (opaque value, str type)
                     # the CHC / equivalence engines model every parameter as Int, so only a type-independent
                     # alignment / width spec (safe for any scalar) is sound here; a typed spec abstains.
                     if not (scalar and _alignment_only_spec(part.format_spec) is not None):
                         raise Unsupported("f-string format spec")
                     _note_overapprox(ctx, "an f-string format spec")
                     return z3.FreshConst(_SS, "fstr")
-                if part.conversion in (114, 97) or not _is_str(v):   # !r / !a, or str() of a non-string: opaque string
-                    if _TRAPFREE:
-                        return _Opaque("fstr")
+                if part.conversion in (114, 97) or not _is_str(v):   # !r / !a, or str() of a non-string: a string of
+                    if _TRAPFREE:                                     # unknown content, but definitely str-typed
+                        return z3.FreshConst(_SS, "fstr")
                     raise Unsupported("f-string interpolation of a non-string value")
                 out = z3.Concat(out, v)                      # a plain str field (or !s on a str): the string itself
             else:
@@ -3065,11 +3071,15 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         if node.id in _MATH_CONSTS:                           # `from math import pi` / e / tau / inf / nan
             return _MATH_CONSTS[node.id]
         return _Opaque(node.id)                               # a free/imported name: opaque, reading it traps at most NameError
-    if isinstance(node, ast.Tuple):                          # tuple packing -> a Python tuple of terms
-        return tuple(ev(e, env, ctx) for e in node.elts)
+    if isinstance(node, ast.Tuple) and not any(isinstance(e, ast.Starred) for e in node.elts):
+        return tuple(ev(e, env, ctx) for e in node.elts)     # tuple packing -> a Python tuple of terms
+    if _TRAPFREE and isinstance(node, ast.Tuple):            # (*a, *b, x): a NEW immutable tuple of length
+        return _SafeContainer("tupleunpack", immutable=True, length=_star_seq_len(node.elts, env, ctx))
     if isinstance(node, ast.List) and not any(isinstance(e, ast.Starred) for e in node.elts):
         return _ListLit(ev(e, env, ctx) for e in node.elts)  # list literal -> a tuple of element terms (tagged mutable
         #                                                      for a[i] = v); each element is evaluated, trap-checked
+    if _TRAPFREE and isinstance(node, ast.List):             # [*a, *b, x]: a NEW list of length sum(len(*list)) + the
+        return _SafeContainer("listunpack", length=_star_seq_len(node.elts, env, ctx))   # plain-element count
     if isinstance(node, ast.Set):                            # set literal: evaluate the elements for their
         for e in node.elts:                                  # traps, then an opaque value
             ev(e.value if isinstance(e, ast.Starred) else e, env, ctx)
@@ -3158,6 +3168,16 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             # the result is bounds-checked against len(l) + len(r); byteslike is preserved (elements stay in [0, 255]).
             return _SafeContainer("concat", byteslike=l.byteslike,
                                   length=_container_len(l, ctx) + _container_len(r, ctx))
+        if (isinstance(l, _SafeContainer) or isinstance(r, _SafeContainer)) and op is ast.Mult:
+            sc, k = (l, r) if isinstance(l, _SafeContainer) else (r, l)
+            if (not sc.unindexable and sc.tuple_arity is None and sc.elem is None
+                    and z3.is_expr(k) and (z3.is_int(k) or z3.is_bool(k))):
+                # list / bytes * int repeats it: a NEW sequence of length max(count, 0) * len(seq), trap free; the
+                # element kind (byteslike) is preserved. A nested / tuple-element source falls through (aliasing).
+                kk = z3.If(k, z3.IntVal(1), z3.IntVal(0)) if z3.is_bool(k) else k
+                n = _container_len(sc, ctx)
+                return _SafeContainer("seqrep", byteslike=sc.byteslike,
+                                      length=z3.If(kk >= 0, n * kk, z3.IntVal(0)))
         if isinstance(l, _Complex) or isinstance(r, _Complex):
             return _cx_binop(op, l, r)
         if (_is_real(l) or _is_real(r)) and not (_is_fp(l) or _is_fp(r)):   # exact rational (Fraction) arithmetic;
@@ -3673,11 +3693,14 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 return _Opaque("reversed")
             raise Unsupported("reversed() of a possibly non-iterable value")
         if name in ("iter", "enumerate") and name not in ctx.repo and 1 <= len(node.args) <= 2 and not node.keywords:
-            # iter / enumerate over an iterable: an opaque iterator, trap free to build (a for-loop over it
-            # havocs its targets). A non-iterable scalar abstains.
+            # iter / enumerate over an iterable: a for-loop over it havocs its targets. enumerate(seq) over a sized
+            # container is a lazy iterator of (index, element) 2-tuples of the container's length, so list(enumerate(
+            # seq)) sizes and an element unpacks; iter and other iterables stay opaque.
             x = ev(node.args[0], env, ctx)
             for a in node.args[1:]:
                 ev(a, env, ctx)
+            if name == "enumerate" and isinstance(x, _SafeContainer) and not x.unindexable and not x.unsized:
+                return _SafeContainer("enumerate", length=_container_len(x, ctx), unsized=True, tuple_arity=2)
             if (isinstance(x, (_SafeContainer, tuple, _DictParam, _DictLit, _MapVal, _DefaultDict, _Opaque))
                     or _is_str(x)):
                 return _Opaque(name)
@@ -3719,7 +3742,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     ctx.facts.append(n >= 0)
             else:
                 raise Unsupported(f"{name}() of a possibly non-iterable value")
-            return _SafeContainer(name, length=n)
+            ta = x.tuple_arity if isinstance(x, _SafeContainer) else None   # list(zip / enumerate / items) keeps the
+            return _SafeContainer(name, length=n, tuple_arity=ta)            # fixed-arity tuple element
         if name == "print" and "print" not in ctx.repo:
             # print(...) writes str() of each argument and returns None, raising no modeled trap (the same
             # assume-str-safe over-approximation an f-string interpolation already makes). Each argument and
@@ -3850,9 +3874,11 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                         ctx.traps.append(ctx.pc)
                     return z3.FreshInt("iterlen")
                 return _container_len(a, ctx)                # shared with the bounds check on a[i]
-            if _TRAPFREE and isinstance(a, _Opaque):         # other opaque container (dict / view / attribute / call
-                r = z3.FreshInt("hlen")                      # result): len() is nonnegative, so 10 // (len(d) + 1)
-                if ctx.facts is not None:                    # is trap free, not a spurious ZeroDivisionError
+            if _TRAPFREE and isinstance(a, _DictParam):       # len(d) for a dict parameter: a stable by-name nonneg
+                return _container_len(a, ctx)                 # length, shared with its d.keys() / d.values() view
+            if _TRAPFREE and isinstance(a, _Opaque):         # other opaque container (view / attribute / call result):
+                r = z3.FreshInt("hlen")                      # len() is nonnegative, so 10 // (len(d) + 1) is trap free,
+                if ctx.facts is not None:                    # not a spurious ZeroDivisionError
                     ctx.facts.append(r >= 0)
                 return r
             if BEST_EFFORT:                                  # len of an unmodeled value: a nonneg int (lower trust)
@@ -3936,7 +3962,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 m = lens[0]
                 for ln in lens[1:]:
                     m = z3.If(ln < m, ln, m)
-                return _SafeContainer("zip", length=m, unsized=True)
+                return _SafeContainer("zip", length=m, unsized=True, tuple_arity=len(parts))   # elements are k-tuples
             return _Opaque("zip")                            # an iterable of tuples; a for-loop over it havocs the targets
         if name == "Fraction" and 1 <= len(node.args) <= 2:  # exact rational over Z3 Real
             num = _to_real(ev(node.args[0], env, ctx))
@@ -3999,6 +4025,16 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             return _Opaque("besteffort")
         raise Unsupported(f"unmodeled call {name}(...) at line {getattr(node, 'lineno', '?')}")
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        if (isinstance(node.func.value, ast.Attribute) and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "itertools" and node.func.value.attr == "chain"
+                and node.func.attr == "from_iterable" and "itertools" not in env and len(node.args) == 1):
+            # itertools.chain.from_iterable(xss): a lazy iterator over the concatenated inner iterables. Its length is
+            # the unknown sum of inner lengths (a fresh nonnegative int); the result is an unsized iterator.
+            ev(node.args[0], env, ctx)                       # trap-check the outer iterable
+            n = z3.FreshInt("chainfi")
+            if ctx.facts is not None:
+                ctx.facts.append(n >= 0)
+            return _SafeContainer("chainfi", length=n, unsized=True)
         if (isinstance(node.func.value, ast.Attribute) and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id == "os" and node.func.value.attr == "path" and "os" not in env):
             # os.path string functions never raise on str input. split / splitext / splitdrive return a 2-tuple of
@@ -4151,6 +4187,19 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                                          else z3.Length(p) if _is_str(p) else z3.IntVal(len(p)))
                     return _SafeContainer("product", length=total, unsized=True)
                 return _Opaque("product")
+            if (node.func.value.id == "itertools" and node.func.attr == "pairwise"
+                    and "itertools" not in env and len(node.args) == 1 and not node.keywords):
+                # itertools.pairwise(it): consecutive overlapping 2-tuples, so its length is max(len(it) - 1, 0); a
+                # lazy iterator of 2-tuples.
+                it = ev(node.args[0], env, ctx)
+                if isinstance(it, _SafeContainer) and not it.unindexable:
+                    n = _container_len(it, ctx)
+                elif _is_str(it):
+                    n = z3.Length(it)
+                else:
+                    raise Unsupported("itertools.pairwise of a non-sized iterable")
+                return _SafeContainer("pairwise", length=z3.If(n - 1 >= 0, n - 1, z3.IntVal(0)),
+                                      unsized=True, tuple_arity=2)
             if (node.func.value.id == "itertools" and node.func.attr == "accumulate"
                     and "itertools" not in env and 1 <= len(node.args) <= 2 and not node.keywords):
                 # itertools.accumulate(it[, func]) yields len(it) running accumulations (a lazy iterator). The default
@@ -4160,22 +4209,12 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 if isinstance(it, _SafeContainer):
                     if len(node.args) == 2:
                         fn = node.args[1]
-                        lam = ev(fn, env, ctx) if isinstance(fn, ast.Lambda) else \
-                            (env.get(fn.id) if isinstance(fn, ast.Name) else None)
                         acc = _container_element(it, ctx)
                         elem = _container_element(it, ctx)
                         saved = ctx.pc
                         ctx.pc = z3.And(ctx.pc, _container_len(it, ctx) >= 2)   # func runs only on >= 2 elements
                         try:
-                            if isinstance(lam, _Lambda) and len(lam.params) == 2:
-                                le = dict(lam.env)
-                                le[lam.params[0]] = acc
-                                le[lam.params[1]] = elem
-                                ev(lam.body, le, ctx)
-                            elif isinstance(fn, ast.Name) and fn.id in ctx.repo:
-                                ctx.inline(fn.id, [acc, elem])
-                            else:
-                                raise Unsupported("itertools.accumulate with a non-modeled func")
+                            _apply_fold_fn(fn, acc, elem, env, ctx)
                         finally:
                             ctx.pc = saved
                     return _SafeContainer("accumulate", length=_container_len(it, ctx), unsized=True)
@@ -4188,23 +4227,13 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 seq = ev(node.args[1], env, ctx)
                 init = ev(node.args[2], env, ctx) if len(node.args) == 3 else None
                 fn = node.args[0]
-                lam = ev(fn, env, ctx) if isinstance(fn, ast.Lambda) else \
-                    (env.get(fn.id) if isinstance(fn, ast.Name) else None)
                 if isinstance(seq, _SafeContainer):
                     acc = init if init is not None else _container_element(seq, ctx)
                     elem = _container_element(seq, ctx)
                     saved = ctx.pc
                     ctx.pc = z3.And(ctx.pc, _container_len(seq, ctx) >= 1)   # f runs only on a non-empty iterable
                     try:
-                        if isinstance(lam, _Lambda) and len(lam.params) == 2:
-                            le = dict(lam.env)
-                            le[lam.params[0]] = acc
-                            le[lam.params[1]] = elem
-                            ev(lam.body, le, ctx)                # surface a per-step trap (a // b on a zero element)
-                        elif isinstance(fn, ast.Name) and fn.id in ctx.repo:
-                            ctx.inline(fn.id, [acc, elem])
-                        else:
-                            raise Unsupported("functools.reduce with a non-modeled function (a 2-arg lambda or repo fn)")
+                        _apply_fold_fn(fn, acc, elem, env, ctx)   # surface a per-step trap (a // b on a zero element)
                     finally:
                         ctx.pc = saved
                     if init is None and ctx.traps is not None:    # reduce of an empty iterable with no initial: TypeError
@@ -4495,6 +4524,12 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 return z3.FreshInt("getdef")                  # d.get(k, default): the value or the default, never None
             if len(a) == 1:
                 return _NoneVal()                             # d.get(k): None when k is absent
+        if meth in ("keys", "values", "items") and isinstance(recv, _DictParam) and not a:
+            # a dict view (d.keys() / d.values() / d.items()) is sized and iterable but NOT subscriptable (like a set):
+            # its length is len(d), so list(view) / sorted(view) / sum(view) decide and max(view) is the empty-dict
+            # ValueError; a len(d) guard proves a guarded max. view[i] is a TypeError. items() yields (k, v) 2-tuples.
+            return _SafeContainer(meth, unindexable=True, length=_container_len(recv, ctx),
+                                  tuple_arity=2 if meth == "items" else None)
         # a.union(b) / a.intersection(b) / a.difference(b) / a.symmetric_difference(b) between two set-like
         # containers is the matching set operation, modeled with the operand-defined content (like | & - ^).
         if (meth in ("union", "intersection", "difference", "symmetric_difference")
@@ -4738,6 +4773,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     and z3.is_expr(idx) and idx.sort() == z3.IntSort():
                 n = _container_len(base, ctx)                # bounds VC: IndexError when the index leaves [-len, len)
                 ctx.traps.append(z3.And(ctx.pc, z3.Or(idx < -n, idx >= n)))
+                if base.tuple_arity is not None:             # zip / enumerate / items element: a fixed N-tuple
+                    return tuple(z3.FreshInt("telem") for _ in range(base.tuple_arity))
                 if isinstance(base.elem, _SafeContainer):    # list[list[..]] etc.: the element is an inner sequence
                     pr = base.elem                           # whose length is a per-index uninterpreted function, so a
                     ilen = z3.Function("ilen_" + base.name, z3.IntSort(), z3.IntSort())(idx)   # len(c[i]) guard
@@ -4853,6 +4890,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     ctx.facts.append(length >= 0)
                     if base_len is not None:
                         ctx.facts.append(length <= base_len)
+            if elt_val is not None and _is_str(elt_val):     # a string-element list comp [str(x) for x in xs] is a
+                return _StrSeq("strcomp", length=length)      # sized sequence of strings, so sep.join([...]) proves
             return _SafeContainer("comp", length=length)
         return _Opaque("comp")
     if BEST_EFFORT:                                          # an unmodeled expression: trap-check its children, then opaque (lower trust)
@@ -4865,6 +4904,24 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     pass
         return _Opaque("be_expr")
     raise Unsupported(f"expression {type(node).__name__} at line {getattr(node, 'lineno', '?')}")
+
+
+def _star_seq_len(elts, env, ctx):
+    """The length of a star-unpacked list/tuple literal [*a, *b, x]: the sum of the plain scalar-list sources' lengths
+    plus the plain-element count. Each element is trap-checked. Raises on a non-plain-list starred source (a tuple /
+    nested / mapping source, whose element types would be mismodeled)."""
+    total = z3.IntVal(0)
+    for e in elts:
+        if isinstance(e, ast.Starred):
+            v = ev(e.value, env, ctx)
+            if isinstance(v, _SafeContainer) and v.tuple_arity is None and v.elem is None:
+                total = total + _container_len(v, ctx)
+            else:
+                raise Unsupported("starred unpacking of a non-plain-list iterable")
+        else:
+            ev(e, env, ctx)
+            total = total + z3.IntVal(1)
+    return total
 
 
 def _container_len(c, ctx):
@@ -4885,6 +4942,8 @@ def _container_element(container, ctx):
     """A fresh value for an arbitrary element of `container`, the same kind container[i] yields: an inner sequence for
     list[list]/list[str], a byte in [0,255] for bytes/bytearray, else an int."""
     if isinstance(container, _SafeContainer):
+        if container.tuple_arity is not None:
+            return tuple(z3.FreshInt("ketelem") for _ in range(container.tuple_arity))
         if isinstance(container.elem, _SafeContainer):
             pr = container.elem
             ln = z3.FreshInt("keyilen")
@@ -4901,8 +4960,12 @@ def _container_element(container, ctx):
 
 def _apply_key_callable(keynode, container, env, ctx):
     """Apply a sorted/min/max key= callable to a freely-chosen element so its per-element traps surface (key=lambda x:
-    10 // x refutes); guarded by the container being non-empty. A lambda or repo function is applied; a bare builtin
-    key (len/abs, element-type-dependent) is declined to UNKNOWN."""
+    10 // x refutes); guarded by the container being non-empty. A lambda or repo function is applied; the total
+    builtins str/repr never trap on any element (accepted); other bare builtins (len/abs, element-type-dependent) are
+    declined to UNKNOWN."""
+    if (isinstance(keynode, ast.Name) and keynode.id in ("str", "repr")
+            and keynode.id not in env and keynode.id not in ctx.repo):
+        return                                               # str(x) / repr(x) is total -- no per-element trap
     lam = ev(keynode, env, ctx) if isinstance(keynode, ast.Lambda) else \
         (env.get(keynode.id) if isinstance(keynode, ast.Name) else None)
     elem = _container_element(container, ctx)
@@ -4920,6 +4983,28 @@ def _apply_key_callable(keynode, container, env, ctx):
             raise Unsupported("sorted/min/max key= is not a modeled callable (only a lambda or repo function)")
     finally:
         ctx.pc = saved
+
+
+def _apply_fold_fn(fn, acc, elem, env, ctx):
+    """Apply a 2-argument reduce / accumulate fold callable to (acc, elem) so its per-step trap surfaces (a // b on a
+    zero element refutes). Handles a 2-arg lambda, an in-repo function, and operator.<binop> (operator.add / mul /
+    floordiv / ...); raises on anything else (the caller then declines to UNKNOWN)."""
+    lam = ev(fn, env, ctx) if isinstance(fn, ast.Lambda) else (env.get(fn.id) if isinstance(fn, ast.Name) else None)
+    if isinstance(lam, _Lambda) and len(lam.params) == 2:
+        le = dict(lam.env)
+        le[lam.params[0]] = acc
+        le[lam.params[1]] = elem
+        ev(lam.body, le, ctx)
+    elif isinstance(fn, ast.Name) and fn.id in ctx.repo:
+        ctx.inline(fn.id, [acc, elem])
+    elif (isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name) and fn.value.id == "operator"
+          and fn.attr in _OPERATOR_BINOP and "operator" not in env):
+        binop = ast.copy_location(ast.BinOp(left=ast.copy_location(ast.Name("_facc", ast.Load()), fn),
+                                            op=_OPERATOR_BINOP[fn.attr](),
+                                            right=ast.copy_location(ast.Name("_felem", ast.Load()), fn)), fn)
+        ev(binop, {"_facc": acc, "_felem": elem}, ctx)       # operator.add(acc, x) etc.: the binop's own trap surfaces
+    else:
+        raise Unsupported("fold function is not a 2-arg lambda / repo function / operator binop")
 
 
 def _dict_member(d, key):

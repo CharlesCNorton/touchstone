@@ -2323,6 +2323,13 @@ def run_self_tests(fast=False):
     assert check("def f(xs: list):\n    return ','.join(str(x) for x in xs)\n").status == PROVED
     assert check("def f(n: int):\n    return '/'.join(str(i) for i in range(n))\n").status == PROVED
     assert check("def f(xs: list):\n    return ','.join(x for x in xs)\n").status == UNKNOWN     # elements not proven str
+    # a string-element LIST comp ([str(x) for x in xs]) is a sized string sequence, so sep.join([...]) proves too; and
+    # an f-string is always str-typed, so f'{x}' joins, has string methods, and f'{x}' + 1 is a refutable TypeError.
+    assert check("def f(xs: list):\n    return ','.join([str(x) for x in xs])\n").status == PROVED
+    assert check("def f(xs: list):\n    return ' '.join(f'{x}' for x in xs)\n").status == PROVED
+    assert check("def f(xs: list):\n    return ' '.join([f'{x}' for x in xs])\n").status == PROVED
+    assert check("def f(x: int):\n    return f'{x}'.upper()\n").status == PROVED
+    assert check("def f(x: int):\n    return f'{x}' + 1\n").status == REFUTED               # str + int: TypeError
     # a sequence's truthiness uses the same length its c[i] bounds check uses (the explicit length of a comprehension
     # or split result), so `if c: c[0]` proves.
     assert check("def f(xs: list):\n    c = [x + 1 for x in xs]\n    if c:\n        return c[0]\n    return 0\n").status == PROVED
@@ -2336,6 +2343,11 @@ def run_self_tests(fast=False):
     assert check("import functools\ndef f(xs: list):\n    return functools.reduce(lambda a, b: a + b, xs)\n").status == REFUTED   # empty: TypeError
     assert check("import functools\ndef f(xs: list):\n    if xs:\n        return functools.reduce(lambda a, b: a + b, xs)\n    return 0\n").status == PROVED
     assert check("import functools\ndef f():\n    return functools.reduce(lambda a, b: a // b, (1, 2, 3))\n").status == UNKNOWN   # tuple declines
+    # an operator.<binop> fold function (reduce(operator.add, ...) = sum, reduce(operator.mul, ...) = product) applies
+    # the corresponding binop, so a total binop proves and a dividing one refutes -- in reduce and accumulate alike.
+    assert check("import functools, operator\ndef f(xs: list):\n    return functools.reduce(operator.add, xs, 0)\n").status == PROVED
+    assert check("import functools, operator\ndef f(xs: list):\n    return functools.reduce(operator.floordiv, xs, 1)\n").status == REFUTED
+    assert check("import itertools, operator\ndef f(xs: list):\n    return list(itertools.accumulate(xs, operator.mul))\n").status == PROVED
     # a lazy iterator (zip / itertools.chain / reversed / ...) has no len() and is not subscriptable: len(it) and it[i]
     # are TypeErrors; only list(it) / sorted(it) / a for-loop consume it.
     assert check("import itertools\ndef f(a: list, b: list):\n    return len(itertools.chain(a, b))\n").status == REFUTED
@@ -2352,6 +2364,45 @@ def run_self_tests(fast=False):
     assert check("import itertools\ndef f(xs: list):\n    return list(itertools.accumulate(xs, lambda a, b: a // b))\n").status == REFUTED
     assert check("import itertools\ndef f(xs: list):\n    return len(itertools.accumulate(xs))\n").status == REFUTED
     assert check("import itertools\ndef f(xs: list):\n    t = 0\n    for x in itertools.accumulate(xs):\n        t = 1\n    return t\n").status == PROVED
+    # itertools.chain.from_iterable(xss): a lazy iterator (like chain), so list(...) is sized but len(...) and [i] are
+    # TypeErrors.
+    assert check("import itertools\ndef f(xss: list):\n    return 10 // (len(list(itertools.chain.from_iterable(xss))) + 1)\n").status == PROVED
+    assert check("import itertools\ndef f(xss: list):\n    return len(itertools.chain.from_iterable(xss))\n").status == REFUTED
+    assert check("import itertools\ndef f(xss: list):\n    t = 0\n    for x in itertools.chain.from_iterable(xss):\n        t = 1\n    return t\n").status == PROVED
+    # itertools.pairwise(it): consecutive 2-tuples of length max(len-1, 0); a lazy iterator, so list(...) sizes and an
+    # element unpacks, len(...) is a TypeError.
+    assert check("import itertools\ndef f(xs: list):\n    return 10 // (len(list(itertools.pairwise(xs))) + 1)\n").status == PROVED
+    assert check("import itertools\ndef f(xs: list):\n    t = 0\n    for a, b in itertools.pairwise(xs):\n        t = 1\n    return t\n").status == PROVED
+    assert check("import itertools\ndef f(xs: list):\n    return len(itertools.pairwise(xs))\n").status == REFUTED
+    # sorting / max-ing dict items by value (the d.items() tuple element's [1]) decides via the key= machinery.
+    assert check("def f(d: dict):\n    return sorted(d.items(), key=lambda kv: kv[1])\n").status == PROVED
+    # [*a, *b, x] star-unpacking builds a NEW list of length sum(len(*list)) + the plain-element count; it is trap free
+    # and iterable, indexing it bounds-checks, and a starred non-plain-list source (a zip tuple) declines.
+    assert check("def f(a: list, b: list):\n    return 10 // (len([*a, *b]) - len(a) - len(b) + 1)\n").status == PROVED
+    assert check("def f(a: list, b: list):\n    t = 0\n    for x in [*a, *b]:\n        t = 1\n    return t\n").status == PROVED
+    assert check("def f(a: list, b: list):\n    return [*a, *b][0]\n").status == REFUTED   # may be empty -> IndexError
+    assert check("def f(a: list, b: list):\n    return [*list(zip(a, b))]\n").status == UNKNOWN   # tuple source declines
+    # (*a, *b, x) tuple star-unpacking is the immutable analogue: a NEW tuple of the same summed length.
+    assert check("def f(a: list, b: list):\n    return 10 // (len((*a, *b)) - len(a) - len(b) + 1)\n").status == PROVED
+    assert check("def f(a: list, b: list):\n    return (*a, *b)[0]\n").status == REFUTED   # may be empty -> IndexError
+    assert check("def f(rest: list, x: int):\n    return (x, *rest)\n").status == PROVED
+    # a list / bytes parameter * int repeats it: a NEW sequence of length max(count, 0) * len(seq), trap free, with
+    # the element kind preserved (bytes stay [0, 255]). A non-integer multiplier or a nested source declines.
+    assert check("def f(a: list):\n    return 10 // (len(a * 3) - 3 * len(a) + 1)\n").status == PROVED
+    assert check("def f(a: list):\n    return 3 * a\n").status == PROVED
+    assert check("def f(a: list):\n    return (a * 3)[0]\n").status == REFUTED   # a may be empty -> IndexError
+    assert check("def f(b: bytes):\n    c = b * 3\n    if c:\n        return 1000 // (c[0] + 1)\n    return 0\n").status == PROVED
+    assert check("def f(a: list):\n    return a * 1.5\n").status == UNKNOWN   # non-integer multiplier declines
+    # zip / enumerate / dict.items() yield fixed-arity tuples, so an element is a tuple: z[i][0] / z[i][1] decide and
+    # a, b = z[i] unpacks, but z[i] + 1 is the TypeError CPython raises (was a false PROVED when elements were modeled
+    # as scalar ints). list(enumerate / zip) is sized; sorted(d.items()) and for k, v in d.items() decide.
+    assert check("def f(a: list, b: list):\n    z = list(zip(a, b))\n    if z:\n        return z[0] + 1\n    return 0\n").status == REFUTED   # tuple + int
+    assert check("def f(a: list, b: list):\n    z = list(zip(a, b))\n    if z:\n        return z[0][0] + 1\n    return 0\n").status == PROVED
+    assert check("def f(a: list, b: list):\n    z = list(zip(a, b))\n    if z:\n        x, y = z[0]\n        return x + y\n    return 0\n").status == PROVED
+    assert check("def f(xs: list):\n    return 10 // (len(list(enumerate(xs))) + 1)\n").status == PROVED
+    assert check("def f(xs: list):\n    t = 0\n    for i, x in enumerate(xs):\n        t = 1\n    return t\n").status == PROVED
+    assert check("def f(d: dict):\n    return sorted(d.items())\n").status == PROVED
+    assert check("def f(d: dict):\n    t = 0\n    for k, v in d.items():\n        t = 1\n    return t\n").status == PROVED
     # statistics.mean / median / stdev / ... raise StatisticsError on too few data points (< 1 for the mean family,
     # < 2 for stdev / variance); a len guard removes it. The result is a float.
     assert check("import statistics\ndef f(xs: list):\n    return statistics.mean(xs)\n").status == REFUTED
@@ -2418,6 +2469,11 @@ def run_self_tests(fast=False):
     assert check("def f(xs: list):\n    if xs:\n        return max(xs, key=lambda x: 10 // x)\n    return 0\n").status == REFUTED
     assert check("def f(xs: list):\n    return sorted(xs, key=len)\n").status == UNKNOWN                   # builtin key abstains
     assert check("def f(xs: list):\n    return max(xs, key=abs)\n").status == UNKNOWN
+    # key=str / key=repr are total on any element (never trap), so they are accepted: sorted(xs, key=str) proves and
+    # max(xs, key=str) is the empty-iterable ValueError. Element-type-dependent builtins (len / abs) still decline.
+    assert check("def f(xs: list):\n    return sorted(xs, key=str)\n").status == PROVED
+    assert check("def f(xs: list):\n    return max(xs, key=str)\n").status == REFUTED                      # empty -> ValueError
+    assert check("def f(xs: list):\n    if xs:\n        return max(xs, key=repr)\n    return ''\n").status == PROVED
     # getattr(o, "name"[, default]) with a constant name models the field o.name (a stable value, duck-typed numeric),
     # and a parameter used as getattr/hasattr(o, ...) is inferred an object, so arithmetic on a getattr is decided.
     assert check("def f(o):\n    return getattr(o, \"x\", 0) + 1\n").status == PROVED
@@ -2613,6 +2669,14 @@ def run_self_tests(fast=False):
     assert check("def f(d: dict):\n    return 10 // (len(d.items()) + 1)\n").status == PROVED
     assert check("def f(s: set):\n    return 10 // (len(s) + 1)\n").status == PROVED
     assert check("def f(d: dict):\n    return 10 // len(d)\n").status == REFUTED               # empty dict -> div by zero
+    # d.keys() / d.values() is a sized, iterable, NON-subscriptable view of length len(d): list / sorted / sum over it
+    # decide, max(d.values()) is the empty-dict ValueError (a len(d) guard proves a guarded max), and view[i] is a
+    # TypeError. The view length ties to len(d), so the guard connects.
+    assert check("def f(d: dict):\n    return sorted(d.values())\n").status == PROVED
+    assert check("def f(d: dict):\n    return 10 // (len(list(d.keys())) + 1)\n").status == PROVED
+    assert check("def f(d: dict):\n    return max(d.values())\n").status == REFUTED             # empty dict -> ValueError
+    assert check("def f(d: dict):\n    if len(d) > 0:\n        return max(d.values())\n    return 0\n").status == PROVED
+    assert check("def f(d: dict):\n    return d.keys()[0]\n").status == REFUTED                 # view is not subscriptable
     assert check("def f():\n    y = None\n    if y:\n        return y + 1\n    return 0\n").status == PROVED   # None falsy in value engine
     # a dict read d[k] traps (KeyError) unless the key is provably present, for an unannotated parameter the body
     # subscripts with a string key (inferred a dict), an annotation, or a literal; a guard or a prior store proves it
@@ -3857,7 +3921,7 @@ def run_self_tests(fast=False):
     assert check("def f(a: list, b: list):\n    n = len(list(zip(a, b)))\n    if n <= len(a):\n        return 1\n    return 10 // 0\n").status == PROVED
     assert check("def f(a: list, b: list):\n    return list(zip(a, b))[0]\n").status == REFUTED
     assert check("def f(a: list, b: list):\n    s = 0\n    for x, y in zip(a, b):\n        s = 1\n    return s\n").status == PROVED
-    assert check("def f(a: list, b: list):\n    z = list(zip(a, b))\n    if len(z) > 0:\n        return z[0][0]\n    return 0\n").status == UNKNOWN
+    assert check("def f(a: list, b: list):\n    z = list(zip(a, b))\n    if len(z) > 0:\n        return z[0][0]\n    return 0\n").status == PROVED   # zip element is a 2-tuple: [0][0] is a scalar
     # itertools.repeat(x, count) yields max(count, 0) copies, so list(repeat(x, n)) has length max(n, 0): an unguarded
     # index refutes (n may be 0), an n >= 1 guard proves, and it composes with chain (chain(repeat(x, 3), ys) has
     # length 3 + len(ys)). repeat(x) without a count is infinite and abstains.
@@ -6142,14 +6206,14 @@ def run_self_tests(fast=False):
     assert check("def f(t: tuple[int, int], i: int):\n    if 0 <= i < len(t):\n        return t[i]\n    return 0\n", target="f").status == PROVED
     assert check("from typing import List\ndef f(x: List[int]):\n    return len(x)\n", target="f").status == PROVED
     assert check("def f(x: list[int]):\n    return x + 1\n", target="f").status != PROVED                    # container-as-scalar: still abstains
-    # SOUNDNESS: a container-typed parameter (list / dict / set / tuple) used DIRECTLY as a scalar -- a + 1,
-    # t * 2, -a, int(a) -- is a TypeError on the real value, so the integer CHC model and the value engine's
-    # opaque int() abstain (UNKNOWN); a container used AS a container (a[i], len(a), for x in a) and a scalar
-    # derived from it (len(a) + 1) are sound and still decide.
+    # SOUNDNESS: a container-typed parameter (list / dict / set / tuple) used DIRECTLY as a scalar -- a + 1, -a,
+    # int(a) -- is a TypeError on the real value, so the integer CHC model and the value engine's opaque int()
+    # abstain (UNKNOWN); a container used AS a container (a[i], len(a), for x in a, seq * int repetition) and a
+    # scalar derived from it (len(a) + 1) are sound and still decide.
     assert check("def f(a: list):\n    return a + 1\n", target="f").status != PROVED
     assert check("def f(d: dict):\n    return d + 1\n", target="f").status != PROVED
     assert check("def f(s: set):\n    return s + 1\n", target="f").status != PROVED
-    assert check("def f(t: tuple):\n    return t * 2\n", target="f").status != PROVED
+    assert check("def f(t: tuple):\n    return t * 2\n", target="f").status == PROVED        # tuple repetition is valid
     assert check("def f(a: list):\n    return -a\n", target="f").status != PROVED
     assert check("def f(a: list):\n    return int(a)\n", target="f").status != PROVED
     assert check("def f(s: set):\n    return int(s)\n", target="f").status != PROVED
