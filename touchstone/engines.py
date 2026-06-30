@@ -765,6 +765,82 @@ def _rewrite_single_object(src, target):
         return None
 
 
+def _len_only_uses(node, names):
+    """True when every Name in `names` occurring in `node` is the sole argument of a len(...) call -- so the
+    spec reads only those accumulators' lengths, never their contents (which a length rewrite would discard)."""
+    under_len = {id(c.args[0]) for c in ast.walk(node)
+                 if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id == "len"
+                 and len(c.args) == 1 and isinstance(c.args[0], ast.Name) and c.args[0].id in names}
+    return all(id(n) in under_len for n in ast.walk(node)
+               if isinstance(n, ast.Name) and n.id in names)
+
+
+class _LenToScalar(ast.NodeTransformer):
+    """len(out) -> out for names that a length rewrite has turned into scalar counters."""
+    def __init__(self, names):
+        self.names = names
+
+    def visit_Call(self, n):
+        self.generic_visit(n)
+        if (isinstance(n.func, ast.Name) and n.func.id == "len" and len(n.args) == 1
+                and isinstance(n.args[0], ast.Name) and n.args[0].id in self.names):
+            return n.args[0]
+        return n
+
+
+def _rewrite_append_to_counter(src, post_node):
+    """`out = []; for <elem> in <it>: out.append(e); return out`, with a spec reading result only through
+    len(...), counts one append per iteration, so len(out) tracks a scalar counter out = out + 1. Rewrite it
+    to that counter (and len(result) -> result in the spec) so verify_sequence_loop proves len(result) ==
+    len(xs); None when the shape, an off-loop mutation of out, or a non-length use of result does not match."""
+    try:
+        mod = ast.parse(textwrap.dedent(src))                            # the RAW ast (enumerate not yet desugared to
+    except SyntaxError:                                                 # a counter, so its body stays a single append)
+        return None
+    fn = next((n for n in mod.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+    if fn is None:
+        return None
+    loops = [s for s in fn.body if isinstance(s, ast.For)]
+    rets = [s for s in fn.body if isinstance(s, ast.Return)]
+    if len(loops) != 1 or len(rets) != 1 or fn.body[-1] is not rets[0]:
+        return None
+    loop = loops[0]
+    if loop.orelse or len(loop.body) != 1 or not isinstance(rets[0].value, ast.Name):
+        return None
+    outname = rets[0].value.id
+    inits = [s for s in fn.body if isinstance(s, ast.Assign) and len(s.targets) == 1
+             and isinstance(s.targets[0], ast.Name) and s.targets[0].id == outname]
+    if len(inits) != 1 or not _empty_list_lit(inits[0].value):
+        return None
+    st = loop.body[0]                                                    # the loop body is one unconditional append
+    if not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and not st.value.keywords
+            and isinstance(st.value.func, ast.Attribute) and st.value.func.attr == "append"
+            and isinstance(st.value.func.value, ast.Name) and st.value.func.value.id == outname
+            and len(st.value.args) == 1):
+        return None
+    allowed = {id(inits[0].targets[0]), id(st.value.func.value), id(rets[0].value)}   # out only here: init / append
+    if any(id(n) not in allowed for n in ast.walk(fn)                    # receiver / return -- never read or aliased
+           if isinstance(n, ast.Name) and n.id == outname):
+        return None
+    if not _len_only_uses(post_node, {"result", outname}):
+        return None
+    new_fn = copy.deepcopy(fn)
+    for i, s in enumerate(new_fn.body):
+        if isinstance(s, ast.Assign) and isinstance(s.targets[0], ast.Name) and s.targets[0].id == outname \
+                and _empty_list_lit(s.value):
+            new_fn.body[i] = ast.copy_location(ast.Assign(                # out = [] -> out = 0
+                targets=[ast.Name(id=outname, ctx=ast.Store())], value=ast.Constant(value=0)), s)
+        elif isinstance(s, ast.For):
+            s.body = [ast.copy_location(ast.Assign(                       # out.append(e) -> out = out + 1
+                targets=[ast.Name(id=outname, ctx=ast.Store())],
+                value=ast.BinOp(left=ast.Name(id=outname, ctx=ast.Load()), op=ast.Add(),
+                                right=ast.Constant(value=1))), s.body[0])]
+    ast.fix_missing_locations(new_fn)
+    new_post = _LenToScalar({"result", outname}).visit(copy.deepcopy(post_node))
+    ast.fix_missing_locations(new_post)
+    return ast.unparse(new_fn), new_post
+
+
 def _try_sequence_loop(prop, target, src, post_node, pre_node, repo, spec):
     """Route a for-loop over a list parameter to verify_sequence_loop, which relates the result to the list
     length and to per-element accumulators -- a property the general CHC engine leaves UNKNOWN. The Python
@@ -1064,6 +1140,11 @@ def _prove_core(impl_src, ensures, requires, repo, prop, target):
         if fv.status != UNKNOWN:                                                 # routed to the quantified-spec
             return fv                                                           # engines (map comp / array loop)
     if any(isinstance(n, (ast.While, ast.For)) for n in ast.walk(_parse(impl_src))):
+        if not repo:
+            _rw = _rewrite_append_to_counter(impl_src, post_node)              # out=[]; for..: out.append(e); return
+            if _rw is not None:                                               # out, a len(result)-only spec -> the
+                impl_src, post_node = _rw                                     # scalar counter out += 1, which the loop
+                post_fn = lambda S, r: ev_bool(post_node, {**S, "result": r}, spec)   # engines below prove
         v = verify_chc(prop, target, impl_src, pre_fn, post_fn, repo)           # single loop: synthesizes the
         if v.status != UNKNOWN:                                                 # invariant Spacer misses
             return v
@@ -1699,6 +1780,27 @@ def _dispatch_annotated_methods(src, target, repo):
     return variants
 
 
+def _seq_param_note(src, target):
+    """A note for a REFUTED whose target has an unannotated parameter modeled as a list (an integer-indexed
+    sequence whose out-of-range index is a witnessable IndexError): the counterexample reflects that reading,
+    so flag it in case a dict or other mapping was meant. None when no such parameter exists."""
+    try:
+        from .domains import _infer_param_kinds
+        fn = next((n for n in _parse(src).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and (target is None or n.name == target)), None)
+        if fn is None:
+            return None
+        kinds = _infer_param_kinds(fn)
+    except Exception:
+        return None
+    seqps = [a.arg for a in fn.args.args if a.annotation is None and kinds.get(a.arg) == "seq"]
+    if not seqps:
+        return None
+    return ("note: unannotated parameter%s %s modeled as a list (an integer-indexed sequence); annotate (e.g. %s: "
+            "dict) if a mapping was meant -- the counterexample is for the list reading"
+            % ("s" if len(seqps) > 1 else "", ", ".join(seqps), seqps[0]))
+
+
 def check(src, requires="True", repo=None, total=False, prop="implicit", target=None, best_effort=False) -> Verdict:
     """Verify a function with no externally supplied property: mine the contracts the code already
     states. Every `assert` in the body becomes an obligation (it must hold on all inputs the optional
@@ -1715,7 +1817,12 @@ def check(src, requires="True", repo=None, total=False, prop="implicit", target=
             return _label_best_effort(v, core.BEST_EFFORT_ASSUMED)
         finally:
             core.BEST_EFFORT = saved
-    return _escalate_budget(lambda: _check_core(src, requires, repo, total, prop, target))
+    v = _escalate_budget(lambda: _check_core(src, requires, repo, total, prop, target))
+    if v.status == REFUTED:                                   # surface the unannotated-as-list reading behind a
+        note = _seq_param_note(src, target)                  # surprising counterexample (e.g. d[k] with k = -1)
+        if note and note not in (v.reason or ""):
+            v.reason = (v.reason + "; " + note) if v.reason else note
+    return v
 
 
 def _check_core(src, requires, repo, total, prop, target):
@@ -4322,6 +4429,10 @@ def _optnull_truth(node, env, traps, pc, aux, auxv):
         if isinstance(op, (ast.Is, ast.IsNot, ast.Eq, ast.NotEq)):
             eq = z3.If(ln, rn, z3.And(z3.Not(rn), lx == rx))             # None==None; None!=int; int==int by value
             return eq if isinstance(op, (ast.Is, ast.Eq)) else z3.Not(eq)
+        if type(op) not in _CMP:                                         # In / NotIn (membership) is not an ordering and
+            raise Unsupported(f"optional membership test {type(op).__name__}")  # not None-orderable: the None engine
+            #                                                              abstains (caught -> UNKNOWN) so the value engine,
+            #                                                              which models `k in d`, decides instead of crashing
         traps.append(z3.And(pc, z3.Or(ln, rn)))                          # ordering a None is a TypeError
         return _CMP[type(op)](lx, rx)
     n, x = _mb_split(_optnull_eval(node, env, traps, pc, aux, auxv))     # atom truthiness: present and nonzero

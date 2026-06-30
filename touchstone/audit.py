@@ -2650,6 +2650,14 @@ def run_self_tests(fast=False):
     assert check("def f(d: dict):\n    k, v = d.popitem()\n    return 0\n").status == REFUTED      # same trap, unpacked
     assert check("def f(d: dict):\n    if len(d) > 0:\n        return d.popitem()\n    return None\n").status == PROVED
     assert check("def f(d: dict):\n    a = d.popitem()\n    b = d.popitem()\n    return 0\n").status == UNKNOWN   # two pops: not mutate-once
+    # bool(dict) is len(d) != 0, the same length len(d) uses, so a truthiness guard `if d:` proves a popitem /
+    # max(d.values()) the way `if len(d) > 0:` does; the `not d` branch is the empty one, so a popitem there still
+    # refutes; truthiness is not key membership, so a guarded d[k] on an unproven key still refutes.
+    assert check("def f(d: dict):\n    if d:\n        return d.popitem()\n    return None\n").status == PROVED
+    assert check("def f(d: dict):\n    if not d:\n        return None\n    return d.popitem()\n").status == PROVED
+    assert check("def f(d: dict):\n    if d:\n        return max(d.values())\n    return 0\n").status == PROVED
+    assert check("def f(d: dict):\n    if not d:\n        return d.popitem()\n    return 0\n").status == REFUTED   # not d == empty
+    assert check("def f(d: dict, k: int):\n    if d:\n        return d[k]\n    return 0\n").status == REFUTED   # non-empty != has k
     assert check("def f(xs: list):\n    if len(xs) >= 1:\n        a = xs.pop()\n        b = xs.pop()\n"
                  "        return a + b\n    return 0\n").status == UNKNOWN   # popped twice: abstains
     assert check("def f(xs: list):\n    x = xs.pop()\n    xs.append(x)\n    return x\n").status == UNKNOWN   # pop + append: excluded
@@ -2711,7 +2719,18 @@ def run_self_tests(fast=False):
     assert check("def f(d: dict[str, int], k):\n    if k in d and d[k] != 0:\n        return 10 // d[k]\n    return 0\n").status == PROVED
     assert check("def f(d: dict, k):\n    if k in d:\n        return 10 // d[k]\n    return 0\n").status == REFUTED
     assert check("def f(d: dict, k):\n    if k in d and d[k] == 5:\n        return 10 // (d[k] - 5)\n    return 0\n").status == REFUTED
+    # the safe-dict-access idiom `if k in d: return d[k]` followed by `return None` reaches the optional/None
+    # engine (the function may return None); a membership test there is not a None-ordering comparison, so the
+    # None engine abstains (rather than crashing on the operator) and the value engine proves the guarded read.
+    assert check("def f(d: dict, k):\n    if k in d:\n        return d[k]\n    return None\n").status == PROVED
+    assert check("def f(d: dict, k):\n    if k not in d:\n        return None\n    return d[k]\n").status == PROVED
     assert check("def f(d: dict, k):\n    if k in d:\n        x = d[k]\n        if x != 0:\n            return 10 // x\n    return 0\n").status == PROVED
+    # an unannotated container subscripted by a non-string key is modeled as a list, so d[k] refutes (the index may
+    # be out of range); the REFUTED verdict surfaces that reading so a dict-intended parameter is not read as a real
+    # bug. The note fires only for an unannotated `seq` parameter -- not for an annotation or a string-keyed dict.
+    _v3 = check("def f(d, k):\n    return d[k]\n")
+    assert _v3.status == REFUTED and "modeled as a list" in _v3.reason
+    assert "modeled as a list" not in (check("def f(d: dict, k):\n    return d[k]\n").reason or "")
     # a dict parameter's value type is modeled (dict[K, V] / typing.Dict[K, V]): a read-only dict[str, list] read d[k]
     # is a stable list, so a len(d[k]) > 0 guard proves d[k][0], an unguarded d[k][0] refutes (it may be empty), and
     # d[k].append / len(d[k]) decide; dict[str, str] read d[k] is a string (d[k].upper()). A bare dict (no value type)
@@ -3935,6 +3954,14 @@ def run_self_tests(fast=False):
     assert check("import math\ndef f(a: float, b: float):\n    return 10 // math.isclose(a, b)\n").status == REFUTED
     assert check("import math\ndef f(s: str, b: float):\n    return 1 if math.isclose(s, b) else 0\n").status == UNKNOWN
     assert check("import math\ndef f(a: float, b: float):\n    return 1 if math.isclose(a, b, rel_tol=0.1) else 0\n").status == UNKNOWN
+    # total float methods on a symbolic float (no raise on ANY float, NaN / inf included): is_integer -> a 0/1 bool,
+    # hex -> a str, conjugate -> the float. is_integer keeps both branches live (a trap on either side refutes); a
+    # non-total method (as_integer_ratio raises on NaN / inf) is not modeled and stays UNKNOWN.
+    assert check("def f(x: float):\n    return x.is_integer()\n").status == PROVED
+    assert check("def f(x: float):\n    return x.hex()\n").status == PROVED
+    assert check("def f(x: float):\n    return x.conjugate()\n").status == PROVED
+    assert check("def f(x: float):\n    if x.is_integer():\n        return 10 // 0\n    return 0\n").status == REFUTED
+    assert check("def f(x: float):\n    return x.as_integer_ratio()\n").status == UNKNOWN   # raises on NaN / inf: not modeled
     # zip(a, b, ...) stops at the SHORTEST argument, so list(zip(...)) has the minimum length of its sized arguments
     # (trap free; a for-loop over it still havocs the targets, including a tuple target). An unguarded index into it
     # refutes (it may be empty); its elements are opaque tuples, so a deep index z[0][0] abstains.
@@ -4620,6 +4647,17 @@ def run_self_tests(fast=False):
     _cnt = "def f(xs: list):\n    count = 0\n    for x in xs:\n        count = count + 1\n    return count\n"
     assert prove(_cnt, "result == len(xs)", target="f").status == PROVED
     assert prove(_cnt, "result == len(xs) + 1", target="f").status == REFUTED
+    # a list BUILT by a single unconditional append per iteration has len(result) == len(xs): the same counter
+    # argument, recognized through `prove` (one append per element), for both `for x in xs` and enumerate. Only
+    # a length-reading spec qualifies; a conditional or repeated append, or a content spec, does not (so no false
+    # PROVED on a length that the appends do not actually reach).
+    _ap = "def f(xs: list):\n    out = []\n    for x in xs:\n        out.append(x * 2)\n    return out\n"
+    _ape = "def f(xs: list):\n    out = []\n    for i, x in enumerate(xs):\n        out.append(x)\n    return out\n"
+    assert prove(_ap, "len(result) == len(xs)", target="f").status == PROVED
+    assert prove(_ape, "len(result) == len(xs)", target="f").status == PROVED
+    assert prove(_ap, "len(result) == len(xs) + 1", target="f").status == REFUTED
+    assert prove("def f(xs: list):\n    out = []\n    for x in xs:\n        if x > 0:\n            out.append(x)\n    return out\n",
+                 "len(result) == len(xs)", target="f").status == UNKNOWN   # conditional append: not one per element
     # for-loop equivalence by a relational product: two functions accumulating over the same `for elem in xs`
     # are equivalent iff their results agree at every input, by the single inductive invariant the sequence-loop
     # engine synthesizes -- sound both ways, where the value engine's loop over-approximation is unsound for ==.

@@ -1708,6 +1708,9 @@ def _as_bool(x, ctx=None):
         n = x.length if getattr(x, "length", None) is not None else z3.Int("len_" + x.name)
         return n != 0                                        # bounds check uses (explicit for a comprehension / split
         #                  result, else by name), so `if c: c[0]` proves
+    if isinstance(x, _DictParam):                            # bool(dict) is len(d) != 0, the SAME length len(d) and
+        n = x.length if getattr(x, "length", None) is not None else z3.Int("len_" + x.name)
+        return n != 0                                        # d.popitem() / max(d.values()) use, so `if d:` guards them
     if isinstance(x, _NdArray):                              # bool(ndarray / Series) is a ValueError for more than one
         raise Unsupported("truth value of an array is ambiguous "   # element (numpy/pandas), so its truthiness is not
                           "(use .any() / .all() or a size check)")  # a benign bool -- abstain rather than over-approximate
@@ -4475,6 +4478,13 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             res = _int_method(meth, _as_int(recv), ctx)       # bit_length / bit_count / __index__ / conjugate
             if res is not None:
                 return res
+        if _is_fp(recv) and not a and not node.keywords:      # total float methods: no raise on ANY float, NaN / inf
+            if meth == "is_integer":                          # included (is_integer -> bool, hex -> str of the float,
+                return _b01(z3.FreshConst(z3.BoolSort(), "is_integer"))   # conjugate -> the real float itself)
+            if meth == "hex":
+                return z3.FreshConst(_SS, "fphex")
+            if meth == "conjugate":
+                return recv
         if (z3.is_expr(recv) and (z3.is_int(recv) or z3.is_bool(recv)) and meth == "to_bytes"
                 and 1 <= len(node.args) <= 2 and all(kw.arg in ("byteorder", "signed") for kw in node.keywords)):
             # n.to_bytes(length, byteorder[, signed=]) -> a bytes value of `length` bytes. For a CONSTANT length L it
