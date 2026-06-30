@@ -1200,6 +1200,7 @@ def _check_trapfree_symexec(prop, target, src, pre_node, spec, repo, has_pre, tr
         risky_isinstance = False
     ctx = Ctx(repo or {}); ctx.facts = []; ctx.trapfree_callees = trapfree_callees
     ctx.exact_traps = []                                          # precise first-iteration loop traps (refutable)
+    ctx.hard_traps = []                                           # exact traps refutable even under the value over-approx
     saved = core._TRAPFREE; core._TRAPFREE = True
     try:
         _a, z3args, _r, traps, _n = symexec(src, ctx, param_kinds=kinds)
@@ -1214,6 +1215,12 @@ def _check_trapfree_symexec(prop, target, src, pre_node, spec, repo, has_pre, tr
         # engine (verify_no_raise_optional, tried first in check) carries the None precisely instead.
         return Verdict(UNKNOWN, prop, target, "implicit contracts (asserts + trap freedom)",
                        reason="a None may survive a loop; the value engine's havoc cannot model it soundly")
+    hard = getattr(ctx, "hard_traps", None)                      # an exact trap (0 ** negative, exact operands) refutes
+    if hard and not has_pre:                                     # even under the value over-approximation that set it,
+        hc = z3.And(pre_term, *ctx.facts, z3.Or(*hard)) if ctx.facts else z3.And(pre_term, z3.Or(*hard))   # and even
+        if _solve(hc)[0] == REFUTED:                             # when ctx.traps holds no other (unsuppressed) trap
+            return Verdict(REFUTED, prop, target, "implicit contracts (asserts + trap freedom)",
+                           reason="a trap is reachable")
     if not traps:
         if risky_isinstance:                                     # a guessed-scalar parameter is isinstance-tested, so
             return Verdict(UNKNOWN, prop, target, "implicit contracts (asserts + trap freedom)",   # the value engine's
@@ -5543,6 +5550,75 @@ def _block_exits(stmts) -> bool:
     return False
 
 
+def _provably_nonempty_iter(node, bound):
+    """True iff a for-loop over this iterable provably runs its body at least once: a non-empty list / tuple / set
+    literal, a non-empty string / bytes constant, or range(...) with constant arguments and a non-empty extent. A
+    symbolic or possibly-empty iterable (or a shadowed `range`) is not provably non-empty -- the answer is False."""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return bool(node.elts) and not any(isinstance(e, ast.Starred) for e in node.elts)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+        return len(node.value) >= 1
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "range"
+            and node.func.id not in bound and not node.keywords and 1 <= len(node.args) <= 3
+            and all(isinstance(a, ast.Constant) and isinstance(a.value, int) and not isinstance(a.value, bool)
+                    for a in node.args)):
+        try:
+            return len(range(*[a.value for a in node.args])) >= 1
+        except (ValueError, TypeError):
+            return False
+    return False
+
+
+def _continues_this_loop(stmts):
+    """True iff some `continue` in these statements targets the immediately enclosing loop (not a nested for/while)."""
+    stack = list(stmts)
+    while stack:
+        s = stack.pop()
+        if isinstance(s, ast.Continue):
+            return True
+        if isinstance(s, (ast.For, ast.AsyncFor, ast.While)):
+            continue                                          # a continue inside a nested loop is bound to that loop
+        if isinstance(s, (ast.If, ast.Try, ast.With, ast.AsyncWith)):
+            stack.extend(getattr(s, "body", []))
+            stack.extend(getattr(s, "orelse", []))
+            stack.extend(getattr(s, "finalbody", []))
+            for h in getattr(s, "handlers", []):
+                stack.extend(h.body)
+    return False
+
+
+def _while_enters(test, prev):
+    """True iff `test` is provably true at first entry: the immediately preceding statement set the test's counter to
+    a constant int and the comparison against a constant holds. This is exactly the shape a for-loop over a constant
+    range desugars to (`__forc = 0; while __forc < 10: ...`), so such a loop provably runs its body at least once."""
+    if not (isinstance(prev, ast.Assign) and len(prev.targets) == 1 and isinstance(prev.targets[0], ast.Name)
+            and isinstance(prev.value, ast.Constant) and isinstance(prev.value.value, int)
+            and not isinstance(prev.value.value, bool)):
+        return False
+    cname, cval = prev.targets[0].id, prev.value.value
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1):
+        return False
+
+    def val(node):
+        if isinstance(node, ast.Name) and node.id == cname:
+            return cval
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+            return node.value
+        return None
+
+    lv, rv = val(test.left), val(test.comparators[0])
+    if lv is None or rv is None:
+        return False
+    t = type(test.ops[0])
+    if t is ast.Lt:  return lv < rv
+    if t is ast.LtE: return lv <= rv
+    if t is ast.Gt:  return lv > rv
+    if t is ast.GtE: return lv >= rv
+    if t is ast.Eq:  return lv == rv
+    if t is ast.NotEq: return lv != rv
+    return False
+
+
 def _use_before_def(src):
     """The sorted names that may be read before assignment on some path. Only a name bound somewhere in
     the function's own scope can be unbound-local (Python raises UnboundLocalError for those alone); a
@@ -5586,6 +5662,7 @@ def _use_before_def(src):
         defined = set(defined)
         cond_defs = {}                                       # stable-guard key -> names defined under it; local per
         #                                                      block, so it never leaks across a loop body or nesting
+        prev = None                                          # the immediately preceding statement (a while-entry test)
         for s in stmts:
             if isinstance(s, ast.Assign):
                 uses(s.value, defined)
@@ -5606,13 +5683,18 @@ def _use_before_def(src):
                 defined |= stores(s.target)
             elif isinstance(s, ast.For):
                 uses(s.iter, defined)                         # the loop variable is bound, but the body may not run,
-                defined |= stores(s.target)                   # so the body's own bindings do not survive the loop
+                defined |= stores(s.target)                   # so the body's own bindings do not generally survive
                 brk_stack.append([])
-                walk(s.body, defined | binds(s.iter))
+                after = walk(s.body, defined | binds(s.iter))
                 brk = brk_stack.pop()
                 else_defs = walk(s.orelse, defined)
                 if s.orelse:                                  # for/else: definite after iff defined on the else path
                     defined |= set.intersection(else_defs, *brk)   # (no-break completion) AND at every break
+                elif _provably_nonempty_iter(s.iter, local_names | params) and not _continues_this_loop(s.body):
+                    # a constant range / non-empty literal runs the body at least once, so a name the body binds on
+                    # every non-continue path survives -- intersected with each break point (the loop may break on its
+                    # first pass). A continue could loop back before the binding, so that case abstains.
+                    defined |= set.intersection(after, *brk) if brk else after
             elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 defined.add(s.name)                          # binds its name; the body is a separate scope
             elif isinstance(s, ast.Return):
@@ -5633,13 +5715,21 @@ def _use_before_def(src):
             elif isinstance(s, ast.While):
                 uses(s.test, defined)
                 brk_stack.append([])
-                walk(s.body, defined | binds(s.test))        # a walrus in the test binds in the body; body may not run
+                after = walk(s.body, defined | binds(s.test))   # a walrus in the test binds in the body; body may not run
                 brk = brk_stack.pop()
                 else_defs = walk(s.orelse, defined)
                 always = isinstance(s.test, ast.Constant) and bool(s.test.value)   # while True: only a break exits
+                # provably enters (a constant counter makes the test true at entry -- the shape `for i in range(C)`
+                # desugars to) and no continue can loop back before a binding: the loop runs at least once and
+                # normal-exits after a completed body, so the body's definite bindings survive (intersected with breaks).
+                enters = _while_enters(s.test, prev) and not _continues_this_loop(s.body)
                 exits = list(brk)
-                if not always:                                # a test-false (0-iteration) exit runs the else, else
-                    exits.append(else_defs)                   # leaves the pre-loop state
+                if always:
+                    pass                                      # while True: the only exits are breaks (in brk)
+                elif enters:
+                    exits.append(after)                       # ran >= once, normal exit follows a completed body
+                else:                                         # may run 0 times: the test-false exit leaves the
+                    exits.append(else_defs)                   # pre-loop state, so body bindings do not survive
                 if exits:
                     defined |= set.intersection(*exits)
             elif isinstance(s, ast.Try):
@@ -5659,6 +5749,7 @@ def _use_before_def(src):
                     if isinstance(t, ast.Name):
                         defined.discard(t.id)
             # raise / pass / continue / import reference globals or nothing: no-ops for definite assignment.
+            prev = s                                          # track the immediately preceding statement
         return defined
 
     walk(fn.body, params)

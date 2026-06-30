@@ -2296,6 +2296,58 @@ def run_self_tests(fast=False):
     assert check("def f(s: str, sep: str):\n    return s.split(sep, 1)\n").status == REFUTED
     assert check("def f(s: str):\n    return s.replace(\"a\", \"b\", 1)\n").status == PROVED
     assert check("def f(s: str):\n    return \" \".join(s.split())\n").status == PROVED   # join a split (string) seq
+    # split / rsplit with a separator always yield at least the whole string, so the result has length >= 1 and [0] /
+    # [-1] are in bounds: those index loads are PROVED, and an element is a string (so [0].upper() is fine). split()
+    # on whitespace and splitlines() can return [] (e.g. "".split() == []), so [0] there stays a refutable IndexError.
+    assert check("def f(s: str):\n    return s.split(',')[0]\n").status == PROVED
+    assert check("def f(s: str):\n    return s.split(',')[-1]\n").status == PROVED
+    assert check("def f(s: str):\n    return s.rsplit('/', 1)[-1]\n").status == PROVED
+    assert check("def f(s: str):\n    return s.split(',')[0].upper()\n").status == PROVED
+    assert check("def f(s: str):\n    return 10 // len(s.split(','))\n").status == PROVED   # length >= 1, no div-by-0
+    assert check("def f(s: str):\n    return s.split()[0]\n").status == REFUTED              # ''.split() == [] -> OOB
+    assert check("def f(s: str):\n    return s.splitlines()[0]\n").status == REFUTED
+    assert check("def f(s: str):\n    return s.split(',')[5]\n").status == REFUTED           # only >= 1, [5] may be OOB
+    assert check("def f(s: str, i: int):\n    return s.split(',')[i]\n").status == REFUTED   # unguarded symbolic index
+    assert check("def f(s: str, i: int):\n    p = s.split(',')\n    if 0 <= i < len(p):\n        return p[i]\n    return ''\n").status == PROVED
+    # map(str, X) / map(repr, X) is a lazy iterator of strings (str / repr is total), so sep.join(map(str, X)) is a
+    # trap-free string -- the most common list-to-string idiom. The iterator is NOT sized or subscriptable, so len()
+    # of it is the TypeError CPython raises and an index abstains; a non-string map function (map(abs, X)) is not
+    # assumed to yield strings, so the join stays UNKNOWN (it could TypeError on a non-string part).
+    assert check("def f(xs: list):\n    return ''.join(map(str, xs))\n").status == PROVED
+    assert check("def f(xs: list):\n    return ','.join(map(str, xs))\n").status == PROVED
+    assert check("def f(n: int):\n    return ' '.join(map(str, range(n)))\n").status == PROVED
+    assert check("def f(xs: list):\n    return '-'.join(map(repr, xs))\n").status == PROVED
+    assert check("def f(d: dict):\n    return ','.join(map(str, list(d)))\n").status == PROVED
+    assert check("def f(xs: list):\n    return len(map(str, xs))\n").status == REFUTED       # map has no len(): TypeError
+    assert check("def f(xs: list):\n    return map(str, xs)[0]\n").status == UNKNOWN          # map not subscriptable
+    assert check("def f(xs: list):\n    return ','.join(map(abs, xs))\n").status == UNKNOWN   # abs may not yield a str
+    # a generator expression whose element is a string -- (str(x) for x in xs), (f'{x}' for ...) -- is likewise a lazy
+    # iterator of strings, so sep.join(<that generator>) is a trap-free string. A non-string-element generator stays
+    # UNKNOWN (it could TypeError in join).
+    assert check("def f(xs: list):\n    return ','.join(str(x) for x in xs)\n").status == PROVED
+    assert check("def f(n: int):\n    return '/'.join(str(i) for i in range(n))\n").status == PROVED
+    assert check("def f(xs: list):\n    return ','.join(x for x in xs)\n").status == UNKNOWN     # elements not proven str
+    # a sequence's truthiness (`if c:` / `if not c:`) is tied to the SAME length its c[i] bounds check uses, including
+    # for a list comprehension or split result whose length term is explicit (not len_<name>) -- so an emptiness guard
+    # written as truthiness proves the guarded access safe, where previously it spuriously refuted as out-of-range.
+    assert check("def f(xs: list):\n    c = [x + 1 for x in xs]\n    if c:\n        return c[0]\n    return 0\n").status == PROVED
+    assert check("def f(xs: list):\n    c = [x + 1 for x in xs]\n    return c[0]\n").status == REFUTED   # unguarded: may be empty
+    assert check("def f(s: str):\n    parts = s.split()\n    if parts:\n        return parts[0]\n    return ''\n").status == PROVED
+    assert check("def f(s: str):\n    parts = s.split()\n    return parts[0]\n").status == REFUTED   # ''.split() == []
+    # sorted / min / max with a key= lambda: the key is applied to a freely-chosen element so its per-element traps
+    # surface. sorted is total (no empty trap) so a trap-free key proves; a key that divides by the element refutes
+    # (sorted([0], key=lambda x: 10 // x) raises). min / max additionally raise ValueError on an empty iterable, so an
+    # unguarded max(xs, key=...) refutes on that; a non-empty guard or default= removes it. A bare builtin key (len /
+    # abs), whose safety depends on the element's runtime type, is declined -- UNKNOWN, never a guess.
+    assert check("def f(xs: list):\n    return sorted(xs, key=lambda x: x + 1)\n").status == PROVED
+    assert check("def f(xs: list):\n    return sorted(xs, key=lambda x: -x)\n").status == PROVED
+    assert check("def f(xs: list):\n    return sorted(xs, key=lambda x: 10 // x)\n").status == REFUTED   # zero element
+    assert check("def f(xs: list):\n    if xs:\n        return max(xs, key=lambda x: x * x)\n    return 0\n").status == PROVED
+    assert check("def f(xs: list):\n    return max(xs, key=lambda x: x + 1, default=0)\n").status == PROVED  # no empty trap
+    assert check("def f(xs: list):\n    return max(xs, key=lambda x: x + 1)\n").status == REFUTED          # empty ValueError
+    assert check("def f(xs: list):\n    if xs:\n        return max(xs, key=lambda x: 10 // x)\n    return 0\n").status == REFUTED
+    assert check("def f(xs: list):\n    return sorted(xs, key=len)\n").status == UNKNOWN                   # builtin key abstains
+    assert check("def f(xs: list):\n    return max(xs, key=abs)\n").status == UNKNOWN
     # getattr(o, "name"[, default]) with a constant name models the field o.name (a stable value, duck-typed numeric),
     # and a parameter used as getattr/hasattr(o, ...) is inferred an object, so arithmetic on a getattr is decided.
     assert check("def f(o):\n    return getattr(o, \"x\", 0) + 1\n").status == PROVED
@@ -2483,12 +2535,40 @@ def run_self_tests(fast=False):
     assert check("def f(d: dict, k):\n    v = d.get(k)\n    if v is None:\n        return 0\n    return v + 1\n").status == PROVED
     assert check("def f(d: dict, k):\n    x = d.get(k)\n    if x:\n        return x + 1\n    return 0\n").status == PROVED   # truthiness guard
     assert check("def f(d: dict, k):\n    return d.get(k)\n").status == PROVED                # returning None is fine
+    # len() of a dict, a dict view, or any opaque container is nonnegative (a negative __len__ raises ValueError in
+    # CPython), so len(d) + 1 can never reach 0: 10 // (len(d) + 1) is trap free, not a spurious ZeroDivisionError.
+    # An empty dict still makes the unguarded 10 // len(d) refutable (len may be 0).
+    assert check("def f(d: dict):\n    return 10 // (len(d) + 1)\n").status == PROVED
+    assert check("def f(d: dict):\n    return 10 // (len(d.keys()) + 1)\n").status == PROVED
+    assert check("def f(d: dict):\n    return 10 // (len(d.values()) + 1)\n").status == PROVED
+    assert check("def f(d: dict):\n    return 10 // (len(d.items()) + 1)\n").status == PROVED
+    assert check("def f(s: set):\n    return 10 // (len(s) + 1)\n").status == PROVED
+    assert check("def f(d: dict):\n    return 10 // len(d)\n").status == REFUTED               # empty dict -> div by zero
     assert check("def f():\n    y = None\n    if y:\n        return y + 1\n    return 0\n").status == PROVED   # None falsy in value engine
     # a dict read d[k] traps (KeyError) unless the key is provably present, for an unannotated parameter the body
     # subscripts with a string key (inferred a dict), an annotation, or a literal; a guard or a prior store proves it
     assert check("def f(d):\n    return d['x']\n").status == REFUTED
     assert check("def f(d):\n    if 'x' in d:\n        return d['x']\n    return 0\n").status == PROVED
     assert check("def f(d: dict):\n    return d['x']\n").status == REFUTED
+    # a read-only dict parameter's d[k] is a fixed function of k, so it is memoized: re-reading the same key gives one
+    # value. A guard `if k in d and d[k] != 0:` then protects a later `10 // d[k]` (once a false REFUTED, the two
+    # reads having been independent fresh values). A genuine trap still refutes -- an unguarded `10 // d[k]`, or
+    # d[k] == 5 then 10 // (d[k] - 5) -- and a name bound once (x = d[k]) was already stable.
+    assert check("def f(d: dict, k):\n    if k in d and d[k] != 0:\n        return 10 // d[k]\n    return 0\n").status == PROVED
+    assert check("def f(d: dict[str, int], k):\n    if k in d and d[k] != 0:\n        return 10 // d[k]\n    return 0\n").status == PROVED
+    assert check("def f(d: dict, k):\n    if k in d:\n        return 10 // d[k]\n    return 0\n").status == REFUTED
+    assert check("def f(d: dict, k):\n    if k in d and d[k] == 5:\n        return 10 // (d[k] - 5)\n    return 0\n").status == REFUTED
+    assert check("def f(d: dict, k):\n    if k in d:\n        x = d[k]\n        if x != 0:\n            return 10 // x\n    return 0\n").status == PROVED
+    # a dict parameter's value type is modeled (dict[K, V] / typing.Dict[K, V]): a read-only dict[str, list] read d[k]
+    # is a stable list, so a len(d[k]) > 0 guard proves d[k][0], an unguarded d[k][0] refutes (it may be empty), and
+    # d[k].append / len(d[k]) decide; dict[str, str] read d[k] is a string (d[k].upper()). A bare dict (no value type)
+    # leaves d[k] opaque, so d[k][0] abstains.
+    assert check("def f(d: dict[str, list], k):\n    if k in d and len(d[k]) > 0:\n        return d[k][0]\n    return 0\n").status == PROVED
+    assert check("def f(d: dict[str, list], k):\n    if k in d:\n        return d[k][0]\n    return 0\n").status == REFUTED
+    assert check("def f(d: dict[str, list], k):\n    if k in d:\n        d[k].append(1)\n    return 0\n").status == PROVED
+    assert check("from typing import Dict, List\ndef f(d: Dict[str, List[int]], k):\n    if k in d and len(d[k]) > 0:\n        return d[k][0]\n    return 0\n").status == PROVED
+    assert check("def f(d: dict[str, str], k):\n    if k in d:\n        return d[k].upper()\n    return 0\n").status == PROVED
+    assert check("def f(d: dict, k):\n    if k in d:\n        return d[k][0]\n    return 0\n").status == UNKNOWN
     # None in arithmetic is a TypeError trap; an `is None` guard that exits or rebinds proves the use safe
     assert check("def f():\n    y = None\n    return y + 1\n").status == REFUTED
     assert check("def f(c):\n    y = None\n    if c:\n        y = 3\n    return y + 1\n").status == REFUTED
@@ -3585,6 +3665,197 @@ def run_self_tests(fast=False):
     assert check("def f(plain: str):\n    return [ord(c) - 96 for c in plain]\n").status == PROVED
     assert check("def f(s: str):\n    for c in s:\n        x = ord(c)\n    return 0\n").status == PROVED
     assert check("def f(s: str):\n    return [10 // (ord(c) - 65) for c in s]\n").status == REFUTED
+    # iterating a bytes / bytearray parameter binds the element to an int in [0, 255] (an arbitrary byte over-
+    # approximates every one), in the loop body, the exact first iteration, and a comprehension. So x + 1 is never
+    # 0 over a byte -- PROVED, where an unconstrained element would FABRICATE a ZeroDivisionError at the impossible
+    # byte == -1 -- x % 16 never traps, while a trap reachable at a real byte value (100 // (x - 5) at byte 5) still
+    # REFUTES (5 is in [0, 255]).
+    assert check("def f(b: bytes):\n    s = 0\n    for x in b:\n        s = s + 1000 // (x + 1)\n    return s\n").status == PROVED
+    assert check("def f(b: bytes):\n    return [1000 // (x + 1) for x in b]\n").status == PROVED
+    assert check("def f(b: bytearray):\n    s = 0\n    for x in b:\n        s = s + 1000 // (x + 1)\n    return s\n").status == PROVED
+    assert check("def f(b: bytes):\n    s = 0\n    for x in b:\n        s = s + 100 // (x - 5)\n    return s\n").status == REFUTED
+    assert check("def f(b: bytes):\n    return [100 // (x - 5) for x in b]\n").status == REFUTED
+    # a sequence literal collapses to a tuple, so list + list (valid) versus tuple + list (TypeError) is undecided:
+    # the value engine abstains rather than fabricate a TypeError -- xs + [1] must never be REFUTED (it once was, a
+    # false refutation of valid list concatenation). A genuinely incompatible right operand still refutes (a scalar /
+    # bytes / set + a list literal), and a sequence times a sequence is the TypeError CPython raises (xs * [1] was
+    # once a false PROVED, a missed TypeError). Repetition by an int and list + list-literal still hold.
+    assert check("def f(xs: list):\n    return xs + [1]\n").status != REFUTED
+    assert check("def f(xs: list):\n    return [1] + xs\n").status != REFUTED
+    assert check("def f(xs: list):\n    return xs * [1]\n").status == REFUTED
+    assert check("def f(xs: list):\n    return [1] * xs\n").status == REFUTED
+    assert check("def f(b: bytes):\n    return b + [1]\n").status == REFUTED
+    assert check("def f(s: set):\n    return s + [1]\n").status == REFUTED
+    assert check("def f():\n    return [1, 2, 3] + 5\n").status == REFUTED
+    assert check("def f():\n    return [0] * 3\n").status == PROVED
+    assert check("def f():\n    return [1] + [2]\n").status == PROVED
+    assert check("def f(n: int):\n    a = [0] * n\n    return len(a)\n").status == PROVED
+    # a list / tuple literal value reassigned across a loop keeps its sequence kind through the havoc (not collapsed
+    # to a fresh int), so a length / index after the loop is modeled rather than abstained on as a non-integer.
+    assert check("def f(n: int):\n    a = (0,)\n    for i in range(n):\n        a = a\n    return len(a)\n").status == PROVED
+    # int.from_bytes(b, byteorder) reads a bytes value as an integer: a correct byteorder literal ('big' / 'little')
+    # is trap free and the unsigned result is non-negative (so it can feed a // (x + 1) safely); a bad byteorder
+    # literal or an unconstrained byteorder parameter refutes (ValueError), a guard on the byteorder proves, and
+    # signed=True drops the non-negativity (a negative result is possible, so // (x + 1) refutes). A non-bytes
+    # first argument (whose elements may not be valid byte values) is declined.
+    assert check("def f(b: bytes):\n    return int.from_bytes(b, 'big')\n").status == PROVED
+    assert check("def f(b: bytes):\n    return int.from_bytes(b, byteorder='little')\n").status == PROVED
+    assert check("def f(b: bytes):\n    return int.from_bytes(b, 'middle')\n").status == REFUTED
+    assert check("def f(b: bytes, bo: str):\n    return int.from_bytes(b, bo)\n").status == REFUTED
+    assert check("def f(b: bytes, bo: str):\n    if bo == 'big' or bo == 'little':\n        return int.from_bytes(b, bo)\n    return 0\n").status == PROVED
+    assert check("def f(b: bytes):\n    x = int.from_bytes(b, 'big')\n    return 1000 // (x + 1)\n").status == PROVED
+    assert check("def f(b: bytes):\n    x = int.from_bytes(b, 'big', signed=True)\n    return 1000 // (x + 1)\n").status == REFUTED
+    assert check("def f(s: str):\n    return int.from_bytes(s, 'big')\n").status == UNKNOWN
+    # int('42') / float('1.5') parse a string literal exactly as CPython does: a valid literal is total and its value
+    # is known (int('42') is 42, float('1.5') is 1.5, float('inf') is the IEEE infinity), while an unparseable literal
+    # (float('abc'), int('0x10') without a base) always raises ValueError. A non-literal string argument stays
+    # UNKNOWN -- the parse cannot be decided symbolically (a str-to-number predicate is not in the theory).
+    assert check("def f():\n    return float('inf')\n").status == PROVED
+    assert check("def f():\n    return 100 // (int('42') - 41)\n").status == PROVED   # int('42') == 42 exactly
+    assert check("def f():\n    x = float('1.5')\n    return 10.0 / (x - 1.5 + 1.0)\n").status == PROVED   # float('1.5') == 1.5
+    assert check("def f():\n    return float('abc')\n").status == REFUTED
+    assert check("def f():\n    return int('0x10')\n").status == REFUTED            # base-10 int() rejects a 0x prefix
+    assert check("def f(s: str):\n    return float(s)\n").status == UNKNOWN
+    # int(str_literal, base) parses with the given base (positional or base=, default 10) -- exactly CPython's parse.
+    # A valid (digits, base) is total with a known value (int('ff', 16) is 255), an invalid digit string or an
+    # out-of-range base (must be 0 or 2..36) raises ValueError. A base= keyword MUST use that base, not 10, so
+    # int('ff', base=16) is valid -- never a false ValueError. A non-literal string or base abstains.
+    assert check("def f():\n    return int('ff', base=16)\n").status == PROVED          # base= keyword, not base 10
+    assert check("def f():\n    return 1000 // (int('ff', 16) - 254)\n").status == PROVED   # int('ff', 16) == 255 exactly
+    assert check("def f():\n    return int('zz', 16)\n").status == REFUTED
+    assert check("def f():\n    return int('5', 37)\n").status == REFUTED               # base out of range (2..36 or 0)
+    assert check("def f(s: str):\n    return int(s, 16)\n").status == UNKNOWN
+    # itertools.chain(a, b, ...) concatenates known sized iterables into one of the summed length (trap free), so
+    # len(list(chain(a, b))) is exactly len(a) + len(b), an index into it past that length refutes (both may be
+    # empty), and a non-sized / possibly non-iterable argument (chain(5, 6)) abstains.
+    assert check("import itertools\ndef f(a: list, b: list):\n    return 10 // (len(list(itertools.chain(a, b))) - len(a) - len(b) + 1)\n").status == PROVED
+    assert check("import itertools\ndef f(a: list, b: list):\n    c = list(itertools.chain(a, b))\n    if len(c) > 0:\n        return c[0]\n    return 0\n").status == PROVED
+    assert check("import itertools\ndef f(a: list, b: list):\n    return list(itertools.chain(a, b))[0]\n").status == REFUTED
+    assert check("import itertools\ndef f():\n    return len(list(itertools.chain(5, 6)))\n").status == UNKNOWN
+    # a = [1, 2, 3]; a[i] = v mutates a list literal in place: a constant in-range index updates the element exactly
+    # (a[0] = 9 then a[0] is 9), a constant out-of-range or an unguarded symbolic index refutes (IndexError), a
+    # guarded symbolic index proves. A tuple literal is NOT mutable -- (1, 2, 3)[0] = v stays a possible TypeError
+    # (UNKNOWN). Exact element reads and unpacking over a list literal are unchanged (the value is a tuple subclass).
+    assert check("def f():\n    a = [1, 2, 3]\n    a[0] = 9\n    return 10 // (a[0] - 8)\n").status == PROVED   # a[0] == 9 exactly
+    assert check("def f(i: int):\n    a = [1, 2, 3]\n    if 0 <= i < 3:\n        a[i] = 9\n    return a[0]\n").status == PROVED
+    assert check("def f(i: int):\n    a = [1, 2, 3]\n    a[i] = 9\n    return 0\n").status == REFUTED
+    assert check("def f():\n    a = [1, 2, 3]\n    a[5] = 9\n    return 0\n").status == REFUTED
+    assert check("def f():\n    a = (1, 2, 3)\n    a[0] = 9\n    return 0\n").status == UNKNOWN          # tuple literal: not mutable
+    assert check("def f():\n    return 10 // ([1, 2, 3][0])\n").status == PROVED                       # exact read preserved
+    assert check("def f():\n    a, b = [1, 2]\n    return 10 // a\n").status == PROVED                 # unpacking preserved
+    # reversed(seq): an indexable sized sequence gives a NEW sequence of the same length (trap free), so
+    # len(list(reversed(xs))) is exactly len(xs) and an unguarded index into it refutes (it may be empty); reversed
+    # bytes yields ints in [0, 255]. A set / frozenset is NOT reversible -- reversed(s) refutes (TypeError, once a
+    # false PROVED) and list(reversed(s)) never proves; a str / bytes / dict (3.8+) is reversible.
+    assert check("def f(xs: list):\n    return 10 // (len(list(reversed(xs))) - len(xs) + 1)\n").status == PROVED
+    assert check("def f(xs: list):\n    r = list(reversed(xs))\n    if len(r) > 0:\n        return r[0]\n    return 0\n").status == PROVED
+    assert check("def f(xs: list):\n    return list(reversed(xs))[0]\n").status == REFUTED
+    assert check("def f(s: set):\n    return reversed(s)\n").status == REFUTED                  # a set is not reversible
+    assert check("def f(s: set):\n    return list(reversed(s))\n").status != PROVED             # never a false PROVED
+    assert check("def f(b: bytes):\n    s = 0\n    for x in reversed(b):\n        s = s + 1000 // (x + 1)\n    return s\n").status == PROVED
+    assert check("def f(d: dict):\n    return reversed(d)\n").status == PROVED                  # dict reversible (3.8+)
+    # operator.add(a, b) / operator.lt(a, b) / operator.neg(a) mirror the Python operator exactly, reusing its
+    # semantics and traps: operator.add(a, b) is a + b (exactly), operator.floordiv(a, b) is a ZeroDivisionError when
+    # b is 0 (an unguarded divisor refutes, a b != 0 guard proves), operator.lt returns a bool, operator.neg(x) is
+    # -x. A non-operator helper (itemgetter) is not mapped and abstains.
+    assert check("import operator\ndef f(a: int, b: int):\n    return 10 // (operator.add(a, b) - a - b + 1)\n").status == PROVED
+    assert check("import operator\ndef f(x: int):\n    return 10 // (operator.neg(x) + x + 1)\n").status == PROVED
+    assert check("import operator\ndef f(a: int, b: int):\n    return operator.floordiv(a, b)\n").status == REFUTED
+    assert check("import operator\ndef f(a: int, b: int):\n    if b != 0:\n        return operator.floordiv(a, b)\n    return 0\n").status == PROVED
+    assert check("import operator\ndef f(a: int, b: int):\n    return 1 if operator.lt(a, b) else 0\n").status == PROVED
+    assert check("import operator\ndef f(xs: list):\n    return operator.itemgetter(0)(xs)\n").status == UNKNOWN
+    # bytes.fromhex(s) / bytearray.fromhex(s) parses a hex string literal exactly as CPython does: a valid hex string
+    # (interleaved whitespace allowed) gives a byteslike value of half its non-space length whose elements are bytes
+    # in [0, 255], an odd-length or non-hex literal always raises ValueError. A non-literal argument abstains.
+    assert check("def f():\n    return 10 // (len(bytes.fromhex('dead')) - 1)\n").status == PROVED   # len == 2 exactly
+    assert check("def f():\n    return bytes.fromhex('zz')\n").status == REFUTED
+    assert check("def f():\n    return bytes.fromhex('abc')\n").status == REFUTED                    # odd length
+    assert check("def f():\n    s = 0\n    for x in bytes.fromhex('cafe'):\n        s = s + 1000 // (x + 1)\n    return s\n").status == PROVED
+    assert check("def f():\n    return bytes.fromhex('')[0]\n").status == REFUTED                    # empty -> IndexError
+    assert check("def f(s: str):\n    return bytes.fromhex(s)\n").status == UNKNOWN
+    # math.isclose(a, b) -> a bool, total over numbers with the default tolerances (so an if math.isclose(...) branch
+    # decides). The two values must be numeric -- a str / list argument abstains -- and a rel_tol / abs_tol keyword
+    # (a possible negative-tolerance ValueError) is declined. The bool is 0/1, so 10 // math.isclose(a, b) refutes
+    # (isclose can be False, i.e. 0 -- a real ZeroDivisionError).
+    assert check("import math\ndef f(a: float, b: float):\n    return 1 if math.isclose(a, b) else 0\n").status == PROVED
+    assert check("import math\ndef f(a: float, b: float):\n    x = 1 if math.isclose(a, b) else 2\n    return 10 // x\n").status == PROVED
+    assert check("import math\ndef f(a: float, b: float):\n    return 10 // math.isclose(a, b)\n").status == REFUTED
+    assert check("import math\ndef f(s: str, b: float):\n    return 1 if math.isclose(s, b) else 0\n").status == UNKNOWN
+    assert check("import math\ndef f(a: float, b: float):\n    return 1 if math.isclose(a, b, rel_tol=0.1) else 0\n").status == UNKNOWN
+    # zip(a, b, ...) stops at the SHORTEST argument, so list(zip(...)) has the minimum length of its sized arguments
+    # (trap free; a for-loop over it still havocs the targets, including a tuple target). An unguarded index into it
+    # refutes (it may be empty); its elements are opaque tuples, so a deep index z[0][0] abstains.
+    assert check("def f(a: list, b: list):\n    n = len(list(zip(a, b)))\n    if n <= len(a):\n        return 1\n    return 10 // 0\n").status == PROVED
+    assert check("def f(a: list, b: list):\n    return list(zip(a, b))[0]\n").status == REFUTED
+    assert check("def f(a: list, b: list):\n    s = 0\n    for x, y in zip(a, b):\n        s = 1\n    return s\n").status == PROVED
+    assert check("def f(a: list, b: list):\n    z = list(zip(a, b))\n    if len(z) > 0:\n        return z[0][0]\n    return 0\n").status == UNKNOWN
+    # itertools.repeat(x, count) yields max(count, 0) copies, so list(repeat(x, n)) has length max(n, 0): an unguarded
+    # index refutes (n may be 0), an n >= 1 guard proves, and it composes with chain (chain(repeat(x, 3), ys) has
+    # length 3 + len(ys)). repeat(x) without a count is infinite and abstains.
+    assert check("import itertools\ndef f(x: int):\n    return 10 // (len(list(itertools.repeat(x, 5))) - 4)\n").status == PROVED   # len == 5 exactly
+    assert check("import itertools\ndef f(x: int, n: int):\n    return list(itertools.repeat(x, n))[0]\n").status == REFUTED
+    assert check("import itertools\ndef f(x: int, n: int):\n    if n >= 1:\n        return list(itertools.repeat(x, n))[0]\n    return 0\n").status == PROVED
+    assert check("import itertools\ndef f(x: int, ys: list):\n    return 10 // (len(list(itertools.chain(itertools.repeat(x, 3), ys))) - len(ys) - 2)\n").status == PROVED
+    assert check("import itertools\ndef f(x: int):\n    return len(list(itertools.repeat(x)))\n").status == UNKNOWN
+    # itertools.islice(it, stop) takes the first `stop` elements (stop=None -> all), so for a sized iterable
+    # list(islice(it, n)) has length min(len(it), n) when n is a non-negative int: an unguarded n refutes (a negative
+    # stop is a ValueError), an n >= 0 guard proves, and stop=None gives len(it). A non-sized iterable abstains.
+    assert check("import itertools\ndef f(xs: list):\n    m = len(list(itertools.islice(xs, 3)))\n    if m <= 3 and m <= len(xs):\n        return 1\n    return 10 // 0\n").status == PROVED
+    assert check("import itertools\ndef f(xs: list, n: int):\n    return len(list(itertools.islice(xs, n)))\n").status == REFUTED
+    assert check("import itertools\ndef f(xs: list, n: int):\n    if n >= 0:\n        return len(list(itertools.islice(xs, n)))\n    return 0\n").status == PROVED
+    assert check("import itertools\ndef f(xs: list):\n    return 10 // (len(list(itertools.islice(xs, None))) - len(xs) + 1)\n").status == PROVED
+    assert check("import itertools\ndef f(xs: list):\n    return len(list(itertools.islice((y for y in xs), 3)))\n").status == UNKNOWN
+    # struct.calcsize(fmt) for a string LITERAL is exactly CPython's byte size of the format (struct.calcsize('>I')
+    # is 4, '>2I' is 8); an invalid format literal always raises struct.error. A non-literal format abstains.
+    assert check("import struct\ndef f():\n    return 10 // (struct.calcsize('>I') - 3)\n").status == PROVED   # == 4 exactly
+    assert check("import struct\ndef f():\n    return struct.calcsize('zzz')\n").status == REFUTED
+    assert check("import struct\ndef f(fmt: str):\n    return struct.calcsize(fmt)\n").status == UNKNOWN
+    # math.log(x, base) (two-argument) = log(x)/log(base): a ValueError when x <= 0 or base <= 0, a ZeroDivisionError
+    # when base == 1 -- so an unguarded call refutes (CPython: log(-1, 2) is ValueError, log(10, 1) is
+    # ZeroDivisionError), and a guard (x > 0, base > 0, base != 1) proves. A non-numeric argument abstains.
+    assert check("import math\ndef f(x: float):\n    return math.log(x, 2.0)\n").status == REFUTED
+    assert check("import math\ndef f(x: float):\n    if x > 0.0:\n        return math.log(x, 2.0)\n    return 0.0\n").status == PROVED
+    assert check("import math\ndef f():\n    return math.log(10.0, 1.0)\n").status == REFUTED   # base == 1: ZeroDivisionError
+    assert check("import math\ndef f(x: float, b: float):\n    if x > 0.0 and b > 0.0 and b != 1.0:\n        return math.log(x, b)\n    return 0.0\n").status == PROVED
+    assert check("import math\ndef f(s: str):\n    return math.log(s, 2.0)\n").status == UNKNOWN
+    # itertools.zip_longest(a, b, ...) pads to the LONGEST argument (the dual of zip), so list(zip_longest(...)) has
+    # the MAXIMUM length of its sized arguments (trap free; a for-loop still havocs the targets). An unguarded index
+    # refutes (both may be empty); a fillvalue keyword is benign; a non-sized argument abstains.
+    assert check("import itertools\ndef f(a: list, b: list):\n    m = len(list(itertools.zip_longest(a, b)))\n    if m >= len(a) and m >= len(b):\n        return 1\n    return 10 // 0\n").status == PROVED
+    assert check("import itertools\ndef f(a: list, b: list):\n    return list(itertools.zip_longest(a, b))[0]\n").status == REFUTED
+    assert check("import itertools\ndef f(a: list, b: list):\n    s = 0\n    for x, y in itertools.zip_longest(a, b):\n        s = 1\n    return s\n").status == PROVED
+    assert check("import itertools\ndef f(a: list):\n    return len(list(itertools.zip_longest(a, (y for y in a))))\n").status == UNKNOWN
+    # itertools.product(a, b, ...) is the cartesian product, so list(product(...)) has length equal to the PRODUCT of
+    # the argument lengths (product() with no args is the single empty tuple, length 1). A guarded index proves, an
+    # unguarded one refutes (a factor may be empty); a non-sized argument abstains.
+    assert check("import itertools\ndef f(a: list, b: list):\n    return 10 // (len(list(itertools.product(a, b))) + 1)\n").status == PROVED
+    assert check("import itertools\ndef f():\n    return 10 // (len(list(itertools.product())) - 0)\n").status == PROVED   # length 1
+    assert check("import itertools\ndef f(a: list, b: list):\n    return list(itertools.product(a, b))[0]\n").status == REFUTED
+    assert check("import itertools\ndef f(a: list, b: list):\n    p = list(itertools.product(a, b))\n    if len(p) > 0:\n        return p[0]\n    return 0\n").status == PROVED
+    assert check("import itertools\ndef f(xs: list):\n    return len(list(itertools.product(xs, (y for y in xs))))\n").status == UNKNOWN
+    # bytes(n) / bytearray(n) builds n zero bytes: a negative count is a ValueError (an unguarded count refutes, an
+    # n >= 0 guard proves), and the result is a byteslike sequence of length n whose elements are valid bytes in
+    # [0, 255] (so iterating it and dividing by element + 1 is safe). bytes()/bytearray() is empty; bytes(b) copies a
+    # bytes value at equal length. A str argument (which needs an encoding) is declined.
+    assert check("def f(n: int):\n    return bytes(n)\n").status == REFUTED
+    assert check("def f(n: int):\n    if n >= 0:\n        return bytes(n)\n    return b''\n").status == PROVED
+    assert check("def f(n: int):\n    if n >= 0:\n        return bytearray(n)\n    return bytearray()\n").status == PROVED
+    assert check("def f():\n    return 10 // (len(bytes()) + 1)\n").status == PROVED
+    assert check("def f(b: bytes):\n    c = bytes(b)\n    return 10 // (len(c) - len(b) + 1)\n").status == PROVED
+    assert check("def f(n: int):\n    if n >= 0:\n        s = 0\n        for x in bytearray(n):\n            s = s + 1000 // (x + 1)\n        return s\n    return 0\n").status == PROVED
+    assert check("def f(s: str):\n    return bytes(s)\n").status == UNKNOWN
+    # n.to_bytes(length, byteorder[, signed=]) writes an int to `length` bytes: for a CONSTANT length L it is total
+    # iff n fits (unsigned 0 <= n < 256**L, signed -(256**L)//2 <= n < (256**L)//2), else OverflowError -- so an
+    # unguarded n refutes and a tight range guard proves, exactly at the boundary (255 fits one byte, 256 does not;
+    # signed one byte is [-128, 127]). A bad byteorder literal refutes (ValueError); the result has length L. A
+    # symbolic length is declined (256**length is not a concrete bound).
+    assert check("def f(n: int):\n    return n.to_bytes(4, 'big')\n").status == REFUTED
+    assert check("def f(n: int):\n    if 0 <= n and n <= 255:\n        return n.to_bytes(1, 'big')\n    return b''\n").status == PROVED
+    assert check("def f(n: int):\n    if 0 <= n and n <= 256:\n        return n.to_bytes(1, 'big')\n    return b''\n").status == REFUTED
+    assert check("def f(n: int):\n    if -128 <= n and n <= 127:\n        return n.to_bytes(1, 'big', signed=True)\n    return b''\n").status == PROVED
+    assert check("def f(n: int):\n    if 0 <= n and n < 256:\n        b = n.to_bytes(4, 'big')\n        return 10 // (len(b) - 4 + 1)\n    return 0\n").status == PROVED
+    assert check("def f(n: int):\n    if 0 <= n and n < 256:\n        return n.to_bytes(1, 'middle')\n    return b''\n").status == REFUTED
+    assert check("def f(n: int, L: int):\n    return n.to_bytes(L, 'big')\n").status == UNKNOWN
 
     # sys.exit / exit() / quit() terminate the path (SystemExit is an intentional exit, not a modeled crash), so a
     # trap on a path the exit guards proves; a module name shadowed by a parameter is not the real sys.exit.
@@ -4486,6 +4757,19 @@ def run_self_tests(fast=False):
     assert _use_before_def("def f(e):\n    x: int\n    if e:\n        x = 1\n    return x\n") == ["x"]      # bare ann, conditional
     assert _use_before_def("def f():\n    x += 1\n    return x\n") == ["x"]                              # aug on unbound
     assert check("def f(b: int, e: int):\n    res: int = 1\n    while e > 0:\n        if e & 1:\n            res = res + b\n        e = e - 1\n    return res\n", target="f").status == PROVED
+    # a name bound only inside a loop body is definite after the loop when the loop provably runs at least once: a
+    # constant range (for i in range(10), which desugars to a counter-while whose test is true at entry) or a
+    # non-empty literal iterable (for c in 'abc'), even when each body path binds it differently (every-branch). It
+    # stays a possible use-before-assignment when the loop may run zero times (a symbolic range / iterable), when a
+    # continue could loop back before the binding, or when only some branch binds it.
+    assert _use_before_def("def f():\n    for i in range(10):\n        y = i\n    return y\n") == []
+    assert _use_before_def("def f():\n    for c in 'abc':\n        y = c\n    return y\n") == []
+    assert _use_before_def("def f(n):\n    for i in range(n):\n        y = i\n    return y\n") == ["y"]
+    assert _use_before_def("def f(c):\n    for i in range(10):\n        if c:\n            continue\n        y = i\n    return y\n") == ["y"]
+    assert check("def f():\n    for i in range(10):\n        y = i\n    return y\n", target="f").status == PROVED
+    assert check("def f():\n    for i in range(10):\n        if i > 5:\n            y = 1\n        else:\n            y = 2\n    return y\n", target="f").status == PROVED
+    assert check("def f(n: int):\n    for i in range(n):\n        y = i\n    return y\n", target="f").status == UNKNOWN
+    assert check("def f():\n    for i in range(10):\n        if i > 5:\n            y = i\n    return y\n", target="f").status == UNKNOWN
 
     # model_cross_check now requires an INDEPENDENT translation (distinct division encoding)
     assert _independent_claim("def f(a):\n    return a // 3\n", "def f(a):\n    return a // 3\n", {}) is not None
@@ -5078,7 +5362,7 @@ def run_self_tests(fast=False):
     assert check("def f(x: int, y: int):\n    if y >= 0:\n        return (x ** y) + 1\n    return 0\n", target="f").status == PROVED
     assert check("def f(x: int, y: int):\n    if y >= 0:\n        return pow(x, y)\n    return 0\n", target="f").status == PROVED
     assert check("def f(b: int, e: int, m: int):\n    if e >= 0 and m != 0:\n        return (b ** e) % m\n    return 0\n", target="f").status == PROVED
-    assert check("def f(x: int, y: int):\n    return x ** y\n", target="f").status == UNKNOWN       # unguarded: 0**-1 over-approx, abstains
+    assert check("def f(x: int, y: int):\n    return x ** y\n", target="f").status == REFUTED       # unguarded: 0 ** -1 is a ZeroDivisionError (exact-operand trap)
     assert check("def f(x: int):\n    return x ** 3\n", target="f").status == PROVED                 # constant exponent: exact path kept
     assert prove("def f(x: int):\n    return x ** 2\n", "result == x * x", target="f").status == PROVED  # constant: still exact
     # variable-exponent x ** y reasons in prove via the power axioms; pow routes the same.
@@ -5093,6 +5377,24 @@ def run_self_tests(fast=False):
     _vvar = prove("def f(x, y):\n    if y >= 1:\n        return x ** y\n    return 1\n", "result >= x",
                   requires="x >= 1", target="f")
     assert _vvar.status == UNKNOWN and "variable exponent" in _vvar.reason, _vvar
+    # trap freedom of a variable-exponent power: the only trap is 0 ** (negative) (a ZeroDivisionError), modeled
+    # exactly on the operands -- so an unguarded x ** n refutes (x=0, n=-1) and an x != 0 or n >= 0 guard proves, even
+    # though the RESULT value is over-approximated. A nested over-approximated base ((a ** b) ** n) does NOT fabricate
+    # a refutation (its operands are not exact); a divisor built from the over-approximated result stays UNKNOWN.
+    assert check("def f(x: int, n: int):\n    return x ** n\n", target="f").status == REFUTED
+    assert check("def f(n: int):\n    return 0 ** n\n", target="f").status == REFUTED
+    assert check("def f(x: int, n: int):\n    if x != 0:\n        return x ** n\n    return 0\n", target="f").status == PROVED
+    assert check("def f(x: int, n: int):\n    if n >= 0:\n        return x ** n\n    return 0\n", target="f").status == PROVED
+    assert check("def f(n: int):\n    return 2 ** n\n", target="f").status == PROVED
+    assert check("def f(a: int, b: int, n: int):\n    if a >= 1 and n >= 0:\n        y = a ** b\n        return y ** n\n    return 0\n", target="f").status == PROVED
+    assert check("def f(x: int, n: int):\n    if x != 0:\n        return 10 // (x ** n + 1)\n    return 0\n", target="f").status == UNKNOWN
+    # a float accumulator that crosses a loop keeps its float kind through the havoc (not collapsed to an int), so a
+    # later float-only operation is modeled correctly: a bitwise x & 1 / x | 1 (a TypeError on a float) is no longer a
+    # false PROVED (it abstains, the float bitwise op being unmodeled), while a safe float op (x + 2.0 / x * 2.0) proves.
+    assert check("def f(n: int):\n    x = 1.5\n    for i in range(n):\n        x = x + 1.0\n    return x & 1\n", target="f").status != PROVED
+    assert check("def f(n: int):\n    x = 1.5\n    for i in range(n):\n        x = x + 1.0\n    return x | 1\n", target="f").status != PROVED
+    assert check("def f(n: int):\n    x = 1.5\n    for i in range(n):\n        x = x + 1.0\n    return x + 2.0\n", target="f").status == PROVED
+    assert check("def f(n: int):\n    x = 0.0\n    for i in range(n):\n        x = x + 1.0\n    return x * 2.0\n", target="f").status == PROVED
     # variable bit-shift x << k / x >> k: a negative count is a ValueError and the value is over-approximated, so
     # a k >= 0 guard proves trap freedom while the unguarded shift abstains (like x ** y); a constant shift stays exact.
     assert check("def f(x: int, k: int):\n    if k >= 0:\n        return x << k\n    return 0\n", target="f").status == PROVED
@@ -5714,9 +6016,16 @@ def run_self_tests(fast=False):
     # sorted(it) and list(it) build a NEW same-length indexable list, so sorted(nums)[0] / list(xs)[i] bounds-
     # check against the iterable's length: guarded by len it proves, an
     # unguarded index refutes, and the whole sort-then-median idiom decides. An opaque (possibly non-iterable)
-    # argument and a key=/reverse= keyword are declined.
+    # argument and a key= keyword are declined; reverse= changes order only and is accepted.
     assert check("def f(nums: list):\n    if len(nums) > 0:\n        return sorted(nums)[0]\n    return 0\n", target="f").status == PROVED
     assert check("def f(nums: list):\n    return sorted(nums)[0]\n", target="f").status == REFUTED                   # may be empty
+    # sorted(it, reverse=bool) is the same sized container as sorted(it) -- reverse changes order only, never the
+    # length or whether it raises -- so it decides exactly like the unkeyed sort (a guarded index proves, an unguarded
+    # one refutes on the empty list); a param flag is trap-checked. A key= callable still abstains, even beside reverse=.
+    assert check("def f(xs: list):\n    if len(xs) > 0:\n        return sorted(xs, reverse=True)[0]\n    return 0\n", target="f").status == PROVED
+    assert check("def f(xs: list):\n    return sorted(xs, reverse=True)[0]\n", target="f").status == REFUTED
+    assert check("def f(xs: list, r):\n    return len(sorted(xs, reverse=r))\n", target="f").status == PROVED
+    assert check("def f(xs: list):\n    return len(sorted(xs, key=abs, reverse=True))\n", target="f").status == UNKNOWN
     assert check("def f(xs: list, i: int):\n    c = list(xs)\n    if 0 <= i < len(c):\n        return c[i]\n    return 0\n", target="f").status == PROVED
     assert check("def f(n: int, i: int):\n    c = list(range(n))\n    if 0 <= i < n:\n        return c[i]\n    return 0\n", target="f").status == PROVED
     assert check("def f(nums: list):\n    s = sorted(nums)\n    n = len(s)\n    if n == 0:\n        return 0\n    if n % 2 == 1:\n        return s[n // 2]\n    return (s[n // 2 - 1] + s[n // 2]) / 2\n", target="f").status == PROVED   # the median idiom
@@ -7385,6 +7694,25 @@ def run_self_tests(fast=False):
     assert check(_to + "def f():\n    return torch.where(torch.zeros(2, 3) > 0, torch.zeros(2, 3), torch.ones(2, 3))[0, 0]\n", target="f").status == PROVED
     assert check(_to + "def f():\n    return torch.zeros(2, 3).softmax(1).cumsum(0).sum()\n", target="f").status == PROVED
     assert check(_to + "def f():\n    a = torch.zeros(5)\n    return a.nonzero()\n", target="f").status == PROVED   # data-dependent shape: opaque, trap free
+    # an elementwise activation / unary-math FUNCTION (torch.relu(x), F.gelu(x)) on a bare, un-annotated tensor
+    # parameter is trap free even without a tracked shape -- it matches the x.relu() method form, and takes no axis
+    # or shape argument that could be out of range. A dim-taking op (softmax(dim=...)), a shape-changing layer
+    # (reshape / linear / layer_norm), or a reduction stays UNKNOWN on an opaque arg (its dim / shape may not be
+    # valid); a trap inside an argument expression is still caught.
+    _tf = "import torch\nimport torch.nn.functional as F\n"
+    assert check(_tf + "def f(x):\n    return torch.relu(x)\n", target="f").status == PROVED
+    assert check(_tf + "def f(x):\n    return torch.sigmoid(x)\n", target="f").status == PROVED
+    assert check(_tf + "def f(x):\n    return F.relu(x)\n", target="f").status == PROVED
+    assert check(_tf + "def f(x):\n    return F.gelu(x)\n", target="f").status == PROVED
+    assert check(_tf + "def f(x):\n    return F.silu(x)\n", target="f").status == PROVED
+    assert check(_tf + "def f(x):\n    return F.leaky_relu(x)\n", target="f").status == PROVED
+    assert check(_tf + "def f(x):\n    return torch.relu(x).sum()\n", target="f").status == PROVED
+    assert check(_tf + "def f(x, k: int):\n    return F.dropout(x, 10 // k)\n", target="f").status == REFUTED  # arg trap caught
+    assert check(_tf + "def f(x):\n    return torch.softmax(x, dim=5)\n", target="f").status == UNKNOWN     # dim may be OOB
+    assert check(_tf + "def f(x):\n    return torch.reshape(x, (2, 3))\n", target="f").status == UNKNOWN    # size may mismatch
+    assert check(_tf + "def f(x, w):\n    return F.linear(x, w)\n", target="f").status == UNKNOWN
+    # a unary-math name (sqrt / abs) is excluded from the activation fallback so it reaches its scalar model:
+    assert prove("import numpy as np\ndef f(x):\n    return np.abs(x)\n", "result >= 0").status == PROVED
     # numpy reuses the same shape algebra (matmul / concatenate / where); the scalar np.abs / np.sqrt models still apply.
     assert check(_np + "def f():\n    return np.zeros((2, 3)) @ np.zeros((3, 4))\n", target="f").status == PROVED
     assert check(_np + "def f():\n    return np.zeros((2, 3)) @ np.zeros((9, 4))\n", target="f").status == REFUTED

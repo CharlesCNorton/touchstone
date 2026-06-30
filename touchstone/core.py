@@ -749,9 +749,19 @@ _CMP = {
     ast.Eq: lambda a, b: a == b, ast.NotEq: lambda a, b: a != b,
 }
 
+# operator-module functions that mirror a Python operator: each is modeled by re-evaluating the corresponding
+# BinOp / UnaryOp / Compare (operator.add(a, b) == a + b), reusing the existing operator semantics and their traps.
+_OPERATOR_BINOP = {"add": ast.Add, "sub": ast.Sub, "mul": ast.Mult, "truediv": ast.Div, "floordiv": ast.FloorDiv,
+                   "mod": ast.Mod, "pow": ast.Pow, "lshift": ast.LShift, "rshift": ast.RShift, "and_": ast.BitAnd,
+                   "or_": ast.BitOr, "xor": ast.BitXor, "matmul": ast.MatMult}
+_OPERATOR_UNARY = {"neg": ast.USub, "pos": ast.UAdd, "invert": ast.Invert, "inv": ast.Invert, "not_": ast.Not}
+_OPERATOR_CMP = {"lt": ast.Lt, "le": ast.LtE, "eq": ast.Eq, "ne": ast.NotEq, "gt": ast.Gt, "ge": ast.GtE,
+                 "is_": ast.Is, "is_not": ast.IsNot}
+
 
 _F64 = z3.Float64()
 import math as _math
+import struct as _struct
 # math module float constants, exact as IEEE-754 doubles: math.pi / math.e / math.tau / math.inf / math.nan,
 # and the same bare names under `from math import pi`. Reading one never traps, so arithmetic over it is modeled.
 _MATH_CONSTS = {"pi": z3.FPVal(_math.pi, _F64), "e": z3.FPVal(_math.e, _F64), "tau": z3.FPVal(_math.tau, _F64),
@@ -853,6 +863,14 @@ class _NoneVal(_Opaque):
     def __init__(self): super().__init__("None")
 
 
+class _ListLit(tuple):
+    """A list literal value -- a tuple of its element terms, so every existing tuple handling (indexing, unpacking,
+    concatenation, sum, len) applies unchanged, but distinguished from a genuine tuple literal so that in-place item
+    assignment a[i] = v is a bounds-checked mutation rather than a TypeError. (A tuple literal stays a plain tuple,
+    whose item assignment is the TypeError it is in CPython.)"""
+    __slots__ = ()
+
+
 class _SafeContainer(_Opaque):
     """A parameter inferred or annotated as a sequence: iteration and len on it raise no trap and its
     elements are arbitrary integers. An integer index c[i] is bounds-checked against c's symbolic length
@@ -884,8 +902,13 @@ class _SetExpr(_SafeContainer):
 class _DictParam(_Opaque):
     """A parameter annotated `dict`: a read d[k] traps (KeyError) unless k is provably a key, tracked by a
     stable membership predicate so a `k in d` guard or a `for k in d` iteration makes d[k] safe. A store
-    d[k] = v never traps (a dict accepts any key). The oracle samples it as a real dict."""
-    __slots__ = ()
+    d[k] = v never traps (a dict accepts any key). The oracle samples it as a real dict. `valproto` is a
+    prototype of the annotated value type (dict[K, V]); for a read-only dict, a read d[k] is modeled as a fresh
+    V-typed value (memoized per key) so d[k][i] / d[k].append / len(d[k]) decide rather than staying opaque."""
+    __slots__ = ("valproto",)
+    def __init__(self, name, valproto=None):
+        super().__init__(name)
+        self.valproto = valproto
 
 
 class _DictLit(_Opaque):
@@ -941,10 +964,17 @@ class _MapVal(_Opaque):
 
 
 class _StrSeq(_Opaque):
-    """The result of str.split / rsplit / splitlines: a list of strings of statically-unknown length. Its
-    length is a nonnegative integer (a sound over-approximation), so len() is modeled; other operations on
-    it stay UNKNOWN."""
-    __slots__ = ()
+    """A sequence of strings: the result of str.split / rsplit / splitlines, or a map(str, ...) / map(repr, ...) over
+    an iterable. `length` is its (nonnegative) symbolic length -- >= 1 for split / rsplit with a non-empty separator
+    (which always yields at least the whole string), unconstrained for split() on whitespace or splitlines (which can
+    be empty). len() reads it; an index returns a fresh string, bounds-checked against it, so s.split(sep)[0] /
+    s.rsplit(sep)[-1] decide. `unsized` marks a lazy map iterator: sep.join(it) is a trap-free string (every part is
+    a string), but len(it) is the TypeError CPython raises and it is not subscriptable, so both are withheld."""
+    __slots__ = ("length", "unsized")
+    def __init__(self, name, length=None, unsized=False):
+        super().__init__(name)
+        self.length = length
+        self.unsized = unsized
 
 
 def _cx(v):
@@ -1595,18 +1625,27 @@ def _str_call(meth, s, a, ctx, kwnames=None):
     if meth == "join" and len(a) == 1 and isinstance(a[0], _StrSeq):    # sep.join(a string sequence, e.g. a split
         return z3.FreshConst(z3.StringSort(), "joined")                 # result): a string result, trap free (the
         #                                                                 parts are strings, so no TypeError)
-    if meth in ("split", "rsplit"):                                  # a list of strings of unknown length
-        if not a:                                                    # s.split(): split on whitespace, no trap
-            return _StrSeq("split")
+    if meth in ("split", "rsplit"):                                  # a list of strings
+        if not a:                                                    # s.split(): split on whitespace -- CAN be empty
+            k = z3.FreshInt("splitlen")                              # ('  '.split() == []), so its length is only >= 0
+            if ctx.facts is not None:
+                ctx.facts.append(k >= 0)
+            return _StrSeq("split", length=k)
         if 1 <= len(a) <= 2 and _is_str(a[0]):                       # s.split(sep[, maxsplit]): empty sep raises
             if ctx.traps is not None:
                 ctx.traps.append(z3.And(ctx.pc, z3.Length(a[0]) == 0))   # ValueError on an empty separator
             if len(a) == 2:
                 _as_int(a[1])                                        # maxsplit is trap-checked
-            return _StrSeq("split")
+            k = z3.FreshInt("splitlen")                              # a non-empty separator yields >= 1 part (the whole
+            if ctx.facts is not None:                                # string if absent), so split(sep)[0] / [-1] decide
+                ctx.facts.append(k >= 1)
+            return _StrSeq("split", length=k)
         return None
     if meth == "splitlines" and len(a) <= 1:
-        return _StrSeq("splitlines")
+        k = z3.FreshInt("splitlen")                                  # splitlines() of '' is [] -- only >= 0
+        if ctx.facts is not None:
+            ctx.facts.append(k >= 0)
+        return _StrSeq("splitlines", length=k)
     if meth == "format" and z3.is_string_value(s):           # a literal format string: sound over-approximation
         return _str_format(s.as_string(), a, ctx, kwnames)   # (a non-literal receiver / format_map stays UNKNOWN)
     if meth == "encode" and not a and z3.is_expr(s) and s.sort() == z3.StringSort() and ctx.facts is not None:
@@ -1652,10 +1691,16 @@ def _as_bool(x, ctx=None):
     if isinstance(x, _NoneVal):                              # None is always falsy: `if d.get(k):` / `x or default`
         return z3.BoolVal(False)                             # guard a possibly-None value (the value engine's own None,
         #                                                       beyond the literal-None cases the None engine catches)
+    if isinstance(x, _StrSeq) and not x.unsized and x.length is not None:
+        return x.length != 0                                 # a sized string sequence (a split result) is truthy iff
+        #                  non-empty, tied to the same length its [i] bounds check uses -- so `if parts: parts[0]`
+        #                  proves (an unsized map / generator iterator is always truthy, so it falls through below)
     if isinstance(x, _SafeContainer):                        # a sequence is truthy iff non-empty: tie `if c:` /
-        return z3.Int("len_" + x.name) != 0                  # `if not c:` to the same length the c[i] / min(c)
-        #                  bounds check uses (its len >= 0 fact is registered by that use), so an emptiness guard
-        #                  written as truthiness -- not only `len(c) > 0` -- proves the guarded access safe
+        n = x.length if getattr(x, "length", None) is not None else z3.Int("len_" + x.name)
+        return n != 0                                        # `if not c:` to the SAME length the c[i] / min(c) bounds
+        #                  check uses -- the explicit length of a comprehension / split result, else the by-name
+        #                  length of a parameter -- so an emptiness guard written as truthiness (not only len(c) > 0)
+        #                  proves the guarded access safe (a list-comprehension's len term is explicit, not len_<name>)
     if isinstance(x, _NdArray):                              # bool(ndarray / Series) is a ValueError for more than one
         raise Unsupported("truth value of an array is ambiguous "   # element (numpy/pandas), so its truthiness is not
                           "(use .any() / .all() or a size check)")  # a benign bool -- abstain rather than over-approximate
@@ -2070,6 +2115,8 @@ class Ctx:
         # UNKNOWN rather than REFUTED on a satisfiable query (the axioms do not pin the value).
         self.facts: Optional[List[z3.ExprRef]] = None
         self.exact_traps: Optional[List[z3.ExprRef]] = None   # precise first-iteration loop traps (refutable under havoc)
+        self.hard_traps: Optional[List[z3.ExprRef]] = None    # exact traps refutable even under the value over-approx
+        #                                                       (0 ** negative, when the operands are not themselves over-approximated)
         self.overapprox: bool = False
         self.overapprox_reason: Optional[str] = None          # provenance: the operation and line where the first
         self._cur_line: Optional[int] = None                  # over-approximation was introduced (for the UNKNOWN reason)
@@ -2086,6 +2133,8 @@ class Ctx:
         #                                                       fresh int, which would mask a real None-trap, so
         #                                                       a PROVED from that over-approximation is withheld
         self.tracked_dicts: frozenset = frozenset()          # local names modeled as value-engine dicts (per symexec)
+        self.readonly_dicts: frozenset = frozenset()         # dict params provably never mutated: d[k] is memoized so
+        self.dval_cache: dict = {}                           # re-reading one key gives one value (per symexec run)
         self.mutate_once: frozenset = frozenset()            # container names mutated by exactly one .pop()/.remove()
         self.numeric_params: frozenset = frozenset()         # params annotated int/float/bool: a method on one is
         #                                                      an AttributeError, not an opaque-safe call (per symexec)
@@ -2696,7 +2745,9 @@ def _torch_func(name, node, env, ctx):
         return _Opaque(name)                                 # data-dependent shape: trap-free, opaque
     if args and isinstance(args[0], _NdArray):               # a tensor-first function reuses the method model
         return _nd_method(args[0], name, args[1:], node, env, ctx)
-    return None
+    if name in _NN_ACTIVATION_TRAPFREE:                       # an activation on a tensor whose shape is not tracked:
+        return _Opaque(name)                                 # shape-opaque but always trap free (a unary-math name
+    return None                                              # is excluded so it reaches its scalar model instead)
 
 
 # torch.nn.functional layers that preserve the input shape (elementwise activations and normalization). The
@@ -2709,6 +2760,18 @@ _F_SHAPE_PRESERVING = frozenset({
     "batch_norm", "group_norm", "instance_norm", "local_response_norm", "normalize", "rms_norm",
 })
 
+# torch.nn activations that take no axis / shape argument and never raise on a tensor (unlike softmax / cumsum, whose
+# dim can be out of range, or layer_norm / a reduction, whose shape can mismatch or be empty). A call to one of these
+# is trap free regardless of whether the input's shape is tracked, so torch.relu(x) / F.gelu(x) decide on a bare
+# (un-annotated) tensor parameter exactly as the x.relu() method form already does. A unary-math name (abs / sqrt /
+# exp / sin / ...) is deliberately EXCLUDED: it resolves through the more precise scalar np.abs / np.sqrt / math.*
+# model on a non-tensor argument (which a trap-free opaque would shadow, losing e.g. np.abs(x) >= 0).
+_NN_ACTIVATION_TRAPFREE = frozenset({
+    "relu", "relu6", "gelu", "silu", "elu", "selu", "celu", "leaky_relu", "rrelu", "hardtanh", "hardswish",
+    "hardsigmoid", "hardshrink", "softshrink", "tanhshrink", "mish", "logsigmoid", "softplus", "softsign",
+    "prelu", "threshold", "sigmoid", "dropout", "alpha_dropout",
+})
+
 
 def _functional_call(name, node, env, ctx):
     """A `torch.nn.functional.X(tensor, ...)` call: an elementwise activation or normalization preserves the
@@ -2718,6 +2781,8 @@ def _functional_call(name, node, env, ctx):
     for kw in node.keywords:
         ev(kw.value, env, ctx)
     if not (args and isinstance(args[0], _NdArray)):
+        if name in _NN_ACTIVATION_TRAPFREE:                  # an activation on a bare tensor parameter: trap free
+            return _Opaque(name)                             # even without a tracked shape (F.relu(x) / F.gelu(x))
         return None
     if name in _F_SHAPE_PRESERVING:
         return _NdArray(args[0].shape)
@@ -2999,8 +3064,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
     if isinstance(node, ast.Tuple):                          # tuple packing -> a Python tuple of terms
         return tuple(ev(e, env, ctx) for e in node.elts)
     if isinstance(node, ast.List) and not any(isinstance(e, ast.Starred) for e in node.elts):
-        return tuple(ev(e, env, ctx) for e in node.elts)     # list literal -> a tuple of element terms; each
-        #                                                      element is evaluated, so a trap inside it is checked
+        return _ListLit(ev(e, env, ctx) for e in node.elts)  # list literal -> a tuple of element terms (tagged mutable
+        #                                                      for a[i] = v); each element is evaluated, trap-checked
     if isinstance(node, ast.Set):                            # set literal: evaluate the elements for their
         for e in node.elts:                                  # traps, then an opaque value
             ev(e.value if isinstance(e, ast.Starred) else e, env, ctx)
@@ -3056,23 +3121,30 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if op is ast.Add:
                 if isinstance(l, tuple) and isinstance(r, tuple):
                     return l + r                             # list / tuple concatenation
-                if ctx.traps is not None:                    # list/tuple + a non-sequence: TypeError
+                other = r if isinstance(l, tuple) else l     # the operand added to a sequence literal
+                if isinstance(other, _Opaque) and not (isinstance(other, _SafeContainer)
+                                                       and (other.byteslike or other.unindexable)):
+                    # a list-kind container (list + list is valid, but a literal collapses to a tuple so list + list
+                    # vs tuple + list is ambiguous), an ndarray (numpy broadcasts -- no raise), or an opaque value:
+                    # undecided. Abstain rather than fabricate a TypeError trap (a false refutation of xs + [1]).
+                    raise Unsupported("adding a sequence literal to a container / ndarray / opaque value is undecided")
+                if ctx.traps is not None:                    # sequence literal + a scalar / str / bytes / set: TypeError
                     ctx.traps.append(ctx.pc)
                 return _Opaque("seqop")
             if op is ast.Mult:
                 tv, kv = (l, r) if isinstance(l, tuple) else (r, l)
                 if z3.is_int_value(kv):
                     return tv * kv.as_long()                 # tuple repetition by a constant
-                if isinstance(kv, tuple) or _is_str(kv) or _is_fp(kv) or _is_real(kv):   # seq * a non-integer: TypeError
-                    if ctx.traps is not None:
-                        ctx.traps.append(ctx.pc)
-                    return _Opaque("seqop")
-                if _TRAPFREE:                                # seq * a symbolic int: trap free; the length is the count
-                    if z3.is_expr(kv) and kv.sort() == z3.IntSort():   # times the repeated width, clamped at 0 (Python
-                        return _SafeContainer("seqrep",                # gives [] for a non-positive count), so [0] * n
-                                              length=z3.If(kv >= 0, z3.IntVal(len(tv)) * kv, z3.IntVal(0)))   # has len n
-                    return _SafeContainer("seqrep")
-                raise Unsupported("tuple repetition by a non-constant count")
+                if z3.is_expr(kv) and (z3.is_int(kv) or z3.is_bool(kv)):   # seq * a symbolic int / bool (True == 1):
+                    if _TRAPFREE:                            # trap free; the length is the count times the repeated
+                        k = z3.If(kv, z3.IntVal(1), z3.IntVal(0)) if z3.is_bool(kv) else kv   # width, clamped at 0 for a
+                        return _SafeContainer("seqrep", length=z3.If(k >= 0, z3.IntVal(len(tv)) * k, z3.IntVal(0)))  # non-
+                    raise Unsupported("tuple repetition by a non-constant count")                                    # positive count
+                if isinstance(kv, _Opaque) and not isinstance(kv, _SafeContainer):
+                    raise Unsupported("sequence repetition by an ndarray / opaque value")   # numpy broadcasts: abstain
+                if ctx.traps is not None:                    # seq * a sequence / str / float / Fraction: TypeError
+                    ctx.traps.append(ctx.pc)
+                return _Opaque("seqop")
             if ctx.traps is not None:                        # any other operator on a list/tuple (-, /, //, **, &, ...) is a TypeError
                 ctx.traps.append(ctx.pc)
             return _Opaque("seqop")
@@ -3151,7 +3223,15 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     # over-approximated by the power axioms.
                     base_i, exp_i = _as_int(l), _as_int(r)
                     if ctx.traps is not None:
-                        ctx.traps.append(z3.And(ctx.pc, base_i == 0, exp_i < 0))
+                        trap = z3.And(ctx.pc, base_i == 0, exp_i < 0)   # 0 ** (negative): ZeroDivisionError
+                        hard = getattr(ctx, "hard_traps", None)
+                        if (hard is not None and not getattr(ctx, "overapprox", False)
+                                and not getattr(ctx, "havoc", False)):
+                            # the operands are exact (no over-approximation / havoc in scope), so this trap is real
+                            # and refutes even though the RESULT value below is over-approximated (a fresh int).
+                            hard.append(trap)
+                        else:
+                            ctx.traps.append(trap)             # operands possibly over-approximated: leave it suppressible
                     over_cap = (isinstance(node.right, ast.Constant) and isinstance(node.right.value, int)
                                 and not isinstance(node.right.value, bool) and node.right.value > 64)
                     _note_overapprox(ctx, "** with a constant exponent over the unroll cap (64)" if over_cap
@@ -3420,26 +3500,70 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 _note_overapprox(ctx, "hash")
                 return z3.FreshInt("hash")
             raise Unsupported("hash() of a possibly-unhashable value")
-        if name == "int" and "int" not in ctx.repo and len(node.args) <= 1:
-            if not node.args:
+        if name == "int" and "int" not in ctx.repo:
+            args = node.args
+            kws = {k.arg: k.value for k in node.keywords if k.arg is not None}
+            base_node = args[1] if len(args) == 2 else kws.get("base")
+            base_ok = base_node is None or (isinstance(base_node, ast.Constant)
+                                            and isinstance(base_node.value, int) and not isinstance(base_node.value, bool))
+            if not args and not kws:
                 return z3.IntVal(0)                           # int() -> 0
-            a = ev(node.args[0], env, ctx)                    # the argument is trap-checked as it is evaluated
-            if z3.is_expr(a) and (z3.is_int(a) or z3.is_bool(a)):
-                return _as_int(a)                            # int(int) / int(bool): exact, never traps
-            if _is_fp(a) or (_TRAPFREE and isinstance(a, _Opaque)
-                             and not isinstance(a, (_SafeContainer, _DictParam, _DictLit, _MapVal))):
-                _note_overapprox(ctx, "int() of a float")    # truncation toward zero of a finite float --
-                return z3.FreshInt("int")                    # some int (REFUTED withheld; PROVED still sound, set wider)
-            raise Unsupported("int() of a string, container, or unmodeled value (may raise ValueError/TypeError)")
+            if (1 <= len(args) <= 2 and set(kws) <= {"base"} and base_ok
+                    and isinstance(args[0], ast.Constant) and isinstance(args[0].value, str)):
+                # int(str_literal [, base]) parses exactly as CPython does (base positional or base=, default 10): a
+                # valid (digits, base) pair has a known value, an invalid digit string or an out-of-range base (which
+                # must be 0 or 2..36) always raises ValueError. (A base= keyword must use this base, not base 10.)
+                base = base_node.value if base_node is not None else 10
+                try:
+                    return z3.IntVal(int(args[0].value, base))
+                except ValueError:
+                    if ctx.traps is not None:
+                        ctx.traps.append(ctx.pc)
+                    return z3.IntVal(0)                       # poison: never trusted once the trap fires
+            if len(args) == 1 and not kws:
+                a = ev(args[0], env, ctx)                      # the argument is trap-checked as it is evaluated
+                if z3.is_expr(a) and (z3.is_int(a) or z3.is_bool(a)):
+                    return _as_int(a)                         # int(int) / int(bool): exact, never traps
+                if _is_fp(a) or (_TRAPFREE and isinstance(a, _Opaque)
+                                 and not isinstance(a, (_SafeContainer, _DictParam, _DictLit, _MapVal))):
+                    _note_overapprox(ctx, "int() of a float")    # truncation toward zero of a finite float --
+                    return z3.FreshInt("int")                    # some int (REFUTED withheld; PROVED still sound)
+                raise Unsupported("int() of a string, container, or unmodeled value (may raise ValueError/TypeError)")
+            raise Unsupported("int() with an unmodeled signature (a non-constant base, or extra arguments)")
         if name == "float" and "float" not in ctx.repo and len(node.args) <= 1:
             if not node.args:
                 return z3.FPVal(0.0, _F64)                    # float() -> 0.0
+            if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                # float('1.5') / float('inf') / float('nan') is exactly CPython's parse: a valid literal is total
+                # and its IEEE-754 value is known, an unparseable one (float('abc')) always raises ValueError.
+                try:
+                    return z3.FPVal(float(node.args[0].value), _F64)
+                except ValueError:
+                    if ctx.traps is not None:
+                        ctx.traps.append(ctx.pc)
+                    return z3.FPVal(0.0, _F64)                # poison: never trusted once the trap fires
             a = ev(node.args[0], env, ctx)                    # the argument is trap-checked as it is evaluated
             if _is_fp(a):
                 return a                                      # float(float): identity
             if z3.is_expr(a) and (z3.is_int(a) or z3.is_bool(a)):
                 return _to_fp(a)                              # float(int) / float(bool): the exact IEEE-754 value
-            raise Unsupported("float() of a string or unmodeled value (may raise ValueError)")
+            raise Unsupported("float() of a non-literal string or unmodeled value (may raise ValueError)")
+        if name in ("bytes", "bytearray") and name not in ctx.repo and len(node.args) <= 1:
+            # bytes(n) / bytearray(n) is n zero bytes -- ValueError on a negative count -- so the result is a byteslike
+            # sequence of length n (its elements are valid bytes in [0, 255]). bytes()/bytearray() is empty; a bytes /
+            # bytearray argument is copied (same length). A str / general iterable / opaque argument is declined.
+            if not node.args:
+                return _SafeContainer(name, byteslike=True, immutable=(name == "bytes"), length=z3.IntVal(0))
+            a = ev(node.args[0], env, ctx)                    # the argument is trap-checked as it is evaluated
+            if z3.is_expr(a) and (z3.is_int(a) or z3.is_bool(a)):
+                n = _as_int(a)
+                if ctx.traps is not None:                     # ValueError: negative count
+                    ctx.traps.append(z3.And(ctx.pc, n < 0))
+                return _SafeContainer(name, byteslike=True, immutable=(name == "bytes"),
+                                      length=z3.If(n >= 0, n, z3.IntVal(0)))
+            if isinstance(a, _SafeContainer) and a.byteslike:   # bytes(b) / bytearray(b): a copy of equal length
+                return _SafeContainer(name, byteslike=True, immutable=(name == "bytes"), length=_container_len(a, ctx))
+            raise Unsupported("bytes()/bytearray() of a string, iterable, or unmodeled value")
         if name == "bool" and "bool" not in ctx.repo and len(node.args) <= 1:
             if not node.args:
                 return z3.BoolVal(False)                      # bool() -> False
@@ -3523,8 +3647,29 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 _best_effort_assume()
                 return _SafeContainer("tuple", immutable=True)
             raise Unsupported("tuple() of a possibly non-iterable value")
-        if name in ("iter", "reversed", "enumerate") and name not in ctx.repo and 1 <= len(node.args) <= 2 and not node.keywords:
-            # iter / reversed / enumerate over an iterable: an opaque iterator, trap free to build (a for-loop over it
+        if name == "reversed" and name not in ctx.repo and len(node.args) == 1 and not node.keywords:
+            # reversed(seq): an indexable sized sequence (list / str / tuple / range / bytes) gives a NEW sequence of
+            # the SAME length (trap free, indexable, so list(reversed(xs)) decides). A set / frozenset is NOT
+            # reversible (TypeError). A dict (reversible since 3.8) or an opaque iterable is reversed lazily (opaque).
+            x = ev(node.args[0], env, ctx)
+            if isinstance(x, _SafeContainer) and x.unindexable:
+                if ctx.traps is not None:
+                    ctx.traps.append(ctx.pc)                      # set / frozenset: reversed() raises TypeError
+                return _Opaque("reversed")                        # poison: never trusted once the trap fires
+            if isinstance(x, _SafeContainer):                     # list / bytes / range: a reversed sized sequence
+                return _SafeContainer("reversed", byteslike=x.byteslike, length=_container_len(x, ctx))
+            if _is_str(x):
+                return _SafeContainer("reversed", length=z3.Length(x))
+            if isinstance(x, tuple):                              # a list / tuple literal of known length
+                return _SafeContainer("reversed", length=z3.IntVal(len(x)))
+            if isinstance(x, (_DictParam, _DictLit, _MapVal, _DefaultDict, _Opaque)):
+                return _Opaque("reversed")                        # dict (3.8+) / opaque iterable: lazy, trap free
+            if BEST_EFFORT:
+                _best_effort_assume()
+                return _Opaque("reversed")
+            raise Unsupported("reversed() of a possibly non-iterable value")
+        if name in ("iter", "enumerate") and name not in ctx.repo and 1 <= len(node.args) <= 2 and not node.keywords:
+            # iter / enumerate over an iterable: an opaque iterator, trap free to build (a for-loop over it
             # havocs its targets). A non-iterable scalar abstains.
             x = ev(node.args[0], env, ctx)
             for a in node.args[1:]:
@@ -3542,11 +3687,19 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 ev(a, env, ctx)
             _note_overapprox(ctx, "next()")
             return _Opaque("next")
-        if name in ("sorted", "list") and name not in ctx.repo and len(node.args) == 1 and not node.keywords:
-            # sorted(it) and list(it) build a NEW list of the same length as the iterable, indexable -- model it
-            # as a sized container so sorted(nums)[0] / list(xs)[i] bounds-check against that length (the length
-            # len() would give). An opaque/non-iterable argument or a key=/reverse= keyword is declined.
+        if name in ("sorted", "list") and name not in ctx.repo and len(node.args) == 1 and (
+                not node.keywords or (name == "sorted" and all(kw.arg in ("reverse", "key") for kw in node.keywords))):
+            # sorted(it[, reverse=bool][, key=f]) and list(it) build a NEW list of the same length as the iterable,
+            # indexable -- model it as a sized container so sorted(nums)[0] / list(xs)[i] bounds-check against that
+            # length. reverse= changes order only (no trap, no length change): it is trap-checked then ignored. A key=
+            # callable is applied to a freely-chosen element so its per-element traps surface (a lambda or repo function;
+            # a bare builtin key declines to UNKNOWN). An opaque / non-iterable argument is declined.
             x = ev(node.args[0], env, ctx)                    # the iterable is trap-checked as it is evaluated
+            for kw in node.keywords:
+                if kw.arg == "key":
+                    _apply_key_callable(kw.value, x, env, ctx)   # surface the key callable's per-element traps
+                else:
+                    ev(kw.value, env, ctx)                    # sorted(..., reverse=cond): trap-check the flag value
             if isinstance(x, _SafeContainer):
                 n = _container_len(x, ctx)
             elif _is_str(x):
@@ -3615,10 +3768,15 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 _kw = {k.arg for k in node.keywords}
                 if isinstance(seq, tuple) and seq:           # a non-empty literal is total and exact
                     vals = list(seq)
-                elif (_TRAPFREE and isinstance(seq, _SafeContainer) and ctx.traps is not None
-                      and "key" not in _kw):                 # an opaque sequence parameter: ValueError when empty,
+                elif (_TRAPFREE and isinstance(seq, _SafeContainer) and ctx.traps is not None):
+                    keynode = None                           # an opaque sequence parameter: ValueError when empty,
                     for k in node.keywords:                  # against its symbolic length, so a len() / truthiness
-                        ev(k.value, env, ctx)                # guard proves it safe; a default= never raises
+                        if k.arg == "key":                   # guard proves it safe; a default= never raises
+                            keynode = k.value
+                        else:
+                            ev(k.value, env, ctx)
+                    if keynode is not None:                  # a key= callable's per-element traps refute (10 // x on a
+                        _apply_key_callable(keynode, seq, env, ctx)   # zero element); a bare builtin key declines
                     if "default" not in _kw:
                         ctx.traps.append(z3.And(ctx.pc, _container_len(seq, ctx) <= 0))
                     return z3.FreshInt(name)                 # an arbitrary element of the sequence (or the default)
@@ -3659,7 +3817,13 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 return z3.IntVal(len(a))
             if _is_str(a):
                 return z3.Length(a)
-            if isinstance(a, _StrSeq):                       # the length of a split result: a nonnegative int
+            if isinstance(a, _StrSeq):                       # the length of a split result: its stable symbolic
+                if a.unsized:                                # a lazy map(str, ...) iterator is not sized: len() is the
+                    if ctx.traps is not None:                # TypeError CPython raises ("object of type 'map' has no
+                        ctx.traps.append(ctx.pc)             # len()"), so every input reaching it traps
+                    return z3.FreshInt("maplen")
+                if a.length is not None:                     # length (>= 1 for split with a separator, else >= 0), so
+                    return a.length                          # split(sep)[0] / [-1] are in bounds and len() is exact
                 if ctx.facts is not None:
                     _note_overapprox(ctx, "len of a split result")
                     r = z3.FreshInt("splitlen")
@@ -3680,8 +3844,11 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 return a.shape[0]
             if _TRAPFREE and isinstance(a, _SafeContainer):  # a container parameter: a stable nonneg length,
                 return _container_len(a, ctx)                # shared with the bounds check on a[i]
-            if _TRAPFREE and isinstance(a, _Opaque):         # other opaque container (attribute, call result): nonneg
-                return z3.FreshInt("hlen")
+            if _TRAPFREE and isinstance(a, _Opaque):         # other opaque container (dict / view / attribute / call
+                r = z3.FreshInt("hlen")                      # result): len() is nonnegative for every Python object
+                if ctx.facts is not None:                    # (a negative __len__ raises ValueError), so constrain it
+                    ctx.facts.append(r >= 0)                 # -- else len(d) + 1 spuriously reaches 0 and 10 // it
+                return r                                      # fabricates a ZeroDivisionError that cannot occur
             if BEST_EFFORT:                                  # len of an unmodeled value: a nonneg int (lower trust)
                 _best_effort_assume()
                 return z3.FreshInt("be_len")
@@ -3723,6 +3890,11 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         if name == "map" and len(node.args) == 2:            # map(f, constant tuple) -> a tuple
             seq = ev(node.args[1], env, ctx)
             if not isinstance(seq, tuple):
+                fn = node.args[0]                            # map(str, X) / map(repr, X) over a known iterable yields a
+                if (isinstance(fn, ast.Name) and fn.id in ("str", "repr") and fn.id not in env and fn.id not in ctx.repo
+                        and (isinstance(seq, (_SafeContainer, _StrSeq, _DictParam, _DictLit, _MapVal)) or _is_str(seq))):
+                    return _StrSeq("map", unsized=True)      # lazy iterator of strings (str / repr is total), so
+                    #                                          sep.join(map(str, X)) is a trap-free string
                 if BEST_EFFORT:                              # map over an unmodeled iterable: opaque (lower trust)
                     ev(node.args[0], env, ctx)
                     _best_effort_assume()
@@ -3742,10 +3914,23 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     raise Unsupported("map() function is not a modeled callable")
             return tuple(out)
         if name == "zip" and "zip" not in ctx.repo:
-            for arg in node.args:
-                ev(arg, env, ctx)                            # trap-check each iterable argument
+            parts = [ev(arg, env, ctx) for arg in node.args]   # trap-check each iterable argument
+            _strict = False
             for kw in node.keywords:
                 ev(kw.value, env, ctx)                       # a zip(..., strict=...) keyword value
+                if kw.arg == "strict" and not (isinstance(kw.value, ast.Constant) and kw.value.value is False):
+                    _strict = True                           # strict=True / non-literal: a length mismatch raises on
+                    #                                          consumption, so do not size it -- keep it lazy/opaque
+            if parts and not _strict and all(isinstance(p, _SafeContainer) or _is_str(p) or isinstance(p, tuple)
+                                             for p in parts):
+                # zip stops at the SHORTEST argument, so list(zip(a, b, ...)) has the minimum length (trap free; the
+                # elements are opaque tuples). A non-sized argument keeps it an opaque, lazily-consumed iterable.
+                lens = [_container_len(p, ctx) if isinstance(p, _SafeContainer)
+                        else z3.Length(p) if _is_str(p) else z3.IntVal(len(p)) for p in parts]
+                m = lens[0]
+                for ln in lens[1:]:
+                    m = z3.If(ln < m, ln, m)
+                return _SafeContainer("zip", length=m)
             return _Opaque("zip")                            # an iterable of tuples; a for-loop over it havocs the targets
         if name == "Fraction" and 1 <= len(node.args) <= 2:  # exact rational over Z3 Real
             num = _to_real(ev(node.args[0], env, ctx))
@@ -3818,10 +4003,36 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     return res
             if node.func.value.id == "math" and node.func.attr in _TRANSCENDENTAL and len(node.args) == 1:
                 return _transcendental(node.func.attr, ev(node.args[0], env, ctx), ctx)
+            if (node.func.value.id == "math" and node.func.attr == "log"
+                    and "math" not in env and len(node.args) == 2 and not node.keywords):
+                # math.log(x, base) = log(x)/log(base): a ValueError when x <= 0 or base <= 0, a ZeroDivisionError
+                # when base == 1 (log(1) is a zero divisor). The domain trap goes in unconditionally (as the single-
+                # argument log does), so an unguarded call refutes and a guard (x > 0 and base > 0, base != 1) proves;
+                # the value is an arbitrary double (over-approximated for prove).
+                xa = _to_fp(ev(node.args[0], env, ctx))
+                ba = _to_fp(ev(node.args[1], env, ctx))
+                if ctx.traps is not None:
+                    ctx.traps.append(z3.And(ctx.pc, z3.Or(z3.fpLEQ(xa, z3.FPVal(0.0, _F64)),
+                                                          z3.fpLEQ(ba, z3.FPVal(0.0, _F64)),
+                                                          z3.fpEQ(ba, z3.FPVal(1.0, _F64)))))
+                if not _TRAPFREE:
+                    _note_overapprox(ctx, "math.log (2-argument)")
+                return z3.FreshConst(_F64, "log2arg")
             if node.func.value.id == "math" and node.func.attr in _MATH_FUNCS and "math" not in env:
                 res = _math_call(node.func.attr, [ev(a, env, ctx) for a in node.args], ctx)
                 if res is not None:
                     return res
+            if (node.func.value.id == "math" and node.func.attr == "isclose"
+                    and "math" not in env and len(node.args) == 2 and not node.keywords):
+                # math.isclose(a, b) -> a bool, total over numbers with the default (non-negative) tolerances. The two
+                # values are trap-checked and required to be numeric; the result is an arbitrary bool. (A rel_tol /
+                # abs_tol keyword, which could be a negative-tolerance ValueError, is declined.)
+                a0 = ev(node.args[0], env, ctx)
+                a1 = ev(node.args[1], env, ctx)
+                if not all((z3.is_expr(v) and (z3.is_int(v) or z3.is_bool(v))) or _is_fp(v) or _is_real(v)
+                           for v in (a0, a1)):
+                    raise Unsupported("math.isclose of a non-numeric value")
+                return _b01(z3.FreshConst(z3.BoolSort(), "isclose"))
             if node.func.value.id in ("np", "numpy") and node.func.attr in _NP_ARRAY_CTORS:
                 return _np_array_ctor(node.func.attr, node, env, ctx)
             if node.func.value.id == "torch" and node.func.attr in _TORCH_CTORS and "torch" not in env:
@@ -3843,6 +4054,108 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 res = _collections_ctor(node.func.attr, node, env, ctx)
                 if res is not None:
                     return res
+            if (node.func.value.id == "itertools" and node.func.attr == "chain"
+                    and "itertools" not in env and not node.keywords):
+                # itertools.chain(a, b, ...) concatenates its iterables lazily. Consuming it is trap free when each
+                # argument is a known iterable (a sized sequence), and the chain then has the summed length -- so a
+                # later len() / list() / index into list(chain(...)) decides. A non-sized (possibly non-iterable)
+                # argument is declined.
+                parts = [ev(a, env, ctx) for a in node.args]   # each argument trap-checked as it is evaluated
+                if all(isinstance(p, _SafeContainer) or _is_str(p) or isinstance(p, tuple) for p in parts):
+                    total = z3.IntVal(0)
+                    for p in parts:
+                        total = total + (_container_len(p, ctx) if isinstance(p, _SafeContainer)
+                                         else z3.Length(p) if _is_str(p) else z3.IntVal(len(p)))
+                    return _SafeContainer("chain", length=total)
+                return _Opaque("chain")                        # lazy construction raises nothing; consuming an opaque
+                #                                                argument (list(chain(...))) then abstains, as before
+            if (node.func.value.id == "itertools" and node.func.attr == "repeat"
+                    and "itertools" not in env and len(node.args) == 2 and not node.keywords):
+                # itertools.repeat(x, count) yields `count` copies (a negative count gives none), so list(repeat(x, n))
+                # has length max(n, 0) -- trap free for an integer count. repeat(x) without a count is infinite and is
+                # left opaque (consuming it would not terminate).
+                ev(node.args[0], env, ctx)                     # the repeated value is trap-checked
+                cnt = ev(node.args[1], env, ctx)
+                if z3.is_expr(cnt) and (z3.is_int(cnt) or z3.is_bool(cnt)):
+                    k = _as_int(cnt)
+                    return _SafeContainer("repeat", length=z3.If(k >= 0, k, z3.IntVal(0)))
+                raise Unsupported("itertools.repeat with a non-integer count")
+            if (node.func.value.id == "itertools" and node.func.attr == "islice"
+                    and "itertools" not in env and len(node.args) == 2 and not node.keywords):
+                # itertools.islice(it, stop): the first `stop` elements (stop=None -> all of it). For a sized iterable
+                # it is trap free with length min(len(it), stop) when stop is a non-negative int (a negative stop is a
+                # ValueError); stop=None gives len(it). A non-sized iterable or the start/stop/step form is declined.
+                it = ev(node.args[0], env, ctx)
+                stop = ev(node.args[1], env, ctx)
+                if not (isinstance(it, _SafeContainer) or _is_str(it) or isinstance(it, tuple)):
+                    raise Unsupported("itertools.islice of a non-sized iterable")
+                n = (_container_len(it, ctx) if isinstance(it, _SafeContainer)
+                     else z3.Length(it) if _is_str(it) else z3.IntVal(len(it)))
+                if isinstance(node.args[1], ast.Constant) and node.args[1].value is None:
+                    return _SafeContainer("islice", length=n)   # islice(it, None) -> all of it
+                if z3.is_expr(stop) and z3.is_int(stop):
+                    if ctx.traps is not None:
+                        ctx.traps.append(z3.And(ctx.pc, stop < 0))   # ValueError: a negative stop
+                    return _SafeContainer("islice", length=z3.If(stop < 0, z3.IntVal(0),
+                                                                  z3.If(stop < n, stop, n)))   # min(stop, len(it))
+                raise Unsupported("itertools.islice with a non-integer stop")
+            if (node.func.value.id == "itertools" and node.func.attr == "zip_longest"
+                    and "itertools" not in env):
+                # itertools.zip_longest(a, b, ..., fillvalue=...) pads to the LONGEST argument, so list(zip_longest(...))
+                # has the MAXIMUM length of its sized arguments (trap free; elements are opaque tuples) -- the dual of
+                # zip's minimum. The fillvalue keyword is benign. A non-sized argument keeps it opaque.
+                parts = [ev(a, env, ctx) for a in node.args]
+                for kw in node.keywords:
+                    ev(kw.value, env, ctx)                     # fillvalue is trap-checked
+                if parts and all(isinstance(p, _SafeContainer) or _is_str(p) or isinstance(p, tuple) for p in parts):
+                    m = None
+                    for p in parts:
+                        ln = (_container_len(p, ctx) if isinstance(p, _SafeContainer)
+                              else z3.Length(p) if _is_str(p) else z3.IntVal(len(p)))
+                        m = ln if m is None else z3.If(ln > m, ln, m)
+                    return _SafeContainer("zip_longest", length=m)
+                return _Opaque("zip_longest")
+            if (node.func.value.id == "itertools" and node.func.attr == "product"
+                    and "itertools" not in env and not node.keywords):
+                # itertools.product(a, b, ...) is the cartesian product, so list(product(...)) has length equal to the
+                # PRODUCT of the argument lengths (trap free; product() with no args is the single empty tuple, length
+                # 1). A non-sized argument keeps it an opaque, lazily-consumed iterable.
+                parts = [ev(a, env, ctx) for a in node.args]
+                if all(isinstance(p, _SafeContainer) or _is_str(p) or isinstance(p, tuple) for p in parts):
+                    total = z3.IntVal(1)
+                    for p in parts:
+                        total = total * (_container_len(p, ctx) if isinstance(p, _SafeContainer)
+                                         else z3.Length(p) if _is_str(p) else z3.IntVal(len(p)))
+                    return _SafeContainer("product", length=total)
+                return _Opaque("product")
+            if (node.func.value.id == "struct" and node.func.attr == "calcsize"
+                    and "struct" not in env and len(node.args) == 1 and not node.keywords):
+                # struct.calcsize(fmt): for a string LITERAL the size is exactly CPython's -- a valid format string
+                # has a known byte size, an invalid one always raises struct.error. A non-literal format is declined.
+                fmt = node.args[0]
+                if not (isinstance(fmt, ast.Constant) and isinstance(fmt.value, str)):
+                    raise Unsupported("struct.calcsize of a non-literal format")
+                try:
+                    return z3.IntVal(_struct.calcsize(fmt.value))
+                except _struct.error:
+                    if ctx.traps is not None:
+                        ctx.traps.append(ctx.pc)               # invalid format: struct.error
+                    return z3.IntVal(0)                        # poison: never trusted once the trap fires
+            if node.func.value.id == "operator" and "operator" not in env and not node.keywords:
+                # operator.add(a, b) / operator.lt(a, b) / operator.neg(a) ... mirror the Python operator exactly, so
+                # re-evaluate the corresponding BinOp / Compare / UnaryOp -- reusing its semantics and traps (e.g.
+                # operator.floordiv(a, b) is a // b, a ZeroDivisionError when b is 0). Non-operator helpers (itemgetter,
+                # getitem, ...) are not mapped here and fall through.
+                _attr = node.func.attr
+                if _attr in _OPERATOR_BINOP and len(node.args) == 2:
+                    return ev(ast.copy_location(ast.BinOp(left=node.args[0], op=_OPERATOR_BINOP[_attr](),
+                                                          right=node.args[1]), node), env, ctx)
+                if _attr in _OPERATOR_UNARY and len(node.args) == 1:
+                    return ev(ast.copy_location(ast.UnaryOp(op=_OPERATOR_UNARY[_attr](), operand=node.args[0]),
+                                                node), env, ctx)
+                if _attr in _OPERATOR_CMP and len(node.args) == 2:
+                    return ev(ast.copy_location(ast.Compare(left=node.args[0], ops=[_OPERATOR_CMP[_attr]()],
+                                                            comparators=[node.args[1]]), node), env, ctx)
             if node.func.value.id == "str" and node.func.attr == "maketrans" and "str" not in env:
                 # str.maketrans builds a translation table (modeled opaque); the two-string form raises
                 # ValueError when the strings differ in length, the dict and three-argument forms do not.
@@ -3854,6 +4167,45 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 if len(margs) in (1, 3):
                     return _Opaque("transtable")
                 raise Unsupported("str.maketrans signature")
+            if (node.func.value.id == "int" and node.func.attr == "from_bytes"
+                    and "int" not in env and 1 <= len(node.args) <= 2):
+                # int.from_bytes(b, byteorder[, signed=]) reads a bytes value as an integer. The only modeled trap is
+                # ValueError when byteorder is a string other than 'little' / 'big' (modeled exactly, so a bad literal
+                # refutes, a correct or guarded one proves); the result is a non-negative int unless signed is True.
+                # A non-bytes first argument is declined (its element types may not be valid byte values).
+                arg0 = ev(node.args[0], env, ctx)              # trap-checked as it is evaluated
+                if not (isinstance(arg0, _SafeContainer) and arg0.byteslike):
+                    raise Unsupported("int.from_bytes of a non-bytes value")
+                bo = ev(node.args[1], env, ctx) if len(node.args) == 2 else next(
+                    (ev(kw.value, env, ctx) for kw in node.keywords if kw.arg == "byteorder"), None)
+                if bo is None or not _is_str(bo):
+                    raise Unsupported("int.from_bytes without a string byteorder argument")
+                if ctx.traps is not None:                      # ValueError unless byteorder in ('little', 'big')
+                    ctx.traps.append(z3.And(ctx.pc, bo != z3.StringVal("little"), bo != z3.StringVal("big")))
+                signed = next((kw.value for kw in node.keywords if kw.arg == "signed"), None)
+                if signed is not None and not isinstance(signed, ast.Constant):
+                    ev(signed, env, ctx)                       # trap-check a non-literal signed flag
+                r = z3.FreshInt("from_bytes")
+                if ctx.facts is not None and (signed is None or (isinstance(signed, ast.Constant) and not signed.value)):
+                    ctx.facts.append(r >= 0)                   # signed defaults False -> a non-negative result
+                return r
+            if (node.func.value.id in ("bytes", "bytearray") and node.func.attr == "fromhex"
+                    and node.func.value.id not in env and len(node.args) == 1 and not node.keywords):
+                # bytes.fromhex(s) / bytearray.fromhex(s): for a string LITERAL the result is exactly CPython's parse
+                # -- a valid hex string (interleaved whitespace allowed) gives a byteslike value of half its non-space
+                # length (its elements are valid bytes in [0, 255]), an odd-length or non-hex string always raises
+                # ValueError. A non-literal argument is declined (the parse cannot be decided symbolically).
+                hx = node.args[0]
+                if not (isinstance(hx, ast.Constant) and isinstance(hx.value, str)):
+                    raise Unsupported("bytes.fromhex of a non-literal string")
+                _imm = node.func.value.id == "bytes"
+                try:
+                    _parsed = bytes.fromhex(hx.value)
+                except ValueError:
+                    if ctx.traps is not None:
+                        ctx.traps.append(ctx.pc)               # invalid hex: ValueError
+                    return _SafeContainer("fromhex", byteslike=True, immutable=_imm, length=z3.IntVal(0))
+                return _SafeContainer("fromhex", byteslike=True, immutable=_imm, length=z3.IntVal(len(_parsed)))
             if (node.func.value.id == "re" and "re" not in env and node.func.attr in
                     ("match", "search", "fullmatch", "findall", "sub", "subn", "split", "finditer")):
                 # a CONSTANT compilable pattern makes the call total; a non-constant pattern can raise re.error
@@ -3913,6 +4265,34 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             res = _int_method(meth, _as_int(recv), ctx)       # bit_length / bit_count / __index__ / conjugate
             if res is not None:
                 return res
+        if (z3.is_expr(recv) and (z3.is_int(recv) or z3.is_bool(recv)) and meth == "to_bytes"
+                and 1 <= len(node.args) <= 2 and all(kw.arg in ("byteorder", "signed") for kw in node.keywords)):
+            # n.to_bytes(length, byteorder[, signed=]) -> a bytes value of `length` bytes. For a CONSTANT length L it
+            # is total iff n fits -- unsigned 0 <= n < 256**L, signed -(256**L)//2 <= n < (256**L)//2 -- else an
+            # OverflowError; byteorder must be 'little' / 'big' (ValueError, modeled exactly). A symbolic length or a
+            # non-constant signed flag is declined (the fit bound is not statically known). The result is byteslike.
+            nv = _as_int(recv)
+            length_node = node.args[0]
+            if not (isinstance(length_node, ast.Constant) and isinstance(length_node.value, int)
+                    and not isinstance(length_node.value, bool) and 0 <= length_node.value <= 256):
+                raise Unsupported("int.to_bytes with a non-constant or out-of-range length")
+            L = length_node.value
+            bo = a[1] if len(a) == 2 else next(
+                (ev(kw.value, env, ctx) for kw in node.keywords if kw.arg == "byteorder"), None)
+            if bo is not None and not _is_str(bo):
+                raise Unsupported("int.to_bytes with a non-string byteorder")
+            signed_node = next((kw.value for kw in node.keywords if kw.arg == "signed"), None)
+            if signed_node is not None and not isinstance(signed_node, ast.Constant):
+                ev(signed_node, env, ctx)                     # trap-check, then decline: the sign is not statically known
+                raise Unsupported("int.to_bytes with a non-constant signed flag")
+            signed = bool(signed_node.value) if isinstance(signed_node, ast.Constant) else False
+            if ctx.traps is not None:
+                if bo is not None:                            # ValueError unless byteorder in ('little', 'big')
+                    ctx.traps.append(z3.And(ctx.pc, bo != z3.StringVal("little"), bo != z3.StringVal("big")))
+                hi = 1 << (8 * L)                             # 256**L
+                bound = z3.Or(nv < -(hi // 2), nv >= hi // 2) if signed else z3.Or(nv < 0, nv >= hi)
+                ctx.traps.append(z3.And(ctx.pc, bound))       # OverflowError: n does not fit in L bytes
+            return _SafeContainer("to_bytes", byteslike=True, immutable=True, length=z3.IntVal(L))
         # .pop() on a container parameter mutated exactly once (so the stable length / membership is exact):
         # list.pop() is an IndexError on an empty list and pop(i) an IndexError out of range, against the same
         # symbolic length the c[i] check uses; dict.pop(k) is a KeyError unless k is a provable key, and
@@ -4128,6 +4508,24 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             raise Unsupported("tuple index is not an integer")
         if _is_str(base):
             return _str_subscript(base, node.slice, env, ctx)
+        if _TRAPFREE and isinstance(base, _StrSeq) and base.length is not None:
+            # a split / rsplit / splitlines result: an integer index is IndexError-checked against its length (>= 1
+            # for split with a separator, so [0] / [-1] are safe), and an element is a fresh string (so [i].upper()
+            # works). A slice is another string list of arbitrary length.
+            if isinstance(node.slice, ast.Slice):
+                for b in (node.slice.lower, node.slice.upper, node.slice.step):
+                    if b is not None:
+                        ev(b, env, ctx)                       # trap-check each slice bound
+                sk = z3.FreshInt("slicelen")
+                if ctx.facts is not None:
+                    ctx.facts.append(sk >= 0)
+                return _StrSeq("sliced", length=sk)
+            idx = ev(node.slice, env, ctx)
+            if z3.is_expr(idx) and idx.sort() == z3.IntSort():
+                if ctx.traps is not None:
+                    ctx.traps.append(z3.And(ctx.pc, z3.Or(idx < -base.length, idx >= base.length)))   # IndexError
+                return z3.FreshConst(z3.StringSort(), "splitelem")
+            raise Unsupported("split-result index is not an integer")
         if _TRAPFREE and isinstance(base, _DefaultDict):
             if isinstance(node.slice, ast.Slice):
                 raise Unsupported("a dict is not sliceable")
@@ -4136,9 +4534,20 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         if _TRAPFREE and isinstance(base, _DictParam):
             if isinstance(node.slice, ast.Slice):
                 raise Unsupported("a dict is not sliceable")
-            mem = _dict_member(base, ev(node.slice, env, ctx))
+            kt = ev(node.slice, env, ctx)
+            mem = _dict_member(base, kt)
             if mem is not None and ctx.traps is not None:
                 ctx.traps.append(z3.And(ctx.pc, z3.Not(mem)))   # KeyError when the key is not present
+                if (isinstance(node.value, ast.Name) and node.value.id in getattr(ctx, "readonly_dicts", ())):
+                    # a read-only dict's d[k] is a fixed function of k -- memoize it so re-reading the same key gives
+                    # ONE value, making a guard `if d[k] != 0:` protect a later `10 // d[k]` (else the two reads were
+                    # independent fresh values and the division falsely refuted). For dict[K, V], the value is a fresh
+                    # V (named per key, so distinct keys get distinct lengths) -- so d[k][i] / d[k].append / len(d[k])
+                    # decide for dict[str, list].
+                    ck = (node.value.id, str(kt))
+                    if ck not in ctx.dval_cache:
+                        ctx.dval_cache[ck] = _dict_value_term(base.valproto, "dval_%d" % len(ctx.dval_cache))
+                    return ctx.dval_cache[ck]
                 return z3.FreshInt("dval")
             raise Unsupported("dict subscript with an unmodeled key type")
         if _TRAPFREE and isinstance(base, _Opaque) and not isinstance(base, _DictLit):
@@ -4227,6 +4636,12 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 if ctx.facts is not None:
                     ctx.facts.append(z3.Length(cs) == 1)
                 env2[gen.target.id] = cs
+            elif (isinstance(it, _SafeContainer) and it.byteslike and not it.unindexable
+                  and isinstance(gen.target, ast.Name)):           # a bytes / bytearray element is an int in [0, 255]
+                _be = z3.FreshInt("hc_" + gen.target.id)
+                if ctx.facts is not None:
+                    ctx.facts.append(z3.And(_be >= 0, _be <= 255))
+                env2[gen.target.id] = _be
             else:
                 for t in _target_names(gen.target):
                     env2[t] = z3.FreshInt("hc_" + t)
@@ -4240,11 +4655,17 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         for gen in node.generators:
             for cond in gen.ifs:
                 ev(cond, env2, ctx)
+        elt_val = None
         if isinstance(node, ast.DictComp):
             ev(node.key, env2, ctx); ev(node.value, env2, ctx)
         else:
-            ev(node.elt, env2, ctx)
+            elt_val = ev(node.elt, env2, ctx)
         ctx.pc = old_pc
+        # a generator expression whose element is a string -- (str(x) for x in xs), (f"{x}" for ...), (p.name for ...)
+        # -- is a lazy iterator of strings, so sep.join(genexp) is a trap-free string (like map(str, xs)); it is not
+        # sized or subscriptable, so len() of it is a TypeError and an index abstains.
+        if isinstance(node, ast.GeneratorExp) and elt_val is not None and _is_str(elt_val):
+            return _StrSeq("genstr", unsized=True)
         # a single-generator list comprehension [e for x in it] is a NEW sized list, so model it as a container
         # whose length is the iterable's length when there is no filter (and a fresh nonnegative length bounded
         # by it when filtered, since a filter only drops elements): then a later c[i] is bounds-checked --
@@ -4287,6 +4708,50 @@ def _container_len(c, ctx):
     if ctx.facts is not None:
         ctx.facts.append(n >= 0)
     return n
+
+
+def _container_element(container, ctx):
+    """A fresh value standing for an arbitrary element of `container` -- the same kind container[i] yields: an inner
+    sequence for list[list[..]] / list[str], a byte in [0, 255] for bytes / bytearray, an int otherwise (the modeled
+    subset treats a plain list's elements as ints, as len(c)-guarded c[i] arithmetic already does)."""
+    if isinstance(container, _SafeContainer):
+        if isinstance(container.elem, _SafeContainer):
+            pr = container.elem
+            ln = z3.FreshInt("keyilen")
+            if ctx.facts is not None:
+                ctx.facts.append(ln >= 0)
+            return _SafeContainer(container.name + "_ke", immutable=pr.immutable, length=ln,
+                                  unindexable=pr.unindexable, byteslike=pr.byteslike, elem=pr.elem)
+        elem = z3.FreshInt("keyelem")
+        if container.byteslike and ctx.facts is not None:
+            ctx.facts.append(z3.And(elem >= 0, elem <= 255))
+        return elem
+    return z3.FreshInt("keyelem")
+
+
+def _apply_key_callable(keynode, container, env, ctx):
+    """Apply a sorted / min / max key= callable to a freely-chosen element of `container` so the callable's per-element
+    traps surface (key=lambda x: 10 // x refutes on a zero element; key=lambda x: x + 1 is trap free). The trap is
+    guarded by the container being non-empty -- an empty iterable never calls the key -- so it refutes exactly when
+    CPython would. A lambda or an in-repo function is applied; any other callable (a bare builtin like len / abs, whose
+    safety depends on the element's runtime type) is declined, leaving the verdict UNKNOWN."""
+    lam = ev(keynode, env, ctx) if isinstance(keynode, ast.Lambda) else \
+        (env.get(keynode.id) if isinstance(keynode, ast.Name) else None)
+    elem = _container_element(container, ctx)
+    saved = ctx.pc
+    if isinstance(container, _SafeContainer):
+        ctx.pc = z3.And(ctx.pc, _container_len(container, ctx) >= 1)
+    try:
+        if isinstance(lam, _Lambda) and len(lam.params) == 1:
+            le = dict(lam.env)
+            le[lam.params[0]] = elem
+            ev(lam.body, le, ctx)
+        elif isinstance(keynode, ast.Name) and keynode.id in ctx.repo:
+            ctx.inline(keynode.id, [elem])
+        else:
+            raise Unsupported("sorted/min/max key= is not a modeled callable (only a lambda or repo function)")
+    finally:
+        ctx.pc = saved
 
 
 def _dict_member(d, key):
@@ -4441,6 +4906,40 @@ def _elem_container_proto(elem_ann):
     return None
 
 
+def _ann_value(ann):
+    """A prototype value for a type-annotation node, used as a dict's value type (dict[K, V]) so a read d[k] can be
+    modeled as a V. Mirrors _param_term's type mapping for the container / string / dict cases; an int / bool / float
+    or unmodeled type returns None (the read falls back to the fresh-int default)."""
+    base = (ann.id if isinstance(ann, ast.Name)
+            else ann.value.id if isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name) else None)
+    if base in ("list", "List", "Sequence", "MutableSequence"):
+        return _SafeContainer("dvproto", elem=_elem_container_proto(ann.slice) if isinstance(ann, ast.Subscript) else None)
+    if base in ("tuple", "Tuple"):
+        return _SafeContainer("dvproto", immutable=True)
+    if base in ("set", "frozenset", "Set", "FrozenSet", "MutableSet"):
+        return _SafeContainer("dvproto", unindexable=True)
+    if base in ("bytes", "bytearray"):
+        return _SafeContainer("dvproto", byteslike=True, immutable=(base == "bytes"))
+    if base == "str":
+        return z3.String("dvproto")
+    if base in ("dict", "Dict", "Mapping", "MutableMapping"):
+        return _DictParam("dvproto")
+    return None
+
+
+def _dict_value_term(valproto, nm):
+    """A fresh value of a dict value type's prototype, named `nm` (so its symbolic length is distinct per dict key).
+    None / scalar prototype -> a fresh int (the default), so d[k] arithmetic stays modeled."""
+    if isinstance(valproto, _SafeContainer):
+        return _SafeContainer(nm, byteslike=valproto.byteslike, immutable=valproto.immutable,
+                              unindexable=valproto.unindexable, elem=valproto.elem)
+    if _is_str(valproto):
+        return z3.String(nm)
+    if isinstance(valproto, _DictParam):
+        return _DictParam(nm, valproto=valproto.valproto)
+    return z3.FreshInt(nm)
+
+
 def _param_term(arg):
     """A parameter's symbolic term, sorted by its annotation: `int` (and unannotated) -> Int, `bool` ->
     Bool, `float` -> Float64, `str` -> Z3 String, `list` -> a bounds-checked sequence (so an integer index
@@ -4479,7 +4978,9 @@ def _param_term(arg):
         if base in ("set", "frozenset", "Set", "FrozenSet", "MutableSet"):
             return _SafeContainer(arg.arg, unindexable=True)
         if base in ("dict", "Dict", "Mapping", "MutableMapping"):
-            return _DictParam(arg.arg)
+            vp = (_ann_value(ann.slice.elts[1])              # dict[K, V]: carry the value type V so a read-only
+                  if isinstance(ann.slice, ast.Tuple) and len(ann.slice.elts) == 2 else None)   # d[k] models a V
+            return _DictParam(arg.arg, valproto=vp)
     if _is_object_annotation(ann):                           # a class / qualified / union annotation: an opaque
         return _Opaque(arg.arg)                              # receiver, so a scalar op on it is UNKNOWN, not a trap
     return z3.Int(arg.arg)
@@ -4723,6 +5224,43 @@ def _tracked_dict_names(fn):
     return frozenset(cand)
 
 
+_DICT_READONLY_METHODS = frozenset({"get", "keys", "values", "items", "copy", "fromkeys"})
+
+
+def _readonly_dict_names(fn):
+    """Dict parameters provably never mutated, reassigned, aliased, or passed where a callee could mutate them, so a
+    read d[k] is a fixed function of k and may be memoized (a guard `if d[k] != 0:` then `10 // d[k]` is sound). Every
+    Load occurrence of the name must be a sanctioned read: d[...] (load), `k in d`, `for .. in d`, len(d), or a non-
+    mutating method (get / keys / values / items / copy). Any other occurrence -- a subscript store / del, a mutating
+    or unknown method, a reassignment, an alias, or use as a call argument -- disqualifies the name."""
+    params = {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}
+    ok_ids, bad = set(), set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and isinstance(n.ctx, ast.Load):
+            ok_ids.add(id(n.value))                          # d[...] : a read (a store subscript's value is ctx=Store)
+        elif isinstance(n, ast.Compare):
+            for op, comp in zip(n.ops, n.comparators):
+                if isinstance(op, (ast.In, ast.NotIn)) and isinstance(comp, ast.Name):
+                    ok_ids.add(id(comp))                     # k in d
+        elif isinstance(n, ast.For) and isinstance(n.iter, ast.Name):
+            ok_ids.add(id(n.iter))                           # for .. in d
+        elif isinstance(n, ast.Call):
+            if (isinstance(n.func, ast.Name) and n.func.id == "len"
+                    and len(n.args) == 1 and isinstance(n.args[0], ast.Name)):
+                ok_ids.add(id(n.args[0]))                    # len(d)
+            if (isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name)
+                    and n.func.attr in _DICT_READONLY_METHODS):
+                ok_ids.add(id(n.func.value))                 # d.get(...) / d.keys() / ... (non-mutating)
+        elif isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                if isinstance(t, ast.Name):
+                    bad.add(t.id)                            # d reassigned (a different / mutated dict)
+    for n in ast.walk(fn):                                   # any unsanctioned Load (alias, call arg, return, ...) is bad
+        if isinstance(n, ast.Name) and n.id in params and isinstance(n.ctx, ast.Load) and id(n) not in ok_ids:
+            bad.add(n.id)
+    return frozenset(params - bad)
+
+
 def _assign_target(tgt, val, env, ctx):
     """Assign an already-evaluated value to one target -- a name, an attribute, or a (bounds-checked)
     subscript -- so a tuple unpacking with mixed targets (the in-place swap a[i], a[j] = a[j], a[i]) reuses
@@ -4854,8 +5392,13 @@ def _havoc_val(prev, nm):
     (a missed PROVED), never a wrong verdict."""
     if isinstance(prev, _SafeContainer):
         return _SafeContainer("hv_" + nm, byteslike=prev.byteslike, unindexable=prev.unindexable)
+    if isinstance(prev, tuple):             # a list / tuple literal (a = [0]; a = a + [i]) crossing the loop stays a
+        return _SafeContainer("hv_" + nm)   # sequence of opaque length, so a later len / index / concat is modeled
     if _is_str(prev):
         return z3.String("hv_" + nm)        # a string accumulator (out = out + c) stays a string, not an int
+    if _is_fp(prev):                        # a float accumulator (x = x + 1.0) stays a float, not an int -- else a
+        return z3.FreshConst(_F64, "hv_" + nm)   # later float-only op (a bitwise x & 1, a TypeError) is unsoundly
+        #                                          modeled as a valid int operation
     return z3.FreshInt("hv_" + nm)
 
 
@@ -4899,6 +5442,8 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
     saved_np, saved_fa = ctx.numeric_params, ctx.func_aliases
     ctx.func_aliases = _functional_aliases(_mod)              # names bound to torch.nn.functional in this module
     ctx.tracked_dicts = _tracked_dict_names(fn)               # this function's value-engine-modeled dicts
+    ctx.readonly_dicts = _readonly_dict_names(fn)             # dict params whose reads d[k] memoize to a stable value
+    ctx.dval_cache = {}                                       # fresh per symexec run
     ctx.mutate_once = _mutate_once_containers(fn)             # containers whose single .pop()/.remove() is sound to model
     ctx.numeric_params = frozenset(a.arg for a in _params     # params explicitly typed int/float/bool: a number, so
                                    if isinstance(a.annotation, ast.Name)   # a method call on one is an AttributeError,
@@ -4995,8 +5540,27 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         ev(s.value, e, ctx); ev(tgt.value, e, ctx)   # a.b = v: a store raises at most AttributeError
                         nxt.append((e, p))
                     elif _TRAPFREE and isinstance(tgt, ast.Subscript):
-                        ev(s.value, e, ctx)                  # a[i] = v: a write through an opaque container
-                        base = ev(tgt.value, e, ctx)         # (attribute or dict literal) raises no modeled trap;
+                        val = ev(s.value, e, ctx)            # a[i] = v: the stored value is trap-checked
+                        base = ev(tgt.value, e, ctx)         # a write through an opaque container raises no modeled trap
+                        if (isinstance(base, _ListLit) and isinstance(tgt.value, ast.Name)
+                                and not isinstance(tgt.slice, ast.Slice)):
+                            # a = [1, 2, 3]; a[i] = v -- a mutable list literal of known length: IndexError when i is
+                            # out of [-n, n) (modeled exactly against the known length), else the element is updated
+                            # (exact for a constant index; an opaque-element container of the same length for a
+                            # symbolic one, which is sound -- the length is unchanged and elements become arbitrary).
+                            n = len(base)
+                            idx = ev(tgt.slice, e, ctx)
+                            if not (z3.is_expr(idx) and z3.is_int(idx)):
+                                raise Unsupported("list item assignment with a non-integer index")
+                            if ctx.traps is not None:
+                                ctx.traps.append(z3.And(p, z3.Or(idx < -n, idx >= n)))   # IndexError on store
+                            e2 = dict(e)
+                            if z3.is_int_value(idx) and -n <= idx.as_long() < n:
+                                items = list(base); items[idx.as_long()] = val
+                                e2[tgt.value.id] = _ListLit(items)            # exact element update at a constant index
+                            else:
+                                e2[tgt.value.id] = _SafeContainer("listmut", length=z3.IntVal(n))
+                            nxt.append((e2, p)); continue
                         if not isinstance(base, _Opaque):    # a scalar -> UNKNOWN; a sequence parameter is bounds-
                             raise Unsupported("item assignment to a possibly non-container")   # checked like a load
                         if isinstance(base, _NdArray):
@@ -5128,7 +5692,11 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         # here is real and witnessable -- it refutes even though later iterations are havoc'd.
                         st, se, sh = ctx.traps, ctx.exact_traps, ctx.havoc
                         first = []; ctx.traps, ctx.exact_traps = first, None
-                        e1 = dict(e); e1[s.target.id] = z3.FreshInt("fe_" + s.target.id)
+                        e1 = dict(e); _fe = z3.FreshInt("fe_" + s.target.id)
+                        if itv.byteslike and not itv.unindexable and ctx.facts is not None:   # a bytes / bytearray
+                            ctx.facts.append(z3.And(_fe >= 0, _fe <= 255))                     # element is an int in
+                        e1[s.target.id] = _fe                          # [0, 255]: the exact first-iteration element is
+                        #                                                a real byte, never -1 (no fabricated trap)
                         enter = z3.And(p, _container_len(itv, ctx) >= 1)
                         try:
                             walk(s.body, e1, enter)
@@ -5159,6 +5727,12 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         he[s.target.id] = _SafeContainer("ielem_" + s.target.id, immutable=_pr.immutable,
                                                          length=_il, unindexable=_pr.unindexable,
                                                          byteslike=_pr.byteslike, elem=_pr.elem)
+                    elif isinstance(itv, _SafeContainer) and itv.byteslike and not itv.unindexable \
+                            and isinstance(s.target, ast.Name):           # iterating bytes / bytearray yields ints in
+                        _be = z3.FreshInt("belem_" + s.target.id)         # [0, 255], so an element op -- x % 16, or
+                        if ctx.facts is not None:                         # 1000 // (x + 1), never 0 -- decides over
+                            ctx.facts.append(z3.And(_be >= 0, _be <= 255))   # every byte rather than abstaining
+                        he[s.target.id] = _be
                     body_p = p
                     if isinstance(itv, _DictParam) and isinstance(s.target, ast.Name):
                         kv = he[s.target.id]                  # iterating a dict yields keys: the loop variable is a member
