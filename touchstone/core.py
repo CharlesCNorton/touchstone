@@ -4149,7 +4149,11 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 for b in (node.slice.lower, node.slice.upper, node.slice.step):   # but a bound expression can (10 // k)
                     if b is not None:
                         ev(b, env, ctx)
-                return z3.FreshInt("helem")
+                # a slice is a sub-sequence, never a scalar -- model it as an opaque sequence, not a fresh int,
+                # so a later arithmetic op on it abstains (Unsupported -> UNKNOWN) rather than fabricating a
+                # scalar trap: an opaque ndarray's a[1:] / a[:-1] (diffusers VQ-diffusion alpha_schedules) must
+                # not REFUTE as a ZeroDivisionError that numpy never raises (it yields nan element-wise).
+                return _SafeContainer("slice")
             idx = ev(node.slice, env, ctx)
             if isinstance(base, _SafeContainer) and ctx.traps is not None \
                     and z3.is_expr(idx) and idx.sort() == z3.IntSort():

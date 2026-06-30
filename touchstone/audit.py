@@ -7671,6 +7671,14 @@ def run_self_tests(fast=False):
     assert check("import bisect\ndef f(xs: list, x):\n    return bisect.bisect(xs, x)\n", target="f").status == PROVED
     assert check("import heapq\ndef f(xs: list):\n    heapq.heapify(xs)\n    return 0\n", target="f").status == PROVED
     assert check("import math\ndef f(x: float):\n    return math.ldexp(x, 2)\n", target="f").status == PROVED
+    # SOUNDNESS: a slice of a bare opaque value (an unmodeled call / attribute result) is a sub-sequence, never
+    # a scalar, so an arithmetic op on it abstains rather than fabricating a scalar trap. The ndarray idiom
+    # a[1:] / a[:-1] (diffusers VQ-diffusion alpha_schedules) raises nothing in numpy -- it yields nan element-
+    # wise -- so it must NOT REFUTE as a reachable ZeroDivisionError; a divisor that is a slice is never a zero scalar.
+    assert check("def f(o):\n    a = o.compute()\n    return a[1:] / a[:-1]\n", target="f").status == UNKNOWN
+    assert check("def f(o):\n    a = o.compute()\n    return 5 // a[1:]\n", target="f").status == UNKNOWN
+    assert check("import numpy as np\ndef f(n):\n    att = np.arange(0, n) / (n - 1)\n    att = np.concatenate(([1], att))\n    return att[1:] / att[:-1]\n", target="f").status != REFUTED
+    assert check("def f(o):\n    a = o.compute()\n    return a[1:]\n", target="f").status == PROVED   # the slice itself is still trap free
 
     # Count the asserts by parsing the whole file and walking the run_self_tests definition. inspect.getsource's
     # tokenize-based block detection can under-read the function on some platforms (undercounting the suite), so
