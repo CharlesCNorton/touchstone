@@ -2252,6 +2252,14 @@ def run_self_tests(fast=False):
     assert check("def f(xs: list):\n    if len(xs) > 0:\n        return min(xs)\n    return 0\n").status == PROVED
     assert check("def f(xs: list):\n    if xs:\n        return max(xs)\n    return 0\n").status == PROVED   # truthiness guard
     assert check("def f(xs: list):\n    return min(xs, default=0)\n").status == PROVED   # a default never raises
+    # min/max of an empty literal: bare raises ValueError (REFUTED); a default= makes it total, returning the
+    # default (PROVED), even through later arithmetic; a default expression that itself traps still refutes.
+    assert check("def f():\n    return min([], default=5) + 1\n").status == PROVED
+    assert check("def f():\n    return max((), default=-1)\n").status == PROVED
+    assert check("def f():\n    return min([])\n").status == REFUTED
+    assert check("def f():\n    return max(())\n").status == REFUTED
+    assert check("def f(x: int):\n    return min([], default=10 // x)\n").status == REFUTED   # default expr divides by x
+    assert check("def f():\n    v = min([], default=None)\n    if v is None:\n        return 0\n    return v + 1\n").status == PROVED
     # an emptiness guard written as truthiness (`if c:` / `if not c:`), not only `len(c) > 0`, connects to the
     # container's length, so a guarded index or reduction proves while the unguarded form still refutes and a
     # guard too weak for the index (non-empty but read past element 0) is still refuted.
@@ -2474,6 +2482,12 @@ def run_self_tests(fast=False):
     assert check("def f(xs: list):\n    return sorted(xs, key=str)\n").status == PROVED
     assert check("def f(xs: list):\n    return max(xs, key=str)\n").status == REFUTED                      # empty -> ValueError
     assert check("def f(xs: list):\n    if xs:\n        return max(xs, key=repr)\n    return ''\n").status == PROVED
+    # list(s) / sorted(s) of a STRING is a list of 1-char strings, so an element is a string: ''.join(sorted(s)) proves,
+    # s[i].upper() proves, and c[0] + 1 refutes (str + int) -- previously elements were modeled as ints (a false PROVED).
+    assert check("def f(s: str):\n    return ''.join(sorted(s))\n").status == PROVED
+    assert check("def f(s: str):\n    c = sorted(s)\n    if c:\n        return c[0] + 1\n    return 0\n").status == REFUTED
+    assert check("def f(s: str):\n    c = list(s)\n    if c:\n        return c[0].upper()\n    return ''\n").status == PROVED
+    assert check("def f(xs: list):\n    c = sorted(xs)\n    if c:\n        return c[0] + 1\n    return 0\n").status == PROVED   # list source: int elements
     # getattr(o, "name"[, default]) with a constant name models the field o.name (a stable value, duck-typed numeric),
     # and a parameter used as getattr/hasattr(o, ...) is inferred an object, so arithmetic on a getattr is decided.
     assert check("def f(o):\n    return getattr(o, \"x\", 0) + 1\n").status == PROVED
@@ -2630,6 +2644,12 @@ def run_self_tests(fast=False):
     assert check("def f(d: dict):\n    return d.pop('k')\n").status == REFUTED                    # pop a possibly-missing key
     assert check("def f(d: dict, k):\n    if k in d:\n        return d.pop(k)\n    return 0\n").status == PROVED
     assert check("def f(d: dict):\n    return d.pop('k', 0)\n").status == PROVED                  # a default never raises
+    # dict.popitem() on a dict parameter mutated once: KeyError on an empty dict (like list/set pop), so an
+    # unguarded popitem refutes and a len() guard proves; the popped value is an arbitrary (key, value) 2-tuple.
+    assert check("def f(d: dict):\n    return d.popitem()\n").status == REFUTED                   # empty dict: KeyError
+    assert check("def f(d: dict):\n    k, v = d.popitem()\n    return 0\n").status == REFUTED      # same trap, unpacked
+    assert check("def f(d: dict):\n    if len(d) > 0:\n        return d.popitem()\n    return None\n").status == PROVED
+    assert check("def f(d: dict):\n    a = d.popitem()\n    b = d.popitem()\n    return 0\n").status == UNKNOWN   # two pops: not mutate-once
     assert check("def f(xs: list):\n    if len(xs) >= 1:\n        a = xs.pop()\n        b = xs.pop()\n"
                  "        return a + b\n    return 0\n").status == UNKNOWN   # popped twice: abstains
     assert check("def f(xs: list):\n    x = xs.pop()\n    xs.append(x)\n    return x\n").status == UNKNOWN   # pop + append: excluded
@@ -5528,11 +5548,14 @@ def run_self_tests(fast=False):
     assert check("def f(n: int):\n    x = 1.5\n    for i in range(n):\n        x = x + 1.0\n    return x | 1\n", target="f").status != PROVED
     assert check("def f(n: int):\n    x = 1.5\n    for i in range(n):\n        x = x + 1.0\n    return x + 2.0\n", target="f").status == PROVED
     assert check("def f(n: int):\n    x = 0.0\n    for i in range(n):\n        x = x + 1.0\n    return x * 2.0\n", target="f").status == PROVED
-    # variable bit-shift x << k / x >> k: a negative count is a ValueError and the value is over-approximated, so
-    # a k >= 0 guard proves trap freedom while the unguarded shift abstains (like x ** y); a constant shift stays exact.
+    # variable bit-shift x << k / x >> k: a negative count is a ValueError. The count is exact even though the
+    # shifted value is over-approximated, so the negative-count trap is hard (refutes despite the fuzzy value):
+    # an unguarded shift refutes, a k >= 0 guard proves trap freedom, and a constant non-negative shift stays exact.
     assert check("def f(x: int, k: int):\n    if k >= 0:\n        return x << k\n    return 0\n", target="f").status == PROVED
     assert check("def f(x: int, k: int):\n    if k >= 0:\n        return x >> k\n    return 0\n", target="f").status == PROVED
-    assert check("def f(x: int, k: int):\n    return x << k\n", target="f").status == UNKNOWN              # negative count over-approx
+    assert check("def f(x: int, k: int):\n    return x << k\n", target="f").status == REFUTED              # k may be negative
+    assert check("def f(x: int, k: int):\n    return x >> k\n", target="f").status == REFUTED
+    assert check("def f():\n    return 1 << -1\n", target="f").status == REFUTED                            # constant negative count
     assert check("def f(x: int):\n    return x << 3\n", target="f").status == PROVED
     # del of a subscript or attribute target: del c[i] traps as a read does (IndexError / KeyError), a guarded
     # delete proves, and del o.attr raises no modeled trap.
@@ -6124,6 +6147,12 @@ def run_self_tests(fast=False):
     assert check("def f(a: int, b: int):\n    return len(range(a, b, 0))\n", target="f").status == REFUTED   # zero step: ValueError
     assert check("def f(a: int, b: int, s: int):\n    return len(range(a, b, s))\n", target="f").status == REFUTED   # non-constant step: ValueError when s == 0
     assert check("def f(a: int, b: int, s: int):\n    if s != 0:\n        return len(range(a, b, s))\n    return 0\n", target="f").status == PROVED   # guarded
+    # a constant zero step refutes in any consuming context, not only len(): the post-trap value is a consumable
+    # container, so list()/sum()/a bare return reach the trap instead of choking on an opaque.
+    assert check("def f():\n    return list(range(0, 10, 0))\n", target="f").status == REFUTED
+    assert check("def f():\n    return sum(range(1, 9, 0))\n", target="f").status == REFUTED
+    assert check("def f():\n    return range(0, 10, 0)\n", target="f").status == REFUTED
+    assert check("def f():\n    return len(list(range(0, 10, 2))) == 5\n", target="f").status == PROVED   # nonzero step: total
     assert check("def f(n: int):\n    return sum(range(n))\n", target="f").status == PROVED             # sized: sum is total
     # a single-generator list comprehension [e for x in it] is a NEW sized list: its length is the iterable's
     # length with no filter (so c = [0 for i in range(n)]; c[i] bounds-checks against n -- guarded by 0 <= i <
@@ -6286,6 +6315,16 @@ def run_self_tests(fast=False):
     assert check("def f(nums):\n    s = 0\n    for i, x in enumerate(nums):\n        s = s + i + x\n    return s\n", target="f").status == PROVED
     assert check("def f(n):\n    s = 0\n    for i, x in enumerate(range(n)):\n        s = i + x\n    return s\n", target="f").status == PROVED
     assert prove("def f():\n    s = 0\n    for i, x in enumerate((10, 20, 30)):\n        s = s + i\n    return s\n", "result == 3", target="f").status == PROVED
+    # the enumerate index (a monotonic counter) carries i >= start through the loop havoc, so a guard if i < start
+    # is dead (PROVED) and a divide by the index decides; the bound never suppresses a real trap or over-claims.
+    assert check("def f(xs: list):\n    for i, v in enumerate(xs, 1):\n        if i < 1:\n            return 1 // 0\n    return 0\n").status == PROVED
+    assert check("def f(xs: list, k: int):\n    for i, v in enumerate(xs, k):\n        if i < k:\n            return 1 // 0\n    return 0\n").status == PROVED
+    assert check("def f(xs: list):\n    t = 0\n    for i, v in enumerate(xs, 1):\n        t = 10 // i\n    return t\n").status == PROVED   # i >= 1: safe
+    assert check("def f(xs: list):\n    for i, v in enumerate(xs, 1):\n        if i < 2:\n            return 1 // 0\n    return 0\n").status == REFUTED   # i == 1 reachable
+    assert check("def f(xs: list):\n    for i, v in enumerate(xs):\n        y = xs[i]\n    return 0\n").status == UNKNOWN   # i >= 0 alone proves no upper bound
+    # a descending for-loop counter carries i <= start the same way (a generalization beyond enumerate); a
+    # conditionally-reset counter is not monotonic, so no bound is assumed.
+    assert check("def f(xs: list):\n    i = 10\n    for x in xs:\n        if i > 10:\n            return 1 // 0\n        i = i - 1\n    return 0\n").status == PROVED
     # a slice bound is trap-checked: ys[10 // k :] divides by k, so k == 0 refutes;
     # a clean slice still decides.
     assert check("def f(ys, k):\n    return ys[10 // k:]\n", target="f").status == REFUTED

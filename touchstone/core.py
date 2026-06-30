@@ -3282,7 +3282,13 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 return l * (2 ** k) if op is ast.LShift else py_floordiv(l, z3.IntVal(2 ** k))
             if _TRAPFREE:                                    # x << k / x >> k by a variable count: a negative count is
                 if ctx.traps is not None:                    # a ValueError, the value an over-approximation (2**k is nonlinear)
-                    ctx.traps.append(z3.And(ctx.pc, r < 0))
+                    trap = z3.And(ctx.pc, r < 0)             # negative shift count: ValueError (an exact trap condition)
+                    hard = getattr(ctx, "hard_traps", None)
+                    if (hard is not None and not getattr(ctx, "overapprox", False)
+                            and not getattr(ctx, "havoc", False)):
+                        hard.append(trap)                    # operands exact: refutes despite the over-approximated value
+                    else:
+                        ctx.traps.append(trap)               # operands possibly over-approximated: leave it suppressible
                 _note_overapprox(ctx, "a variable bit shift")
                 return z3.FreshInt("shift")
             raise Unsupported(f"{op.__name__} requires a constant non-negative shift")
@@ -3635,7 +3641,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if s == 0:
                 if ctx.traps is not None:
                     ctx.traps.append(ctx.pc)                  # range() arg 3 must not be zero: ValueError
-                return _Opaque("range")                       # the value is irrelevant past the trap
+                return _SafeContainer("range", immutable=True)   # a consumable value past the trap, so list(range(
+                #                                                  0, 10, 0)) reaches the trap instead of choking
             # length = ceil((stop - start) / step) clamped at 0; dividing by a positive quantity (s or -s) makes
             # the floor identity floor((k + s - 1) / s) == ceil(k / s) exact, and the clamp handles the empty case.
             length = (stop - start + (s - 1)) / s if s > 0 else (start - stop + (-s - 1)) / (-s)
@@ -3728,7 +3735,9 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if isinstance(x, _SafeContainer):
                 n = _container_len(x, ctx)
             elif _is_str(x):
-                n = z3.Length(x)
+                # list(s) / sorted(s) of a string is a list of 1-char STRINGS (not ints): a _StrSeq, so an element is a
+                # string (s[i].upper() works, s[i] + 1 is a refutable TypeError) and ''.join(sorted(s)) proves.
+                return _StrSeq(name, length=z3.Length(x))
             elif isinstance(x, tuple):
                 n = z3.IntVal(len(x))
             elif isinstance(x, (_DictParam, _DictLit, _MapVal)):
@@ -3794,6 +3803,19 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 _kw = {k.arg for k in node.keywords}
                 if isinstance(seq, tuple) and seq:           # a non-empty literal is total and exact
                     vals = list(seq)
+                elif isinstance(seq, tuple):                 # an empty literal: min([]) raises ValueError; a
+                    _has_dflt = False; dflt = None           # default= makes it total, returning that default
+                    for k in node.keywords:
+                        if k.arg == "default":
+                            dflt = ev(k.value, env, ctx); _has_dflt = True
+                        else:
+                            ev(k.value, env, ctx)
+                    if _has_dflt:
+                        return dflt
+                    if _TRAPFREE and ctx.traps is not None:
+                        ctx.traps.append(ctx.pc)             # min/max of an empty sequence always raises
+                        return z3.FreshInt(name)
+                    raise Unsupported(f"{name}() of an empty sequence raises ValueError")
                 elif (_TRAPFREE and isinstance(seq, _SafeContainer) and ctx.traps is not None):
                     keynode = None                           # an opaque sequence parameter: ValueError when empty,
                     for k in node.keywords:                  # against its symbolic length, so a len() / truthiness
@@ -4503,6 +4525,11 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     return z3.FreshInt("dpop")
             if isinstance(recv, _DictParam) and len(a) == 2:
                 return z3.FreshInt("dpopdef")                                      # dict.pop(k, default): never raises
+        if meth == "popitem" and isinstance(recv, _DictParam) and ctx.traps is not None and not BEST_EFFORT \
+                and _gated and not a:
+            n = _container_len(recv, ctx)
+            ctx.traps.append(z3.And(ctx.pc, n <= 0))                               # popitem() on an empty dict: KeyError
+            return (z3.FreshInt("pik"), z3.FreshInt("piv"))                        # the popped (key, value) 2-tuple
         # list.index(x) / tuple.index(x) / list.remove(x): ValueError when x is not present, against the
         # sequence's stable membership predicate, so an `x in xs` guard proves it. index is non-mutating, so it
         # is modeled on any sequence parameter -- a tuple included; remove mutates, so it is list-only (not an
@@ -5373,7 +5400,7 @@ def _mutate_once_containers(fn):
     for n in ast.walk(fn):
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name):
             nm = n.func.value.id
-            if n.func.attr in ("pop", "remove"):
+            if n.func.attr in ("pop", "remove", "popitem"):
                 tracked[nm] = tracked.get(nm, 0) + 1
             elif n.func.attr in _MUTATING_METHODS:
                 other.add(nm)
@@ -5974,6 +6001,11 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         if isinstance(e.get(nm), _NoneVal) or nm in bnone:   # a possibly-None var havoc'd to an
                             ctx.none_havoc = True              # int would mask a real None-trap, so withhold PROVED
                         he[nm] = _havoc_val(e.get(nm), nm)      # loop variable and body-written names: arbitrary
+                    for _cn, _cs in _loop_counters(s.body).items():   # a monotonic counter (i = i + c, e.g. the
+                        _init = e.get(_cn)                            # enumerate index from for i, x in enumerate(C, s))
+                        if (z3.is_expr(_init) and _init.sort() == z3.IntSort() and ctx.facts is not None
+                                and z3.is_expr(he.get(_cn)) and he[_cn].sort() == z3.IntSort()):
+                            ctx.facts.append(he[_cn] >= _init if _cs > 0 else he[_cn] <= _init)   # i >= start: dead guard
                     if _is_str(itv) and isinstance(s.target, ast.Name):   # iterating a string yields 1-char strings,
                         cs = z3.String("selem_" + s.target.id)            # so a body doing ord(c) / len(c) / c == '?'
                         if ctx.facts is not None:                         # decides (an arbitrary char over-approximates
