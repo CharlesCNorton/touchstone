@@ -6036,12 +6036,12 @@ def verify_no_raise(prop, target, src, pre, repo=None, timeout=4000) -> Verdict:
     if _strparams and any(isinstance(n, ast.Name) and n.id in _strparams for n in ast.walk(fn)):
         return Verdict(UNKNOWN, prop, target, "exception safety",
                        reason="a str/bytes-typed parameter is outside the integer CHC model (value engine decides)")
-    # an object-typed parameter bound as an integer would read a scalar op on it (100 // proto) as a total
-    # integer op, though it is a TypeError on the real object; abstain so the value engine decides it.
+    # an object-typed parameter is carried as an opaque receiver (core._param_term, below) rather than bound as a
+    # z3.Int: it stays out of the integer Horn state, a scalar op on it (100 // proto) makes ev abstain so the
+    # construction declines, and a function that references the object but reasons over its integer state is decided
+    # here instead of bailing. (A non-integer value that would cross a block still abstains via tup, so the object's
+    # own values never enter the Int relations -- soundness is unchanged.)
     _objparams = {a.arg for a in fn.args.args if core._is_object_annotation(a.annotation)}
-    if _objparams and any(isinstance(n, ast.Name) and n.id in _objparams for n in ast.walk(fn)):
-        return Verdict(UNKNOWN, prop, target, "exception safety",
-                       reason="an object-typed parameter is outside the integer CHC model (value engine decides)")
     # a float parameter bound as a z3.Int loses IEEE-754 semantics (NaN non-reflexivity, signed zero, the
     # infinities), so a trap guarded by them reads as unreachable; abstain so the value engine decides it over z3.FP.
     _floatparams = {a.arg for a in fn.args.args
@@ -6092,9 +6092,10 @@ def verify_no_raise(prop, target, src, pre, repo=None, timeout=4000) -> Verdict:
         blocks, entry = _build_cfg(fn.body, _ub)
     except Unsupported as u:
         return Verdict(UNKNOWN, prop, target, "exception safety", reason=str(u))
-    order = _cfg_vars(fn, blocks)
+    order = [v for v in _cfg_vars(fn, blocks) if v not in _objparams]   # object params carried opaque, not Int state
     ctx = Ctx(repo or {}); ctx.divvars = []
-    cur = {v: z3.Int("s_" + v) for v in order}
+    _const_env = {a.arg: core._param_term(a) for a in fn.args.args if a.arg in _objparams}   # opaque receivers
+    cur = {**_const_env, **{v: z3.Int("s_" + v) for v in order}}
     R = {bid: z3.Function(f"R{bid}", *([z3.IntSort()] * len(order)), z3.BoolSort()) for bid in blocks}
     Err = z3.Function("ErrRaise", z3.BoolSort())
     rules = []
@@ -6134,7 +6135,7 @@ def verify_no_raise(prop, target, src, pre, repo=None, timeout=4000) -> Verdict:
     except (Unsupported, z3.Z3Exception, KeyError, TypeError) as u:   # a z3 sort/type clash leaves the body unmodelable
         return Verdict(UNKNOWN, prop, target, "exception safety", reason=str(u))
     return _solve_horn(prop, target, "exception safety", "exception safety (CFG/CHC)",
-                       list(R.values()) + [Err], [*cur.values(), *ctx.divvars], rules, Err(),
+                       list(R.values()) + [Err], [v for v in cur.values() if z3.is_expr(v)] + list(ctx.divvars), rules, Err(),
                        on_error=lambda m: "engine error", proved_reason="no uncaught raise reachable",
                        refuted_reason="an uncaught raise is reachable")
 

@@ -2595,6 +2595,13 @@ def run_self_tests(fast=False):
     # a heap ternary's test truthiness is collection-aware (items[0] if self.items else 0 proves), each branch is
     # trap-checked under its path condition, and a side-effecting branch (a call) abstains rather than mutate both.
     assert check("class C:\n    def __init__(self):\n        self.items = []\n    def first(self):\n        return self.items[0] if self.items else 0\n\ndef f():\n    c = C()\n    return c.first()\n").status == PROVED
+    # the value engine's ternary is collection-aware for the value-or-None idiom too: x[i] if x else None proves
+    # (the guarded index is in bounds, the None branch is trap-free), an unguarded one refutes, and the int-or-None
+    # result is an opaque union -- a later operation on it abstains, never a false trap from treating None as a number.
+    assert check("def f(xs: list):\n    return xs[0] if xs else None\n").status == PROVED
+    assert check("def f(xs: list):\n    return xs[0] if len(xs) > 0 else None\n").status == PROVED
+    assert check("def f(xs: list):\n    return xs[0] if True else None\n").status == REFUTED
+    assert check("def f(xs: list):\n    y = xs[0] if xs else None\n    return y + 1\n").status == UNKNOWN
     # a method's unfilled trailing parameter takes its default (so the trap in 10 // x with x=0 is found), the
     # one-expression C(...).m() form constructs then dispatches on the fresh exact-type instance, and a dict-attribute
     # read raises KeyError on an absent key.
@@ -6314,6 +6321,15 @@ def run_self_tests(fast=False):
     _C6 = "class C:\n    def get(self):\n        return 1\n    def bad(self):\n        return 10 // 0\n"
     assert check(_C6 + "def f(o: C):\n    return o.bad()\n", target="f").status == REFUTED        # dispatch still upgrades
     assert check(_C6 + "def f(o: C):\n    return o.get()\n", target="f").status == PROVED
+    # an object-typed parameter that is referenced is carried as an opaque receiver through the CHC (kept out of the
+    # integer Horn state) rather than bailing: a clean counted loop proves, a reachable integer trap refutes, and a
+    # scalar op on the object itself (100 // proto, a TypeError) still abstains -- never a false verdict.
+    _OP = "def f(proto: Conf, n: int):\n    s = 0\n    for i in range(n):\n        s = s + 1\n    %s\n    return proto\n"
+    assert check(_OP % "pass", target="f").status == PROVED               # object carried; the loop is clean
+    assert check(_OP % "x = 10 // n", target="f").status == REFUTED       # a reachable integer trap (n == 0) refutes
+    assert check("def f(proto: Conf, n: int):\n    for i in range(n):\n        x = 10 // i\n    return proto\n",
+                 target="f").status == REFUTED                            # a per-element trap (i == 0) refutes
+    assert check("def f(proto: Conf, n: int):\n    return 100 // proto\n", target="f").status == UNKNOWN   # object scalar op abstains
     # dispatch on o: C considers each module subclass override (the receiver could be any subclass), so a trap in
     # a subclass method refutes (including through a multi-level hierarchy), while all-safe overrides prove.
     assert check("class B:\n    def m(self):\n        return 1\nclass S(B):\n    def m(self):\n        return 10 // 0\n"

@@ -3467,13 +3467,25 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         return _CMP[op](l, r)
     if isinstance(node, ast.IfExp):
         t = _as_bool(ev(node.test, env, ctx), ctx)
+        # a ternary `b if test else o` whose branches share a z3 sort is one z3.If. Branches of different sorts
+        # (a value-or-None idiom `x[i] if x else None`, or a mixed int/str) have no common z3.If: both are still
+        # evaluated under their path conditions, so each is trap-checked, and the result is an opaque union -- a
+        # bare return of it is trap-free, and any operation on it abstains (Unsupported -> UNKNOWN), so the union
+        # never yields a false trap.
+        def _ifexp(b, o):
+            if z3.is_expr(b) and z3.is_expr(o):
+                if b.sort() == o.sort():
+                    return z3.If(t, b, o)
+                if all(z3.is_int(x) or z3.is_bool(x) for x in (b, o)):   # bool and int share no sort: coerce both to int (False -> 0)
+                    return z3.If(t, _as_int(b), _as_int(o))
+            return _Opaque("ifexp")
         if ctx.traps is None:
-            return z3.If(t, ev(node.body, env, ctx), ev(node.orelse, env, ctx))
+            return _ifexp(ev(node.body, env, ctx), ev(node.orelse, env, ctx))
         old = ctx.pc
         ctx.pc = z3.And(old, t); b = ev(node.body, env, ctx)
         ctx.pc = z3.And(old, z3.Not(t)); o = ev(node.orelse, env, ctx)
         ctx.pc = old
-        return z3.If(t, b, o)
+        return _ifexp(b, o)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
         name = node.func.id
         if name in env and isinstance(env[name], _NoneVal):  # calling a name bound to None raises TypeError: a trap
