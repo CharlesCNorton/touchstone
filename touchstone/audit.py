@@ -3297,6 +3297,12 @@ def run_self_tests(fast=False):
     assert _bdecide("def g(obj, base_type=(str, bytes)):\n    if isinstance(obj, base_type):\n        return 1\n    return 0\n", {}).status != PROVED
     assert _bdecide("def f(x):\n    if isinstance(x, int):\n        return 1\n    return 0\n", {}).status == PROVED
     assert _bdecide("def f(x):\n    return isinstance(x, (int, str))\n", {}).status == PROVED
+    # the nested-callable guard counts only the calls the subject makes in its OWN scope: a nested function it
+    # merely defines and returns (a decorator/factory, or a recursive closure that only calls itself) does not
+    # run when the subject runs, so it must not gate the proof -- while a nested generator the subject
+    # materializes (list(g())) still does.
+    assert _bdecide("def deco(fn):\n    def wrap(x):\n        return fn(wrap(x))\n    return wrap\n", {}).status == PROVED
+    assert _bdecide("def mk(cond, fn):\n    def _map(obj):\n        if cond(obj):\n            return fn(obj)\n        return tuple(_map(x) for x in obj)\n    return _map\n", {}).status == PROVED
     # SOUNDNESS: the recursion engine declines a NON-self-recursive function (it models parameters as integers
     # with no container guard, so it would otherwise vacuously prove `return a + 1` for a list -- a TypeError).
     # Such a function is decided by the earlier guarded engines instead.

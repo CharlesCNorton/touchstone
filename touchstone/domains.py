@@ -3687,6 +3687,24 @@ def _guard_target_fn(src, target):
     return _fndef(src)
 
 
+def _calls_in_scope(fn):
+    """Bare-name calls made directly in fn's own scope -- NOT inside a nested def / lambda / class, whose calls
+    run only when that nested callable itself runs, not when fn runs. So a nested function that fn merely
+    defines and returns (or that only calls itself recursively) is not counted as called by fn."""
+    names = set()
+
+    def rec(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                continue                                         # a nested scope: its calls are its own concern
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                names.add(child.func.id)
+            rec(child)
+
+    rec(fn)
+    return names
+
+
 def _nested_called_trapfree(src, repo, target=None):
     """A PROVED trap-freedom verdict is sound only if every nested function the subject CALLS is itself trap
     free: calling a plain nested function runs its body immediately, and materializing a nested generator
@@ -3700,9 +3718,8 @@ def _nested_called_trapfree(src, repo, target=None):
     nested = _direct_nested_defs(fn)
     if not nested:
         return True
-    called = {c.func.id for c in ast.walk(fn)
-              if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
-    called_nested = [g for g in nested if g.name in called]
+    called = _calls_in_scope(fn)                             # only calls fn itself makes -- a nested function it
+    called_nested = [g for g in nested if g.name in called]  # merely defines and returns does not run in fn
     if not called_nested:
         return True                                          # every nested def is defined but never called here
     global _NESTED_GUARD_DEPTH
@@ -3768,9 +3785,8 @@ def _called_constructors_trapfree(src, repo, target=None):
     classes = _module_classes(src, repo)
     if not classes:
         return True
-    called = {c.func.id for c in ast.walk(fn)
-              if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in classes}
-    if not called:
+    called = {c for c in _calls_in_scope(fn) if c in classes}   # only classes fn constructs directly, not those
+    if not called:                                              # constructed inside a nested function it defines
         return True
     global _NESTED_GUARD_DEPTH
     if _NESTED_GUARD_DEPTH >= _NESTED_GUARD_MAX:
