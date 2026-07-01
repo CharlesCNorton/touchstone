@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "touchstone-prover"
-version = "1.39.0"
+version = "1.40.0"
 description = "An SMT-based verifier for Python with a machine-checked trust base."
 readme = "README.md"
 requires-python = ">=3.11"

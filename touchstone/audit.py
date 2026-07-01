@@ -3289,6 +3289,14 @@ def run_self_tests(fast=False):
     # constructor, whose raise the top-level engines miss); a trap-free constructor still proves.
     assert _bdecide("class C:\n    def __init__(self, p):\n        if not p:\n            raise ValueError(1)\ndef make(p):\n    return C(p)\n", {}).status != PROVED
     assert _bdecide("class C:\n    def __init__(self, a, b):\n        self.a = a\n        self.b = b\ndef make(x):\n    return C(x, x)\n", {}).status == PROVED
+    # isinstance(x, T) requires T to be a type or tuple of types; a T bound to a modeled scalar (a bare parameter
+    # or local, which the engine models as an int) is never a type, so isinstance raises TypeError -- not proved
+    # trap-free (a value engine that read isinstance as always-safe while modeling T as an int was inconsistent).
+    # A concrete type name or tuple of them still proves.
+    assert _bdecide("def f(x, t):\n    return isinstance(x, t)\n", {}).status != PROVED
+    assert _bdecide("def g(obj, base_type=(str, bytes)):\n    if isinstance(obj, base_type):\n        return 1\n    return 0\n", {}).status != PROVED
+    assert _bdecide("def f(x):\n    if isinstance(x, int):\n        return 1\n    return 0\n", {}).status == PROVED
+    assert _bdecide("def f(x):\n    return isinstance(x, (int, str))\n", {}).status == PROVED
     # SOUNDNESS: the recursion engine declines a NON-self-recursive function (it models parameters as integers
     # with no container guard, so it would otherwise vacuously prove `return a + 1` for a list -- a TypeError).
     # Such a function is decided by the earlier guarded engines instead.

@@ -3960,6 +3960,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             raise Unsupported(f"{name}() over a non-tuple iterable")
         if name == "isinstance" and len(node.args) == 2:     # static type test from the value's sort
             v = ev(node.args[0], env, ctx)
+            _tn = node.args[1]                                # the 2nd argument must be a type or tuple of types; a
+            if (ctx.traps is not None and not BEST_EFFORT     # value that is a modeled scalar (a bare parameter or
+                    and isinstance(_tn, ast.Name) and _definitely_not_iterable(env.get(_tn.id))):   # local bound to an
+                ctx.traps.append(ctx.pc)                      # int/float/bool) is never a type -> isinstance TypeError
             if not (z3.is_expr(v) or isinstance(v, tuple)):   # an opaque/unmodeled value: its type is unknown,
                 if _TRAPFREE:                                 # isinstance never traps; the result is arbitrary
                     return z3.FreshConst(z3.BoolSort(), "hi")
