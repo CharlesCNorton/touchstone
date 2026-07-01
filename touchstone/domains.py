@@ -2864,14 +2864,24 @@ def _infer_param_kinds(fn):
             mark(n.iter.id, "container")
         elif isinstance(n, ast.Call):
             f = n.func
-            if (isinstance(f, ast.Name) and f.id in _ITER_CONSUMING_BUILTINS and len(n.args) == 1
-                    and isinstance(n.args[0], ast.Name)):
+            fname = f.id if isinstance(f, ast.Name) else None
+            if (fname in _ITER_CONSUMING_BUILTINS and len(n.args) == 1 and isinstance(n.args[0], ast.Name)):
                 mark(n.args[0].id, "container")              # len/sum/sorted/min/max/any/all/reversed of one Name
             elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
                 if f.attr in _STR_INFER_METHODS:
                     mark(f.value.id, "str")
                 elif f.attr in _CONTAINER_INFER_METHODS:
                     mark(f.value.id, "container")
+            # zip / enumerate / itertools.zip_longest iterate each iterable argument, so each Name argument is a
+            # container -- keeping the modeled and sampled parameter iterable, never a scalar these raise a TypeError on
+            _zl = (isinstance(f, ast.Attribute) and f.attr == "zip_longest"
+                   and isinstance(f.value, ast.Name) and f.value.id == "itertools")
+            if fname in ("zip", "zip_longest") or _zl:
+                for a in n.args:
+                    if isinstance(a, ast.Name):
+                        mark(a.id, "container")
+            elif fname == "enumerate" and n.args and isinstance(n.args[0], ast.Name):
+                mark(n.args[0].id, "container")              # enumerate(seq[, start])
     for n in ast.walk(fn):
         if (isinstance(n, ast.Assign) and len(n.targets) == 1
                 and isinstance(n.targets[0], (ast.Tuple, ast.List)) and isinstance(n.value, ast.Name)):
@@ -3439,6 +3449,11 @@ def _trap_free_for(src, repo):
     tgts = loop.target.elts if isinstance(loop.target, ast.Tuple) else [loop.target]
     if not all(isinstance(t, ast.Name) for t in tgts):
         return Verdict(UNKNOWN, "bench", "f", "for loop")
+    if len(tgts) > 1 and not core._unpack_arity_ok(loop.iter, len(tgts)):
+        # `for a, b in it` unpacks each element; unless the iterable provably yields len(tgts)-tuples
+        # (enumerate/zip/zip_longest), a wrong-shape element raises TypeError/ValueError -- abstain, since
+        # this strategy models the targets as arbitrary independent values and would miss that unpack trap.
+        return Verdict(UNKNOWN, "bench", "f", "for loop")
     pretypes = {}
     for s in before:
         if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
@@ -3598,6 +3613,186 @@ def _trap_free_generator(src, repo):
     return Verdict(PROVED if _has_yield(fn) else UNKNOWN, "bench", "f", "generator")
 
 
+class _StripYields(ast.NodeTransformer):
+    """Rewrite a generator body to the plain code that runs when the generator is materialized (list(g()),
+    a for-loop over g()): `yield e` becomes the expression `e` (still evaluated, so its traps surface) and
+    `yield from e` becomes `e`. A generator's body does not run when called, only when iterated -- this makes
+    the body analyzable as that iterated run, so a trap inside it is seen."""
+    def visit_Yield(self, node):
+        self.generic_visit(node)
+        return node.value if node.value is not None else ast.copy_location(ast.Constant(value=None), node)
+
+    def visit_YieldFrom(self, node):
+        self.generic_visit(node)
+        return node.value
+
+
+def _direct_nested_defs(fn):
+    """The function definitions in fn's own scope -- directly in its body or inside its if/for/while/with/try
+    blocks -- but not those nested inside a deeper def or class (whose interiors are their own scope)."""
+    out = []
+
+    def rec(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.append(child)                            # do not descend: its interior is its own concern
+            elif isinstance(child, ast.ClassDef):
+                continue
+            else:
+                rec(child)
+
+    rec(fn)
+    return out
+
+
+def _hoist_nested_body(g):
+    """A standalone function equivalent to the nested function g's body run in isolation: its yields stripped
+    (so a generator body is analyzed as iterated), its own parameters kept unannotated, and its free variables
+    (a closed-over outer parameter, an unresolved global) added as unannotated parameters, so kind inference
+    types each and the trap-freedom engines analyze the body a materialization would run."""
+    g2 = ast.parse(ast.unparse(g)).body[0]
+    body = [_StripYields().visit(s) for s in g2.body]
+    own = [a.arg for a in g2.args.posonlyargs + g2.args.args + g2.args.kwonlyargs]
+    if g2.args.vararg:
+        own.append(g2.args.vararg.arg)
+    if g2.args.kwarg:
+        own.append(g2.args.kwarg.arg)
+    stored, loaded = set(), set()
+    for s in body:
+        for n in ast.walk(s):
+            if isinstance(n, ast.Name):
+                (stored if isinstance(n.ctx, ast.Store) else loaded).add(n.id)
+    free = sorted(loaded - stored - set(own) - set(dir(builtins)) - {g2.name})
+    params = [ast.arg(arg=a) for a in own] + [ast.arg(arg=x) for x in free]
+    newfn = ast.FunctionDef(
+        name="_nested", args=ast.arguments(posonlyargs=[], args=params, vararg=None, kwonlyargs=[],
+                                           kw_defaults=[], kwarg=None, defaults=[]),
+        body=body or [ast.Pass()], decorator_list=[])
+    mod = ast.Module(body=[newfn], type_ignores=[])
+    ast.fix_missing_locations(mod)
+    return ast.unparse(mod)
+
+
+_NESTED_GUARD_DEPTH = 0
+_NESTED_GUARD_MAX = 3
+
+
+def _guard_target_fn(src, target):
+    """The function the guard analyzes: the named target if given (so `check` gates the right function in a
+    multi-function module), else the first definition (`_decide`'s single-target convention)."""
+    if target is not None:
+        for n in ast.parse(src).body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == target:
+                return n
+    return _fndef(src)
+
+
+def _nested_called_trapfree(src, repo, target=None):
+    """A PROVED trap-freedom verdict is sound only if every nested function the subject CALLS is itself trap
+    free: calling a plain nested function runs its body immediately, and materializing a nested generator
+    (list(g()), a for-loop over g()) runs its body -- traps the top-level engines miss, since they model a
+    statement-body closure as an opaque value. Each called nested function is hoisted to a standalone function
+    and re-decided; True iff each is PROVED trap free, or there are no called nested functions."""
+    try:
+        fn = _guard_target_fn(src, target)
+    except Exception:
+        return True                                          # not a single function: the guard does not apply
+    nested = _direct_nested_defs(fn)
+    if not nested:
+        return True
+    called = {c.func.id for c in ast.walk(fn)
+              if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+    called_nested = [g for g in nested if g.name in called]
+    if not called_nested:
+        return True                                          # every nested def is defined but never called here
+    global _NESTED_GUARD_DEPTH
+    if _NESTED_GUARD_DEPTH >= _NESTED_GUARD_MAX:
+        return False                                         # too deep to verify the nesting: withhold the proof
+    _NESTED_GUARD_DEPTH += 1
+    try:
+        for g in called_nested:
+            try:
+                hoisted = _hoist_nested_body(g)
+            except Exception:
+                return False                                 # cannot isolate the body: withhold the proof
+            if _decide(hoisted, repo).status != PROVED:
+                return False
+    finally:
+        _NESTED_GUARD_DEPTH -= 1
+    return True
+
+
+def _module_classes(src, repo):
+    """The user-defined classes visible to the subject -- from its own module source and the repo -- keyed by
+    name, so a construction call `C(...)` can be resolved to C's __new__/__init__ body."""
+    classes = {}
+    for text in [src] + list((repo or {}).values()):
+        try:
+            for n in ast.parse(text).body:
+                if isinstance(n, ast.ClassDef) and n.name not in classes:
+                    classes[n.name] = n
+        except Exception:
+            continue
+    return classes
+
+
+def _find_ctor_method(cname, classes, meth_name, seen=None):
+    """The __new__ or __init__ that C(...) actually runs: the one defined on the class, else the first found up
+    its in-repo base chain (an inherited constructor still runs and can raise). None when none is visible."""
+    seen = seen if seen is not None else set()
+    if cname in seen or cname not in classes:
+        return None
+    seen.add(cname)
+    cls = classes[cname]
+    m = next((s for s in cls.body if isinstance(s, ast.FunctionDef) and s.name == meth_name), None)
+    if m is not None:
+        return m
+    for b in cls.bases:
+        if isinstance(b, ast.Name):
+            found = _find_ctor_method(b.id, classes, meth_name, seen)
+            if found is not None:
+                return found
+    return None
+
+
+def _called_constructors_trapfree(src, repo, target=None):
+    """A PROVED trap-freedom verdict is sound only if every user-defined class the subject CONSTRUCTS has a
+    trap-free constructor: C(args) runs C.__new__ then C.__init__, whose `raise ValueError`, out-of-range
+    index, or other modeled trap the top-level engines miss, treating the construction as an opaque value.
+    Each called constructor's __new__/__init__ is hoisted and re-decided; True iff each is PROVED trap free,
+    or the subject constructs no such class (a builtin/stdlib constructor is modeled or opaque, not checked)."""
+    try:
+        fn = _guard_target_fn(src, target)
+    except Exception:
+        return True
+    classes = _module_classes(src, repo)
+    if not classes:
+        return True
+    called = {c.func.id for c in ast.walk(fn)
+              if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in classes}
+    if not called:
+        return True
+    global _NESTED_GUARD_DEPTH
+    if _NESTED_GUARD_DEPTH >= _NESTED_GUARD_MAX:
+        return False
+    _NESTED_GUARD_DEPTH += 1
+    try:
+        for cname in called:
+            for meth_name in ("__new__", "__init__"):
+                m = _find_ctor_method(cname, classes, meth_name)
+                if m is None:
+                    continue
+                try:
+                    hoisted = _hoist_nested_body(m)
+                except Exception:
+                    return False
+                if _decide(hoisted, repo).status != PROVED:
+                    return False
+    finally:
+        _NESTED_GUARD_DEPTH -= 1
+    return True
+
+
 def _decide(src, repo):
     """Decide trap freedom with the broadest applicable engine, each with a trivial postcondition (so a
     PROVED is trap free and a REFUTED reaches a trap): the CFG/CHC checker, then a generator (calling one
@@ -3606,13 +3801,21 @@ def _decide(src, repo):
     (closures, tuple/string returns), the heap engine (objects, lists, dicts, sets), the list-iteration
     engine, the recursion engine, dict/set literals the heap engine cannot encode, and finally modular
     trap freedom over invisible callees (imported functions, constructors, factories). First definite
-    verdict, else UNKNOWN."""
+    verdict, else UNKNOWN. A PROVED is additionally gated on every called nested function and constructed
+    class having a trap-free body (a materialized nested generator, or a raising __new__/__init__, runs a
+    body the top-level engines do not see)."""
+    def _guard(v):
+        if v.status == PROVED and not (_nested_called_trapfree(src, repo)
+                                       and _called_constructors_trapfree(src, repo)):
+            return Verdict(UNKNOWN, v.prop, v.target, v.technique,
+                           reason="a called nested function or constructor is not provably trap free")
+        return v
     try:
         v = check(src, repo=repo)
     except Exception:                                        # an engine must never crash the decider; degrade to UNKNOWN
         v = Verdict(UNKNOWN, "bench", "f", "check raised")
     if v.status != UNKNOWN:
-        return v
+        return _guard(v)
     tt = lambda *a: z3.BoolVal(True)
     for run in (lambda: _trap_free_generator(src, repo),
                 lambda: _trap_free_modular(src, repo),
@@ -3634,7 +3837,7 @@ def _decide(src, repo):
         except Exception:
             continue
         if v2.status != UNKNOWN:
-            return v2
+            return _guard(v2)
     return v
 
 

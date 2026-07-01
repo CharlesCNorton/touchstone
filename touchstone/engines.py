@@ -1819,6 +1819,17 @@ def check(src, requires="True", repo=None, total=False, prop="implicit", target=
         finally:
             core.BEST_EFFORT = saved
     v = _escalate_budget(lambda: _check_core(src, requires, repo, total, prop, target))
+    if v.status == PROVED:
+        # a materialized nested generator, or a constructed same-module class's raising __new__/__init__, runs a
+        # body the trap-free engines above treat as an opaque value; gate the proof on those bodies being trap
+        # free too (a late import: domains imports check at load, so this cannot be a module-level import).
+        from .domains import _nested_called_trapfree, _called_constructors_trapfree
+        _tgt = target or next((n.name for n in _parse(src).body
+                               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+        if not (_nested_called_trapfree(src, repo or {}, _tgt)
+                and _called_constructors_trapfree(src, repo or {}, _tgt)):
+            v = Verdict(UNKNOWN, prop, _tgt or "f", v.technique,
+                        reason="a called nested function or constructor is not provably trap free")
     if v.status == REFUTED:                                   # surface the unannotated-as-list reading behind a
         note = _seq_param_note(src, target)                  # surprising counterexample (e.g. d[k] with k = -1)
         if note and note not in (v.reason or ""):

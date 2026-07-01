@@ -3271,6 +3271,24 @@ def run_self_tests(fast=False):
     # included), so it REFUTES under the one-past invariant, while the correct `i < len(a)` still proves.
     assert _bdecide("def f(a: list):\n    i = 0\n    while i <= len(a):\n        a[i] = 0\n        i = i + 1\n    return a\n", {}).status == REFUTED
     assert _bdecide("def f(a: list):\n    for i in range(len(a) + 1):\n        a[i] = 0\n    return a\n", {}).status == REFUTED
+    # a tuple-target for-loop over a non-pair source is not proved trap free by the decider's for-loop strategy
+    # either (a wrong-shape element raises on unpack) -- a bare container, an arbitrary call, or a mismatched
+    # arity. enumerate / zip / zip_longest provably yield k-tuples and still prove, and the iterability of their
+    # arguments is inferred so a scalar argument (zip of two ints, sampled non-iterable) is not vacuously proved.
+    assert _bdecide("def f(xs):\n    for a, b in xs:\n        pass\n    return 0\n", {}).status != PROVED
+    assert _bdecide("def f(g):\n    for a, b in g():\n        pass\n    return 0\n", {}).status != PROVED
+    assert _bdecide("def f(p, q):\n    for a, b, c in zip(p, q):\n        pass\n    return 0\n", {}).status != PROVED
+    assert _bdecide("def f(xs):\n    s = 0\n    for i, x in enumerate(xs):\n        s = i\n    return s\n", {}).status == PROVED
+    assert _bdecide("def f(p, q):\n    for a, b in zip(p, q):\n        pass\n    return 0\n", {}).status == PROVED
+    # a nested generator materialized by list(g()) runs its body, so a tuple-unpack over a closed-over parameter
+    # inside it raises and the outer is not proved trap free (the value engine treated list(g()) as opaque); a
+    # trap-free nested generator still proves.
+    assert _bdecide("def h(aliases):\n    def g():\n        for a, b in aliases:\n            yield a\n    return list(g())\n", {}).status != PROVED
+    assert _bdecide("def outer(n):\n    def g():\n        for i in range(n):\n            yield i * 2\n    return list(g())\n", {}).status == PROVED
+    # constructing a same-module class whose __new__/__init__ can raise is not proved trap free (C(x) runs the
+    # constructor, whose raise the top-level engines miss); a trap-free constructor still proves.
+    assert _bdecide("class C:\n    def __init__(self, p):\n        if not p:\n            raise ValueError(1)\ndef make(p):\n    return C(p)\n", {}).status != PROVED
+    assert _bdecide("class C:\n    def __init__(self, a, b):\n        self.a = a\n        self.b = b\ndef make(x):\n    return C(x, x)\n", {}).status == PROVED
     # SOUNDNESS: the recursion engine declines a NON-self-recursive function (it models parameters as integers
     # with no container guard, so it would otherwise vacuously prove `return a + 1` for a list -- a TypeError).
     # Such a function is decided by the earlier guarded engines instead.
