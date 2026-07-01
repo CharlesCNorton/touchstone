@@ -4905,6 +4905,13 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         for gen in node.generators:
             it = ev(gen.iter, env2, ctx)                     # the iterable is evaluated (trap-checked) regardless
             iters.append(it)
+            if (isinstance(gen.target, (ast.Tuple, ast.List)) and isinstance(gen.iter, (ast.Name, ast.Attribute))
+                    and ctx.traps is not None and not BEST_EFFORT):   # `[e for a, b in xs]`: a bare container's
+                _k = len(gen.target.elts)                             # element of non-k-tuple shape raises on unpack
+                _ar = it.tuple_arity if isinstance(it, _SafeContainer) else None
+                if _ar != _k:
+                    _ne = (_container_len(it, ctx) >= 1) if isinstance(it, _SafeContainer) else z3.BoolVal(True)
+                    ctx.traps.append(z3.And(ctx.pc, _ne))
             if _is_str(it) and isinstance(gen.target, ast.Name):   # iterating a string yields 1-char strings, so the
                 cs = z3.String("hc_" + gen.target.id)              # element's ord(c) / len(c) / c == '?' is modeled
                 if ctx.facts is not None:
@@ -6009,6 +6016,18 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         if not BEST_EFFORT:                  # a tracked scalar is not iterable -> UNKNOWN unless best-effort
                             raise Unsupported("iteration over a possibly non-iterable value")
                         _best_effort_assume()
+                    # a tuple target `for a, b in it` unpacks each element into k names. When `it` is a bare container
+                    # reference (a name / attribute, not a call), its elements are unknown -- unless it is known to
+                    # yield k-tuples (enumerate / zip / dict.items set tuple_arity), an element of another shape raises
+                    # TypeError/ValueError once the loop runs. Withhold the proof there, as the direct `a, b = xs`
+                    # unpacking does; a call iterable (zip/enumerate/items/...) is left to the model that yields it.
+                    if (isinstance(s.target, (ast.Tuple, ast.List)) and isinstance(s.iter, (ast.Name, ast.Attribute))
+                            and ctx.traps is not None and not BEST_EFFORT):
+                        _k = len(s.target.elts)
+                        _ar = itv.tuple_arity if isinstance(itv, _SafeContainer) else None
+                        if _ar != _k:
+                            _ne = (_container_len(itv, ctx) >= 1) if isinstance(itv, _SafeContainer) else z3.BoolVal(True)
+                            ctx.traps.append(z3.And(ctx.pc, _ne))
                     if ctx.exact_traps is not None and isinstance(s.target, ast.Name) and not s.orelse \
                             and isinstance(itv, _SafeContainer):
                         # the first iteration is exact (pre-loop accumulators, a freely-chosen element), so a trap

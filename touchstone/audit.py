@@ -6237,6 +6237,14 @@ def run_self_tests(fast=False):
     assert check("def f(n):\n    return [10 // n for i in range(n)]\n", target="f").status == PROVED
     assert check("def f(n):\n    return [10 // i for i in range(0, n)]\n", target="f").status == REFUTED
     assert check("def f(xs: list):\n    return [10 // x for x in xs]\n", target="f").status == REFUTED
+    # a tuple target over a bare container (for a, b in xs / [e for a, b in xs]) unpacks each element into k
+    # names; a non-k-tuple element raises TypeError/ValueError once the loop runs, so it is not proved trap-free
+    # (as the direct a, b = xs unpacking is not). A call iterable known to yield k-tuples (enumerate / zip /
+    # dict.items) is trusted, so it still proves.
+    assert check("def f(xs):\n    for a, b in xs:\n        pass\n    return 0\n", target="f").status != PROVED
+    assert check("def f(xs):\n    return [a for a, b in xs]\n", target="f").status != PROVED
+    assert check("def f(xs: list):\n    s = 0\n    for a, b in enumerate(xs):\n        s = a\n    return s\n", target="f").status == PROVED
+    assert check("def f(d: dict):\n    return [k for k, v in d.items()]\n", target="f").status == PROVED
     # sorted(it) and list(it) build a NEW same-length indexable list, so sorted(nums)[0] / list(xs)[i] bounds-
     # check against the iterable's length: guarded by len it proves, an
     # unguarded index refutes, and the whole sort-then-median idiom decides. An opaque (possibly non-iterable)
