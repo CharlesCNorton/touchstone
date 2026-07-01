@@ -3554,7 +3554,7 @@ def run_self_tests(fast=False):
         assert _mt["k.topf"] == PROVED                                       # top-level function still covered
         assert _mt["k.C.pure"] == PROVED                                     # pure-of-parameters method: verified
         assert _mt["k.C.divm"] == REFUTED                                    # a // b traps at b == 0
-        assert _mt["k.C.uses_self"] == UNKNOWN                               # self attribute: outside the subset
+        assert _mt["k.C.uses_self"] == UNKNOWN                               # a read-only self attribute: outside the subset
     finally:
         _sh.rmtree(_dm, ignore_errors=True)
 
@@ -6330,6 +6330,16 @@ def run_self_tests(fast=False):
     assert check("def f(proto: Conf, n: int):\n    for i in range(n):\n        x = 10 // i\n    return proto\n",
                  target="f").status == REFUTED                            # a per-element trap (i == 0) refutes
     assert check("def f(proto: Conf, n: int):\n    return 100 // proto\n", target="f").status == UNKNOWN   # object scalar op abstains
+    # a simple object parameter's attribute stores are modeled: rewritten with reads to a fresh local, so a store
+    # o.x = v is what a later read of o.x sees (not an unconstrained field). A store-then-read is precise (o.x = 5
+    # then 10 // o.x proves, where reading o.x as a free field wrongly refuted), a stored 0 refutes, an unstored
+    # read is a free field (still refutes), a store in a loop is loop state, and an aliased object (p = o) is not
+    # simple, so it is left as-is rather than tracked unsoundly.
+    assert check("def f(o):\n    o.x = 5\n    return 10 // o.x\n", target="f").status == PROVED             # store then read: precise
+    assert check("def f(o):\n    o.x = 0\n    return 10 // o.x\n", target="f").status == REFUTED            # a stored 0 refutes
+    assert check("def f(o):\n    return 10 // o.x\n", target="f").status == REFUTED                         # unstored: a free field
+    assert check("def f(o, n: int):\n    o.x = 1\n    for i in range(n):\n        o.x = o.x + 1\n    return o.x\n", target="f").status == PROVED   # a store in a loop is loop state
+    assert check("def f(o, n: int):\n    o.x = 0\n    for i in range(n):\n        o.x = o.x + 1\n    return 10 // n\n", target="f").status == REFUTED   # the integer trap still refutes
     # dispatch on o: C considers each module subclass override (the receiver could be any subclass), so a trap in
     # a subclass method refutes (including through a multi-level hierarchy), while all-safe overrides prove.
     assert check("class B:\n    def m(self):\n        return 1\nclass S(B):\n    def m(self):\n        return 10 // 0\n"

@@ -2625,6 +2625,36 @@ def random_while_corpus(n=200, seed=0):
     return [("genw_%04d" % i, _random_while_program(rng)) for i in range(n)]
 
 
+def _random_object_attr_program(rng):
+    """A function over an object parameter o and integer parameters: it stores integer expressions into o's
+    attributes (o.x = expr), may update one inside a bounded loop, and reads them back with // and %, so a
+    store-then-read and a divide-by-a-stored-value are exercised. This is the class where reading a stored
+    attribute as a free field (rather than the value stored) would refute or prove where CPython does not."""
+    iparams = ["a", "b"][:rng.randint(1, 2)]
+    attrs = ["x", "y"][:rng.randint(1, 2)]
+    reads = list(iparams) + ["o." + at for at in attrs] + list(_GEN_VARS)
+    body = ["    %s = 0" % v for v in _GEN_VARS]
+    for at in attrs:                                     # initial stores into the object's integer attributes
+        body.append("    o.%s = %s" % (at, _gen_expr(rng, iparams, 2)))
+    if rng.random() < 0.5:                               # a store inside a bounded loop: a loop-variant field
+        at = rng.choice(attrs)
+        body.append("    _wc = %s" % rng.choice(iparams))
+        body.append("    while _wc > 0:")
+        body.append("        o.%s = o.%s + %d" % (at, at, rng.randint(1, 3)))
+        body.append("        _wc = _wc - 1")
+    body += _gen_block(rng, reads, "    ", rng.randint(1, 2), [rng.randint(3, 7)])
+    body.append("    return %s" % _gen_expr(rng, reads, 2))
+    return "def f(o, %s):\n%s\n" % (", ".join(iparams), "\n".join(body))
+
+
+def random_object_attr_corpus(n=200, seed=0):
+    """n machine-generated functions that store into and read an object parameter's integer attributes, so the
+    attribute-store model (o.x = v tracked, a store-then-read precise, a store in a loop loop state) is
+    cross-checked against CPython -- the class the other corpora do not exercise."""
+    rng = random.Random(seed)
+    return [("geno_%04d" % i, _random_object_attr_program(rng)) for i in range(n)]
+
+
 # A fifth generator over a two-function repo: a helper g that may trap on some argument, and a caller f
 # that invokes g (its result combined arithmetically) after building up some state. It stresses the modular
 # cross-function trap analysis -- whether a trap inside the callee is propagated to the call site -- rather
@@ -2758,10 +2788,12 @@ _ANYC = _AnyC()
 
 
 class _AnyObj(int):
-    """A benign object stand-in (value 0): every attribute is another _AnyObj, so o.x and o.x + o.y never raise,
-    matching the duck-typed-numeric field model."""
-    __slots__ = ()
-    def __new__(cls): return super().__new__(cls, 0)
+    """A benign object stand-in (value 0): an unset attribute is another _AnyObj, so o.x and o.x + o.y never
+    raise, matching the duck-typed-numeric field model. It carries an instance __dict__ (no __slots__), so a
+    store o.x = v sticks and a later read of o.x returns v -- the semantics the attribute-store model rests on.
+    It is picklable (a plain value, no attributes at construction) so it crosses into the out-of-process sandbox."""
+    def __new__(cls, value=0): return super().__new__(cls, value)
+    def __getnewargs__(self): return (int(self),)
     def __getattr__(self, n):
         if n.startswith("__"):
             raise AttributeError(n)

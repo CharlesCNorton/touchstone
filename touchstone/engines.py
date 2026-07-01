@@ -1267,6 +1267,7 @@ def _check_trapfree_symexec(prop, target, src, pre_node, spec, repo, has_pre, tr
     is reachable under the precondition; a reachable trap REFUTES only with no precondition and no havoc, where
     the query is exact. `trapfree_callees` are recursive callees verified trap free standalone, inlined as a
     fresh result so the caller proceeds."""
+    src = _rewrite_object_attrs(src)                            # model a simple object's attribute stores as locals
     gated = _definite_assignment_guard(prop, target, "implicit contracts (asserts + trap freedom)", [src])
     if gated is not None:                                        # a variable possibly read before assignment on some
         return gated                                             # branch raises UnboundLocalError, not precisely modeled,
@@ -4496,6 +4497,7 @@ def verify_no_raise_optional(prop, target, src, pre_node=None, repo=None, timeou
     (the rest plain integers), so None-ness flows through assignments, branch merges, and the loop back edge in
     linear integer arithmetic Spacer decides. `pre_node`'s parameters are taken present. UNKNOWN outside the
     integer + None fragment (a call, subscript, string, or float)."""
+    src = _rewrite_object_attrs(src)                            # model a simple object's attribute stores as locals
     src = _lower_list_lengths(src)
     gated = _definite_assignment_guard(prop, target, "exception safety (optional)", [src])
     if gated is not None:
@@ -6020,7 +6022,110 @@ def _guard_op_traps(src):
     return ast.unparse(ast.fix_missing_locations(tree))
 
 
+def _attr_root(node):
+    """The root Name id of an attribute chain (a.b.c -> 'a'), or None if the chain is not Name-rooted."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _attr_path(node):
+    """The dotted path of an attribute chain (a.b.c -> 'a.b.c'), or None if not Name-rooted."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr); node = node.value
+    return node.id + "." + ".".join(reversed(parts)) if isinstance(node, ast.Name) else None
+
+
+def _simple_object_params(fn, cand):
+    """The candidate object parameters used ONLY as o.attr (read or write), a comparison operand (o is None),
+    or a return value -- never reassigned, aliased (p = o), passed to a call, or method-called. Such an object's
+    attributes can change only through a direct o.attr = ... store, so rewriting those accesses to fresh locals
+    is sound: nothing else (an alias, a callee, a method) can mutate them behind the analysis' back."""
+    ok, method_roots = set(), set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            r = _attr_root(n.func)                           # o.m(...) -- a method could mutate o
+            if r is not None:
+                method_roots.add(r)
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name):
+            ok.add(id(n.value))                              # o.attr (read or write): a safe use of o
+        if isinstance(n, ast.Compare):
+            for s in [n.left, *n.comparators]:
+                if isinstance(s, ast.Name):
+                    ok.add(id(s))                            # o is None / o == x: no mutation
+        if isinstance(n, ast.Return) and isinstance(n.value, ast.Name):
+            ok.add(id(n.value))                              # return o: no mutation
+    bad = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id in cand and id(n) not in ok}
+    return cand - bad - method_roots
+
+
+class _ModelAttrStores(ast.NodeTransformer):
+    """Rewrite each access (read or write) of a STORED attribute path to a fresh local of that dotted path, keeping
+    its Load/Store context. o.x = v becomes _attr_o_x = v (a real update) and a later read of o.x becomes _attr_o_x
+    (which sees it), so a store-then-read is precise and a store in a loop is loop state. A read-only field is not
+    stored, so it is left untouched -- its opaque modeling (a trap-free len, an abstained subscript) is unchanged."""
+    def __init__(self, stored):
+        self.stored = stored                                 # the dotted paths that are stored (worth modeling)
+        self.paths = {}                                      # dotted path -> fresh local name
+
+    def visit_Attribute(self, node):
+        p = _attr_path(node)
+        if p in self.stored:
+            nm = self.paths.setdefault(p, "_attr_" + p.replace(".", "_"))
+            return ast.copy_location(ast.Name(id=nm, ctx=node.ctx), node)
+        return self.generic_visit(node)
+
+
+_MODELED_TYPE_NAMES = frozenset({"int", "float", "bool", "str", "bytes", "bytearray",
+                                 "list", "tuple", "set", "frozenset", "dict"})
+
+
+def _rewrite_object_attrs(src):
+    """Model a simple object parameter's attribute stores: rewrite its attribute reads and writes to fresh locals,
+    each initialized free as an integer input. So o.x = v updates what a later read of o.x sees (a store-then-read
+    is no longer read as an unconstrained field), and a store in a loop is ordinary loop state. Returns src
+    unchanged when there is no such parameter."""
+    try:
+        mod = _parse(src)
+    except SyntaxError:
+        return src
+    fns = [n for n in mod.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    if len(fns) != 1:                                        # a single top-level function (the analyzed unit)
+        return src
+    fn = fns[0]
+    annotated = {a.arg: a.annotation for a in fn.args.args}
+    cand = set()                                             # a parameter used as an attribute base, not a modeled type
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id in annotated:
+            ann = annotated[n.value.id]
+            if not (isinstance(ann, ast.Name) and ann.id in _MODELED_TYPE_NAMES):
+                cand.add(n.value.id)
+    simple = _simple_object_params(fn, cand) if cand else set()
+    if not simple:
+        return src
+    stored = set()                                          # only model attribute paths that are actually stored; a
+    for n in ast.walk(fn):                                  # read-only field keeps its opaque modeling (len/subscript)
+        tgts = (n.targets if isinstance(n, ast.Assign)
+                else [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else [])
+        for tg in tgts:
+            if isinstance(tg, ast.Attribute) and _attr_root(tg) in simple:
+                p = _attr_path(tg)
+                if p is not None:
+                    stored.add(p)
+    if not stored:
+        return src
+    tr = _ModelAttrStores(stored)
+    tr.visit(fn); ast.fix_missing_locations(fn)
+    if not tr.paths:
+        return src
+    for nm in sorted(set(tr.paths.values())):                # unannotated: kind inference types each field from its
+        fn.args.args.append(ast.arg(arg=nm, annotation=None))   # use (a numeric field refutes, a len'd field abstains)
+    return ast.unparse(mod)
+
+
 def verify_no_raise(prop, target, src, pre, repo=None, timeout=4000) -> Verdict:
+    src = _rewrite_object_attrs(src)                         # model a simple object's attribute stores as locals
     src = _lower_list_lengths(src)                            # a list grown by append -> an integer length
     src = _guard_op_traps(src)                                # a division inside a try/with: route its
     #                                                          ZeroDivisionError raise through the handler

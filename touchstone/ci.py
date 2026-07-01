@@ -129,7 +129,8 @@ def main():
               ("list", benchmark.run_benchmark(benchmark.random_list_corpus(60, seed=0), samples=20)),
               ("recursive", benchmark.run_benchmark(benchmark.random_rec_corpus(60, seed=0), samples=20)),
               ("while", benchmark.run_benchmark(benchmark.random_while_corpus(60, seed=0), samples=20)),
-              ("interproc", benchmark.run_benchmark(benchmark.random_interproc_corpus(60, seed=0), samples=20))]
+              ("interproc", benchmark.run_benchmark(benchmark.random_interproc_corpus(60, seed=0), samples=20)),
+              ("object-attr", benchmark.run_benchmark(benchmark.random_object_attr_corpus(60, seed=0), samples=20))]
     finally:
         core.ALLOW_SUBJECT_EXECUTION = False
     assert all(f["contradictions"] == 0 for _, f in fz), fz
