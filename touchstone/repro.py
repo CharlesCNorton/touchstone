@@ -44,6 +44,31 @@ def _call(name, params, inputs):
     return "%s(%s)" % (name, ", ".join("%s=%r" % (p, inputs[p]) for p in params))
 
 
+def _call_bound(name, params):
+    """The call through locals already bound to the counterexample (f(x=x)), so a postcondition that names
+    the parameters evaluates against the same values the call received."""
+    return "%s(%s)" % (name, ", ".join("%s=%s" % (p, p) for p in params))
+
+
+def _strip_old(expr):
+    """old(e) in a postcondition denotes e's value at function entry; the test binds the entry values as
+    locals and the subject cannot rebind them, so old(e) is e."""
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return expr
+
+    class _S(ast.NodeTransformer):
+        def visit_Call(self, n):
+            self.generic_visit(n)
+            if (isinstance(n.func, ast.Name) and n.func.id == "old"
+                    and len(n.args) == 1 and not n.keywords):
+                return n.args[0]
+            return n
+
+    return ast.unparse(_S().visit(tree))
+
+
 def repro_test(verdict, src, *, ensures=None, requires=None, spec_src=None, func=None,
                name="test_touchstone_repro") -> Optional[str]:
     """A runnable failing test reproducing `verdict`'s counterexample, or None if there is none.
@@ -78,8 +103,10 @@ def repro_test(verdict, src, *, ensures=None, requires=None, spec_src=None, func
         if requires and requires.strip() not in ("", "True"):
             out.append("    # precondition: %s" % requires.strip())
         if ensures is not None:                                       # postcondition: it fails on this input
-            out.append("    result = %s" % call)
-            out.append("    assert %s" % ensures.strip())
+            for p in params:                                          # bind the counterexample, so a spec that
+                out.append("    %s = %r" % (p, inputs[p]))            # names the parameters evaluates in the test
+            out.append("    result = %s" % _call_bound(fname, params))
+            out.append("    assert %s" % _strip_old(ensures.strip()))
         else:                                                        # trap freedom: the call reaches the trap
             out.append("    %s   # touchstone: a reachable trap fires on this input" % call)
     return "\n".join(out) + "\n"

@@ -7398,6 +7398,18 @@ def run_self_tests(fast=False):
         except Exception:                                             # the reachable trap fires on the input
             _trapped = True
         assert _trapped, "the trap repro did not raise on the counterexample"
+    # a postcondition that NAMES the parameters: the test binds the counterexample as locals (x = 0) before
+    # the call, so the assert evaluates instead of raising NameError -- and it fails for the right reason.
+    _pxv = prove(_psrc, "result == x + 1")                             # REFUTED everywhere (x != x + 1)
+    assert _pxv.status == REFUTED and _pxv.counterexample_inputs, _pxv
+    _pxt = repro_test(_pxv, _psrc, ensures="result == x + 1")
+    _pxns = {}; exec(compile(_pxt, "<repro>", "exec"), _pxns)
+    _xfired = False
+    try:
+        _pxns["test_touchstone_repro"]()
+    except AssertionError:
+        _xfired = True
+    assert _xfired, "the parameter-referencing repro did not reproduce the refutation"
     assert repro_test(prove(_psrc, "result == x"), _psrc, ensures="result == x") is None  # PROVED: nothing to show
     # an UNKNOWN's reason is classified into the world it is in (budget / approximation / unmodeled) so the
     # next step is obvious, and an unmodeled construct names its line.
@@ -8187,10 +8199,21 @@ def run_self_tests(fast=False):
     assert check_return_annotation("def f() -> int:\n    return None\n").status == REFUTED
     assert check_return_annotation("def f() -> int:\n    return 5\n").status == PROVED
 
-    # oracle-free metamorphic properties -- idempotence and involution -- decided on real code.
-    assert verify_metamorphic("def f(x):\n    if x < 0:\n        return 0\n    return x\n", "idempotent").status == PROVED
+    # oracle-free metamorphic properties -- idempotence and involution -- decided on real code. The verdict
+    # names the user's function, not the composed __mm_lhs wrapper the equivalence runs on.
+    _mmv = verify_metamorphic("def f(x):\n    if x < 0:\n        return 0\n    return x\n", "idempotent")
+    assert _mmv.status == PROVED and _mmv.target == "f", _mmv
     assert verify_metamorphic("def f(x):\n    return x + 1\n", "idempotent").status == REFUTED
     assert verify_metamorphic("def f(x):\n    return -x\n", "involution").status == PROVED
+
+    # a bare math name resolves as math.* only where its `from math import ...` is visible: an unimported
+    # log() is somebody's logger (an unmodeled call, best-effort eligible), not math.log borrowing a domain
+    # trap; with the import present the math semantics stay decided.
+    _blv = check("def f(x):\n    return log(x)\n")
+    assert _blv.status == UNKNOWN and "unmodeled call" in (_blv.reason or ""), _blv
+    assert check("from math import log\ndef f(x: float):\n    return log(x)\n").status == REFUTED
+    assert check("from math import gcd\ndef f(a, b):\n    return gcd(a, b)\n").status == PROVED
+    assert check("def f(a, b):\n    return gcd(a, b)\n").status == UNKNOWN
 
     # fixed-width overflow is a default-on companion -- a function PROVED over Python's unbounded
     # integers carries the wraparound witness, without its (sound) Python verdict being flipped.

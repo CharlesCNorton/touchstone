@@ -577,7 +577,25 @@ def _parse_template(src: str) -> ast.Module:
 
 
 def _parse(src: str) -> ast.Module:
-    return _clone_ast(_parse_template(src))
+    tree = _clone_ast(_parse_template(src))
+    _mark_free_math_names(tree)
+    return tree
+
+
+def _mark_free_math_names(tree):
+    """Mark each bare math-family call name (sqrt, sin/cos/exp/log, floor/gcd/...) whose `from math import
+    ...` is NOT visible in this module (`node.func._ts_freename = True`), so ev resolves it as an ordinary
+    unmodeled call instead of borrowing the math semantics -- an unimported log() is somebody's logger, not
+    math.log with a domain trap. Body trees all come through _parse, so every engine sees the mark; spec
+    trees (parse_spec) are never marked, so a specification keeps the math reading."""
+    family = _BARE_MATH_FAMILY
+    imported = None                                          # computed on the first hit (most modules have none)
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in family:
+            if imported is None:
+                imported = _module_math_imports(tree)
+            if n.func.id not in imported:
+                n.func._ts_freename = True
 
 
 def _fndef(src: str):
@@ -1218,6 +1236,27 @@ _MATH_PURE_FLOAT = frozenset({"expm1", "atan", "atan2", "asinh", "sinh", "cosh",
                               "hypot", "dist", "erf", "erfc", "exp2", "cbrt", "ldexp", "nextafter", "ulp"})
 _MATH_FUNCS = (_MATH_INT_DOMAIN | _MATH_FLOAT_DOMAIN | _MATH_PURE_FLOAT
                | frozenset({"floor", "ceil", "trunc", "gcd", "lcm"}))
+
+
+# the bare names ev resolves to their math.* meaning when the from-import is visible (_mark_free_math_names)
+_BARE_MATH_FAMILY = frozenset({"sqrt"}) | _TRANSCENDENTAL | _MATH_FUNCS
+
+
+def _module_math_imports(mod):
+    """The bare names a module's `from math import ...` statements bind to their math meaning (an alias
+    renames the binding away, so it does not count; a star import binds every modeled math name). Gates the
+    bare-name math resolution in ev: `log(x)` is math.log only when the import that makes it so is visible,
+    so a same-named free function (a logger's `log`) stays an unmodeled call rather than borrowing math
+    semantics."""
+    out = set()
+    for n in ast.walk(mod):
+        if isinstance(n, ast.ImportFrom) and n.module == "math" and not n.level:
+            for al in n.names:
+                if al.name == "*":
+                    out |= _BARE_MATH_FAMILY
+                elif al.asname in (None, al.name):
+                    out.add(al.name)
+    return frozenset(out)
 
 
 def _math_call(name, args, ctx):
@@ -3819,11 +3858,14 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 #                                                 independent len(xs) refutes -- both sound, since the
                 #                                                 sum can be zero (the empty list, or [1, -1])
             raise Unsupported("sum() over an unmodeled iterable")
-        if name == "sqrt" and len(node.args) == 1 and name not in ctx.repo:   # from math import sqrt
+        _math_vis = not getattr(node.func, "_ts_freename", False)   # the bare math reading needs its from-import
+        #                                                             visible (_mark_free_math_names); an unmarked
+        #                                                             tree (a spec) resolves as before
+        if name == "sqrt" and len(node.args) == 1 and name not in ctx.repo and _math_vis:   # from math import sqrt
             return _sqrt_model(ev(node.args[0], env, ctx), ctx)
-        if name in _TRANSCENDENTAL and len(node.args) == 1 and name not in ctx.repo:   # from math import sin, ...
+        if name in _TRANSCENDENTAL and len(node.args) == 1 and name not in ctx.repo and _math_vis:   # from math import sin, ...
             return _transcendental(name, ev(node.args[0], env, ctx), ctx)
-        if name in _MATH_FUNCS and name not in ctx.repo and name not in env:   # from math import floor, gcd, ...
+        if name in _MATH_FUNCS and name not in ctx.repo and name not in env and _math_vis:   # from math import floor, gcd, ...
             res = _math_call(name, [ev(a, env, ctx) for a in node.args], ctx)
             if res is not None:
                 return res

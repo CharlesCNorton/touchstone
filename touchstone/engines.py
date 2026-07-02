@@ -2475,7 +2475,9 @@ def verify_metamorphic(src, relation="idempotent", target=None, repo=None) -> Ve
     lhs = "def __mm_lhs(%s%s):\n    return %s(%s(%s))\n" % (p, ann, target, target, p)
     rhs = ("def __mm_rhs(%s%s):\n    return %s(%s)\n" % (p, ann, target, p) if relation == "idempotent"
            else "def __mm_rhs(%s%s):\n    return %s\n" % (p, ann, p))
-    return verify_equiv("metamorphic (%s)" % relation, "__mm_lhs", lhs, rhs, repo2)
+    v = verify_equiv("metamorphic (%s)" % relation, target, lhs, rhs, repo2)   # report the user's function,
+    v.target = target                                                          # not the composed wrapper
+    return v
 
 
 def explain(verdict, src, repo=None) -> Verdict:
@@ -2533,6 +2535,13 @@ def _inline_globals(fn, glob):
     fn.body = [glob[g] for g in glob if g in need] + fn.body
 
 
+def _math_import_prefix(mod):
+    """The module's `from math import ...` lines, re-emitted ahead of each extracted function so the
+    bare-name math resolution (gated on that import being visible) survives the module -> repo extraction."""
+    stmts = [s for s in mod.body if isinstance(s, ast.ImportFrom) and s.module == "math" and not s.level]
+    return "".join(ast.unparse(s) + "\n" for s in stmts)
+
+
 def load_module(src):
     """Build a repo {name: source} from a whole module or file: every top-level function becomes
     an entry, and module-level global constants (NAME = expr) are inlined (transitively) into the
@@ -2555,6 +2564,7 @@ def load_module(src):
                 and s.value.id == d.args.args[0].arg)
 
     repo = {}
+    mathpfx = _math_import_prefix(mod)
     for fn in mod.body:
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -2564,7 +2574,7 @@ def load_module(src):
         #                                                      front end declines (UNKNOWN) rather than verifying
         #                                                      a body the decorator may have replaced.
         _inline_globals(fn, glob)
-        repo[fn.name] = ast.unparse(fn)
+        repo[fn.name] = mathpfx + ast.unparse(fn)
     return repo
 
 
@@ -2698,6 +2708,7 @@ def load_program(modules, on_collision="raise"):
                     if al.name in trees:
                         mod_imports[al.asname or al.name] = al.name
         resolver = _CallResolver(m, modfuncs, name_imports, mod_imports)
+        mathpfx = _math_import_prefix(tree)
         for fn in tree.body:
             if isinstance(fn, ast.FunctionDef):
                 resolver.visit(fn)
@@ -2709,7 +2720,7 @@ def load_program(modules, on_collision="raise"):
                     if on_collision == "skip":               # underscore-boundary coincidence): a best-effort scan
                         continue                             # keeps the first and skips the rest rather than crash;
                     raise ValueError(f"mangled name collision: {fn.name}")   # a rigorous verify still rejects it
-                repo[fn.name] = ast.unparse(fn)
+                repo[fn.name] = mathpfx + ast.unparse(fn)
     return repo
 
 

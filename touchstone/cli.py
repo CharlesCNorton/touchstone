@@ -256,8 +256,11 @@ def _report(v, src=None, repo=None, json_out=False, quiet=False, repro=None):
                 print("  hint: %s" % hint)
             if cat in ("approximation", "unmodeled"):        # raising --budget cannot change an abstraction limit
                 print("  --budget: a no-op here (an abstraction / unmodeled limit, not a resource bound)")
-        elif v.status == "PROVED" and v.certificate:
-            print("  %s" % v.certificate)
+        elif v.status == "PROVED":
+            if v.reason:                                     # the substance of a PROVED often lives here: a cost
+                print("  %s" % v.reason)                     # bound, a ranking function, a machine-width caveat
+            if v.certificate:
+                print("  %s" % v.certificate)
     if repro is not None:
         print("\n# --- reproducing test (run it: it fails on the counterexample) ---")
         print(repro, end="")
@@ -779,7 +782,12 @@ def _cmd_infer(a):
             facts = [f for f in facts if f.get("function") == a.func]
         print(json.dumps(facts))
         return 0
-    result = t.infer_types(src, target=a.func)
+    func = a.func
+    if func is None:                                             # like the verdict verbs: a sole function is the
+        names = _functions(src, _label(a.file))                  # default target (target=None means the module's
+        if len(names) == 1:                                      # globals, which for a one-function file is nothing)
+            func = names[0]
+    result = t.infer_types(src, target=func)
 
     def lst(x):
         return sorted(x) if isinstance(x, (set, frozenset)) else x
