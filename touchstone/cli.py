@@ -351,7 +351,8 @@ def _cmd_repair(a):
     before = _read(a.before) if a.before else None
 
     def generate(feedback):                                  # the external generator: feedback in, candidate source out
-        return subprocess.run(a.generator, shell=True, input=feedback or "",
+        fb = json.dumps(feedback) if feedback else ""        # the repair signal is a dict; the pipe carries JSON
+        return subprocess.run(a.generator, shell=True, input=fb,
                               capture_output=True, text=True).stdout
 
     res = t.repair_loop(generate, ensures=a.ensures, requires=a.requires, before=before,

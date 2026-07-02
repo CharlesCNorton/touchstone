@@ -7411,6 +7411,31 @@ def run_self_tests(fast=False):
         _xfired = True
     assert _xfired, "the parameter-referencing repro did not reproduce the refutation"
     assert repro_test(prove(_psrc, "result == x"), _psrc, ensures="result == x") is None  # PROVED: nothing to show
+    # the repair VERB round-trips through the CLI: the round-2 repair signal is piped to the generator
+    # command as JSON (a raw dict would crash subprocess), so a generator that emits the fix on feedback
+    # converges through the full CLI path -- buggy candidate, REFUTED signal, fixed candidate, PROVED.
+    import contextlib as _ctl
+    import io as _io
+    import os as _os
+    import shutil as _sh
+    import sys as _sys
+    import tempfile as _tf
+    _gd = _tf.mkdtemp(prefix="ts_repair_")
+    try:
+        _gp = _os.path.join(_gd, "gen.py")
+        with open(_gp, "w", encoding="utf-8") as _fh:
+            _fh.write("import sys\nfb = sys.stdin.read().strip()\n"
+                      "print('def f(x):\\n    if x < 0:\\n        return -x\\n    return x' if fb\n"
+                      "      else 'def f(x):\\n    return x')\n")
+        from . import cli as _cli
+        _buf = _io.StringIO()
+        with _ctl.redirect_stdout(_buf):
+            _rrc = _cli.main(["repair", "--generator", '"%s" "%s"' % (_sys.executable, _gp),
+                              "--ensures", "result >= 0 and (result == x or result == 0 - x)",
+                              "--func", "f", "--json"])
+        assert _rrc == 0 and '"rounds": 2' in _buf.getvalue(), (_rrc, _buf.getvalue())
+    finally:
+        _sh.rmtree(_gd, ignore_errors=True)
     # an UNKNOWN's reason is classified into the world it is in (budget / approximation / unmodeled) so the
     # next step is obvious, and an unmodeled construct names its line.
     from .diagnostics import classify_unknown, advice, budget_helps, capabilities
