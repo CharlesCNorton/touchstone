@@ -1,0 +1,30 @@
+# SMTCoq certificate-checking toolchain for proofs/touchstone_smtcoq.v: Coq 8.20.1, coq-smtcoq
+# 2.3+8.20, and veriT stable2016. Building this image and running it re-checks the integer
+# obligations' certificates inside Coq's kernel, so the check runs rather than being skipped for want
+# of the toolchain (see proofs/toolchain.lock). The smtcoq CI job builds and runs it. Context = repo root.
+#   docker build -f proofs/Dockerfile.smtcoq -t touchstone-smtcoq . && docker run --rm touchstone-smtcoq
+FROM coqorg/coq:8.20.1
+
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends autoconf flex bison libgmp-dev wget ca-certificates make g++ \
+ && rm -rf /var/lib/apt/lists/*
+
+USER coq
+WORKDIR /home/coq
+
+# veriT (stable2016) for the LIA proof certificates, built from source onto PATH. The 2016 sources
+# predate gcc's -fno-common default, so they are compiled with -fcommon.
+RUN wget -q https://verit.loria.fr/distrib/veriT-stable2016.tar.gz \
+ && tar xzf veriT-stable2016.tar.gz \
+ && cd veriT-stable2016 && autoconf && ./configure && make CC="gcc -fcommon" \
+ && mkdir -p /home/coq/.local/bin && cp veriT /home/coq/.local/bin/veriT \
+ && cd /home/coq && rm -rf veriT-stable2016 veriT-stable2016.tar.gz
+ENV PATH=/home/coq/.local/bin:${PATH}
+
+# SMTCoq for Coq 8.20 (carries the LFSC signatures verify_smtcoq.sh stages next to the proof)
+RUN opam install -y coq-smtcoq.2.3+8.20
+
+COPY --chown=coq:coq proofs/touchstone_smtcoq.v proofs/touchstone_obligations.v proofs/verify_smtcoq.sh /home/coq/proofs/
+WORKDIR /home/coq/proofs
+CMD ["opam", "exec", "--", "bash", "verify_smtcoq.sh"]

@@ -1,0 +1,3162 @@
+{
+  "what": "module", "name": "Main", "need_magic": false, "need_dummy": false,
+  "used_modules": [
+    
+  ],
+  "declarations": [
+    {
+      "what": "decl:ind", "name": "bool", "argnames": [
+        
+      ],
+      "constructors": [
+        {
+          "name": "True", "argtypes": [
+            
+          ]
+        }, {
+          "name": "False", "argtypes": [
+            
+          ]
+        }
+      ]
+    },
+    {
+      "what": "decl:ind", "name": "nat", "argnames": [
+        
+      ],
+      "constructors": [
+        {
+          "name": "O", "argtypes": [
+            
+          ]
+        },
+        {
+          "name": "S",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "nat", "args": [
+                
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "what": "decl:ind", "name": "( * )", "argnames": [
+        "A", "B"
+      ],
+      "constructors": [
+        {
+          "name": "(,)",
+          "argtypes": [
+            {
+              "what": "type:var", "name": "A"
+            }, {
+              "what": "type:var", "name": "B"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "what": "decl:term", "name": "fst",
+      "type": {
+        "what": "type:arrow",
+        "left": {
+          "what": "type:glob", "name": "( * )",
+          "args": [
+            {
+              "what": "type:varidx", "name": 1
+            }, {
+              "what": "type:varidx", "name": 2
+            }
+          ]
+        }, "right": {
+          "what": "type:varidx", "name": 1
+        }
+      },
+      "value": {
+        "what": "expr:lambda", "argnames": [
+          "p"
+        ],
+        "body": {
+          "what": "expr:case", "expr": {
+            "what": "expr:rel", "name": "p"
+          },
+          "cases": [
+            {
+              "what": "case",
+              "pat": {
+                "what": "pat:constructor", "name": "(,)",
+                "argnames": [
+                  "x", "_"
+                ]
+              }, "body": {
+                "what": "expr:rel", "name": "x"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "what": "decl:term", "name": "snd",
+      "type": {
+        "what": "type:arrow",
+        "left": {
+          "what": "type:glob", "name": "( * )",
+          "args": [
+            {
+              "what": "type:varidx", "name": 1
+            }, {
+              "what": "type:varidx", "name": 2
+            }
+          ]
+        }, "right": {
+          "what": "type:varidx", "name": 2
+        }
+      },
+      "value": {
+        "what": "expr:lambda", "argnames": [
+          "p"
+        ],
+        "body": {
+          "what": "expr:case", "expr": {
+            "what": "expr:rel", "name": "p"
+          },
+          "cases": [
+            {
+              "what": "case",
+              "pat": {
+                "what": "pat:constructor", "name": "(,)",
+                "argnames": [
+                  "_", "y"
+                ]
+              }, "body": {
+                "what": "expr:rel", "name": "y"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "what": "decl:ind", "name": "list", "argnames": [
+        "A"
+      ],
+      "constructors": [
+        {
+          "name": "[]", "argtypes": [
+            
+          ]
+        },
+        {
+          "name": "(::)",
+          "argtypes": [
+            {
+              "what": "type:var", "name": "A"
+            },
+            {
+              "what": "type:glob", "name": "list",
+              "args": [
+                {
+                  "what": "type:var", "name": "A"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "what": "decl:fixgroup",
+      "fixlist": [
+        {
+          "what": "fixgroup:item", "name": "app",
+          "type": {
+            "what": "type:arrow",
+            "left": {
+              "what": "type:glob", "name": "list",
+              "args": [
+                {
+                  "what": "type:varidx", "name": 1
+                }
+              ]
+            },
+            "right": {
+              "what": "type:arrow",
+              "left": {
+                "what": "type:glob", "name": "list",
+                "args": [
+                  {
+                    "what": "type:varidx", "name": 1
+                  }
+                ]
+              },
+              "right": {
+                "what": "type:glob", "name": "list",
+                "args": [
+                  {
+                    "what": "type:varidx", "name": 1
+                  }
+                ]
+              }
+            }
+          },
+          "value": {
+            "what": "expr:lambda", "argnames": [
+              "l", "m"
+            ],
+            "body": {
+              "what": "expr:case",
+              "expr": {
+                "what": "expr:rel", "name": "l"
+              },
+              "cases": [
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "[]", "argnames": [
+                      
+                    ]
+                  }, "body": {
+                    "what": "expr:rel", "name": "m"
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "(::)",
+                    "argnames": [
+                      "a", "l1"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "(::)",
+                    "args": [
+                      {
+                        "what": "expr:rel", "name": "a"
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "app"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "l1"
+                          }, {
+                            "what": "expr:rel", "name": "m"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "what": "decl:ind", "name": "positive", "argnames": [
+        
+      ],
+      "constructors": [
+        {
+          "name": "XI",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "positive", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "XO",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "positive", "args": [
+                
+              ]
+            }
+          ]
+        }, {
+          "name": "XH", "argtypes": [
+            
+          ]
+        }
+      ]
+    },
+    {
+      "what": "decl:ind", "name": "z", "argnames": [
+        
+      ],
+      "constructors": [
+        {
+          "name": "Z0", "argtypes": [
+            
+          ]
+        },
+        {
+          "name": "Zpos",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "positive", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Zneg",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "positive", "args": [
+                
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "what": "decl:fixgroup",
+      "fixlist": [
+        {
+          "what": "fixgroup:item", "name": "eqb",
+          "type": {
+            "what": "type:arrow",
+            "left": {
+              "what": "type:glob", "name": "nat", "args": [
+                
+              ]
+            },
+            "right": {
+              "what": "type:arrow",
+              "left": {
+                "what": "type:glob", "name": "nat", "args": [
+                  
+                ]
+              },
+              "right": {
+                "what": "type:glob", "name": "bool", "args": [
+                  
+                ]
+              }
+            }
+          },
+          "value": {
+            "what": "expr:lambda", "argnames": [
+              "n", "m"
+            ],
+            "body": {
+              "what": "expr:case",
+              "expr": {
+                "what": "expr:rel", "name": "n"
+              },
+              "cases": [
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "O", "argnames": [
+                      
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:case",
+                    "expr": {
+                      "what": "expr:rel", "name": "m"
+                    },
+                    "cases": [
+                      {
+                        "what": "case",
+                        "pat": {
+                          "what": "pat:constructor", "name": "O",
+                          "argnames": [
+                            
+                          ]
+                        },
+                        "body": {
+                          "what": "expr:constructor", "name": "True",
+                          "args": [
+                            
+                          ]
+                        }
+                      },
+                      {
+                        "what": "case",
+                        "pat": {
+                          "what": "pat:constructor", "name": "S",
+                          "argnames": [
+                            "_"
+                          ]
+                        },
+                        "body": {
+                          "what": "expr:constructor", "name": "False",
+                          "args": [
+                            
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "S",
+                    "argnames": [
+                      "n'"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:case",
+                    "expr": {
+                      "what": "expr:rel", "name": "m"
+                    },
+                    "cases": [
+                      {
+                        "what": "case",
+                        "pat": {
+                          "what": "pat:constructor", "name": "O",
+                          "argnames": [
+                            
+                          ]
+                        },
+                        "body": {
+                          "what": "expr:constructor", "name": "False",
+                          "args": [
+                            
+                          ]
+                        }
+                      },
+                      {
+                        "what": "case",
+                        "pat": {
+                          "what": "pat:constructor", "name": "S",
+                          "argnames": [
+                            "m'"
+                          ]
+                        },
+                        "body": {
+                          "what": "expr:apply",
+                          "func": {
+                            "what": "expr:global", "name": "eqb"
+                          },
+                          "args": [
+                            {
+                              "what": "expr:rel", "name": "n'"
+                            }, {
+                              "what": "expr:rel", "name": "m'"
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "what": "decl:type", "name": "var", "argnames": [
+        
+      ], "value": {
+        "what": "type:glob", "name": "nat", "args": [
+          
+        ]
+      }
+    },
+    {
+      "what": "decl:ind", "name": "expr", "argnames": [
+        
+      ],
+      "constructors": [
+        {
+          "name": "EVar",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "var", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "EConst",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "z", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "EAdd",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "ESub",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "EMul",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "EDiv",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "EMod",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "ELt",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "ELe",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "EEq",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "ENot",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "EAnd",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "EOr",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "what": "decl:ind", "name": "prog", "argnames": [
+        
+      ],
+      "constructors": [
+        {
+          "name": "PNil", "argtypes": [
+            
+          ]
+        },
+        {
+          "name": "PAsgn",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "var", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "prog", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "PCond",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "prog", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "prog", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "prog", "args": [
+                
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "what": "decl:ind", "name": "form", "argnames": [
+        
+      ],
+      "constructors": [
+        {
+          "name": "FTrue", "argtypes": [
+            
+          ]
+        }, {
+          "name": "FFalse", "argtypes": [
+            
+          ]
+        },
+        {
+          "name": "FLt",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "FLe",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "FEq",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "FNot",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "form", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "FAnd",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "form", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "form", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "FOr",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "form", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "form", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "FImpl",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "form", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "form", "args": [
+                
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "what": "decl:fixgroup",
+      "fixlist": [
+        {
+          "what": "fixgroup:item", "name": "subst_expr",
+          "type": {
+            "what": "type:arrow",
+            "left": {
+              "what": "type:glob", "name": "var", "args": [
+                
+              ]
+            },
+            "right": {
+              "what": "type:arrow",
+              "left": {
+                "what": "type:glob", "name": "expr", "args": [
+                  
+                ]
+              },
+              "right": {
+                "what": "type:arrow",
+                "left": {
+                  "what": "type:glob", "name": "expr", "args": [
+                    
+                  ]
+                },
+                "right": {
+                  "what": "type:glob", "name": "expr", "args": [
+                    
+                  ]
+                }
+              }
+            }
+          },
+          "value": {
+            "what": "expr:lambda", "argnames": [
+              "x", "e", "t"
+            ],
+            "body": {
+              "what": "expr:case",
+              "expr": {
+                "what": "expr:rel", "name": "t"
+              },
+              "cases": [
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EVar",
+                    "argnames": [
+                      "y"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:case",
+                    "expr": {
+                      "what": "expr:apply",
+                      "func": {
+                        "what": "expr:global", "name": "eqb"
+                      },
+                      "args": [
+                        {
+                          "what": "expr:rel", "name": "x"
+                        }, {
+                          "what": "expr:rel", "name": "y"
+                        }
+                      ]
+                    },
+                    "cases": [
+                      {
+                        "what": "case",
+                        "pat": {
+                          "what": "pat:constructor", "name": "True",
+                          "argnames": [
+                            
+                          ]
+                        }, "body": {
+                          "what": "expr:rel", "name": "e"
+                        }
+                      },
+                      {
+                        "what": "case",
+                        "pat": {
+                          "what": "pat:constructor", "name": "False",
+                          "argnames": [
+                            
+                          ]
+                        },
+                        "body": {
+                          "what": "expr:constructor", "name": "EVar",
+                          "args": [
+                            {
+                              "what": "expr:rel", "name": "y"
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EConst",
+                    "argnames": [
+                      "z0"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "EConst",
+                    "args": [
+                      {
+                        "what": "expr:rel", "name": "z0"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EAdd",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "EAdd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "ESub",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "ESub",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EMul",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "EMul",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EDiv",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "EDiv",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EMod",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "EMod",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "ELt",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "ELt",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "ELe",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "ELe",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EEq",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "EEq",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "ENot",
+                    "argnames": [
+                      "a"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "ENot",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EAnd",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "EAnd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EOr",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "EOr",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "what": "decl:fixgroup",
+      "fixlist": [
+        {
+          "what": "fixgroup:item", "name": "subst_form",
+          "type": {
+            "what": "type:arrow",
+            "left": {
+              "what": "type:glob", "name": "var", "args": [
+                
+              ]
+            },
+            "right": {
+              "what": "type:arrow",
+              "left": {
+                "what": "type:glob", "name": "expr", "args": [
+                  
+                ]
+              },
+              "right": {
+                "what": "type:arrow",
+                "left": {
+                  "what": "type:glob", "name": "form", "args": [
+                    
+                  ]
+                },
+                "right": {
+                  "what": "type:glob", "name": "form", "args": [
+                    
+                  ]
+                }
+              }
+            }
+          },
+          "value": {
+            "what": "expr:lambda", "argnames": [
+              "x", "e", "f"
+            ],
+            "body": {
+              "what": "expr:case",
+              "expr": {
+                "what": "expr:rel", "name": "f"
+              },
+              "cases": [
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "FLt",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FLt",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "FLe",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FLe",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "FEq",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FEq",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_expr"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "FNot",
+                    "argnames": [
+                      "g"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FNot",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_form"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "g"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "FAnd",
+                    "argnames": [
+                      "g", "h"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FAnd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_form"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "g"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_form"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "h"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "FOr",
+                    "argnames": [
+                      "g", "h"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FOr",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_form"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "g"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_form"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "h"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "FImpl",
+                    "argnames": [
+                      "g", "h"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FImpl",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_form"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "g"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_form"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          }, {
+                            "what": "expr:rel", "name": "h"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case", "pat": {
+                    "what": "pat:rel", "name": "x0"
+                  }, "body": {
+                    "what": "expr:rel", "name": "x0"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "what": "decl:fixgroup",
+      "fixlist": [
+        {
+          "what": "fixgroup:item", "name": "defined_expr",
+          "type": {
+            "what": "type:arrow",
+            "left": {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, "right": {
+              "what": "type:glob", "name": "form", "args": [
+                
+              ]
+            }
+          },
+          "value": {
+            "what": "expr:lambda", "argnames": [
+              "t"
+            ],
+            "body": {
+              "what": "expr:case",
+              "expr": {
+                "what": "expr:rel", "name": "t"
+              },
+              "cases": [
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EAdd",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FAnd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "ESub",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FAnd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EMul",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FAnd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EDiv",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FAnd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:constructor", "name": "FAnd",
+                        "args": [
+                          {
+                            "what": "expr:apply",
+                            "func": {
+                              "what": "expr:global", "name": "defined_expr"
+                            },
+                            "args": [
+                              {
+                                "what": "expr:rel", "name": "b"
+                              }
+                            ]
+                          },
+                          {
+                            "what": "expr:constructor", "name": "FNot",
+                            "args": [
+                              {
+                                "what": "expr:constructor", "name": "FEq",
+                                "args": [
+                                  {
+                                    "what": "expr:rel", "name": "b"
+                                  },
+                                  {
+                                    "what": "expr:constructor",
+                                    "name": "EConst",
+                                    "args": [
+                                      {
+                                        "what": "expr:constructor",
+                                        "name": "Z0", "args": [
+                                          
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EMod",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FAnd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:constructor", "name": "FAnd",
+                        "args": [
+                          {
+                            "what": "expr:apply",
+                            "func": {
+                              "what": "expr:global", "name": "defined_expr"
+                            },
+                            "args": [
+                              {
+                                "what": "expr:rel", "name": "b"
+                              }
+                            ]
+                          },
+                          {
+                            "what": "expr:constructor", "name": "FNot",
+                            "args": [
+                              {
+                                "what": "expr:constructor", "name": "FEq",
+                                "args": [
+                                  {
+                                    "what": "expr:rel", "name": "b"
+                                  },
+                                  {
+                                    "what": "expr:constructor",
+                                    "name": "EConst",
+                                    "args": [
+                                      {
+                                        "what": "expr:constructor",
+                                        "name": "Z0", "args": [
+                                          
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "ELt",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FAnd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "ELe",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FAnd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EEq",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FAnd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "ENot",
+                    "argnames": [
+                      "a"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:apply",
+                    "func": {
+                      "what": "expr:global", "name": "defined_expr"
+                    }, "args": [
+                      {
+                        "what": "expr:rel", "name": "a"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EAnd",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FAnd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "EOr",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FAnd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "a"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "b"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case", "pat": {
+                    "what": "pat:wild"
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FTrue", "args": [
+                      
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "what": "decl:fixgroup",
+      "fixlist": [
+        {
+          "what": "fixgroup:item", "name": "wpg",
+          "type": {
+            "what": "type:arrow",
+            "left": {
+              "what": "type:glob", "name": "prog", "args": [
+                
+              ]
+            },
+            "right": {
+              "what": "type:arrow",
+              "left": {
+                "what": "type:glob", "name": "form", "args": [
+                  
+                ]
+              },
+              "right": {
+                "what": "type:glob", "name": "form", "args": [
+                  
+                ]
+              }
+            }
+          },
+          "value": {
+            "what": "expr:lambda", "argnames": [
+              "p", "q"
+            ],
+            "body": {
+              "what": "expr:case",
+              "expr": {
+                "what": "expr:rel", "name": "p"
+              },
+              "cases": [
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "PNil",
+                    "argnames": [
+                      
+                    ]
+                  }, "body": {
+                    "what": "expr:rel", "name": "q"
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "PAsgn",
+                    "argnames": [
+                      "x", "e", "rest"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FAnd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "e"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "subst_form"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:rel", "name": "x"
+                          }, {
+                            "what": "expr:rel", "name": "e"
+                          },
+                          {
+                            "what": "expr:apply",
+                            "func": {
+                              "what": "expr:global", "name": "wpg"
+                            },
+                            "args": [
+                              {
+                                "what": "expr:rel", "name": "rest"
+                              }, {
+                                "what": "expr:rel", "name": "q"
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "PCond",
+                    "argnames": [
+                      "c", "thn", "els", "rest"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "FAnd",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "defined_expr"
+                        }, "args": [
+                          {
+                            "what": "expr:rel", "name": "c"
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:constructor", "name": "FAnd",
+                        "args": [
+                          {
+                            "what": "expr:constructor", "name": "FImpl",
+                            "args": [
+                              {
+                                "what": "expr:constructor", "name": "FNot",
+                                "args": [
+                                  {
+                                    "what": "expr:constructor",
+                                    "name": "FEq",
+                                    "args": [
+                                      {
+                                        "what": "expr:rel", "name": "c"
+                                      },
+                                      {
+                                        "what": "expr:constructor",
+                                        "name": "EConst",
+                                        "args": [
+                                          {
+                                            "what": "expr:constructor",
+                                            "name": "Z0", "args": [
+                                              
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "what": "expr:apply",
+                                "func": {
+                                  "what": "expr:global", "name": "wpg"
+                                },
+                                "args": [
+                                  {
+                                    "what": "expr:rel", "name": "thn"
+                                  },
+                                  {
+                                    "what": "expr:apply",
+                                    "func": {
+                                      "what": "expr:global", "name": "wpg"
+                                    },
+                                    "args": [
+                                      {
+                                        "what": "expr:rel", "name": "rest"
+                                      }, {
+                                        "what": "expr:rel", "name": "q"
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          {
+                            "what": "expr:constructor", "name": "FImpl",
+                            "args": [
+                              {
+                                "what": "expr:constructor", "name": "FEq",
+                                "args": [
+                                  {
+                                    "what": "expr:rel", "name": "c"
+                                  },
+                                  {
+                                    "what": "expr:constructor",
+                                    "name": "EConst",
+                                    "args": [
+                                      {
+                                        "what": "expr:constructor",
+                                        "name": "Z0", "args": [
+                                          
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "what": "expr:apply",
+                                "func": {
+                                  "what": "expr:global", "name": "wpg"
+                                },
+                                "args": [
+                                  {
+                                    "what": "expr:rel", "name": "els"
+                                  },
+                                  {
+                                    "what": "expr:apply",
+                                    "func": {
+                                      "what": "expr:global", "name": "wpg"
+                                    },
+                                    "args": [
+                                      {
+                                        "what": "expr:rel", "name": "rest"
+                                      }, {
+                                        "what": "expr:rel", "name": "q"
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "what": "decl:ind", "name": "kcmd", "argnames": [
+        
+      ],
+      "constructors": [
+        {
+          "name": "KSkip", "argtypes": [
+            
+          ]
+        },
+        {
+          "name": "KAsgn",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "var", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "KSeq",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "kcmd", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "kcmd", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "KIf",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "kcmd", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "kcmd", "args": [
+                
+              ]
+            }
+          ]
+        },
+        {
+          "name": "KWhile",
+          "argtypes": [
+            {
+              "what": "type:glob", "name": "form", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "expr", "args": [
+                
+              ]
+            }, {
+              "what": "type:glob", "name": "kcmd", "args": [
+                
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "what": "decl:fixgroup",
+      "fixlist": [
+        {
+          "what": "fixgroup:item", "name": "vcg",
+          "type": {
+            "what": "type:arrow",
+            "left": {
+              "what": "type:glob", "name": "kcmd", "args": [
+                
+              ]
+            },
+            "right": {
+              "what": "type:arrow",
+              "left": {
+                "what": "type:glob", "name": "form", "args": [
+                  
+                ]
+              },
+              "right": {
+                "what": "type:glob", "name": "( * )",
+                "args": [
+                  {
+                    "what": "type:glob", "name": "form", "args": [
+                      
+                    ]
+                  },
+                  {
+                    "what": "type:glob", "name": "list",
+                    "args": [
+                      {
+                        "what": "type:glob", "name": "form", "args": [
+                          
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          "value": {
+            "what": "expr:lambda", "argnames": [
+              "k", "q"
+            ],
+            "body": {
+              "what": "expr:case",
+              "expr": {
+                "what": "expr:rel", "name": "k"
+              },
+              "cases": [
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "KSkip",
+                    "argnames": [
+                      
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "(,)",
+                    "args": [
+                      {
+                        "what": "expr:rel", "name": "q"
+                      },
+                      {
+                        "what": "expr:constructor", "name": "[]",
+                        "args": [
+                          
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "KAsgn",
+                    "argnames": [
+                      "x", "e"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "(,)",
+                    "args": [
+                      {
+                        "what": "expr:constructor", "name": "FAnd",
+                        "args": [
+                          {
+                            "what": "expr:apply",
+                            "func": {
+                              "what": "expr:global", "name": "defined_expr"
+                            },
+                            "args": [
+                              {
+                                "what": "expr:rel", "name": "e"
+                              }
+                            ]
+                          },
+                          {
+                            "what": "expr:apply",
+                            "func": {
+                              "what": "expr:global", "name": "subst_form"
+                            },
+                            "args": [
+                              {
+                                "what": "expr:rel", "name": "x"
+                              }, {
+                                "what": "expr:rel", "name": "e"
+                              }, {
+                                "what": "expr:rel", "name": "q"
+                              }
+                            ]
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:constructor", "name": "[]",
+                        "args": [
+                          
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "KSeq",
+                    "argnames": [
+                      "a", "b"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "(,)",
+                    "args": [
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "fst"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:apply",
+                            "func": {
+                              "what": "expr:global", "name": "vcg"
+                            },
+                            "args": [
+                              {
+                                "what": "expr:rel", "name": "a"
+                              },
+                              {
+                                "what": "expr:apply",
+                                "func": {
+                                  "what": "expr:global", "name": "fst"
+                                },
+                                "args": [
+                                  {
+                                    "what": "expr:apply",
+                                    "func": {
+                                      "what": "expr:global", "name": "vcg"
+                                    },
+                                    "args": [
+                                      {
+                                        "what": "expr:rel", "name": "b"
+                                      }, {
+                                        "what": "expr:rel", "name": "q"
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "app"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:apply",
+                            "func": {
+                              "what": "expr:global", "name": "snd"
+                            },
+                            "args": [
+                              {
+                                "what": "expr:apply",
+                                "func": {
+                                  "what": "expr:global", "name": "vcg"
+                                },
+                                "args": [
+                                  {
+                                    "what": "expr:rel", "name": "a"
+                                  },
+                                  {
+                                    "what": "expr:apply",
+                                    "func": {
+                                      "what": "expr:global", "name": "fst"
+                                    },
+                                    "args": [
+                                      {
+                                        "what": "expr:apply",
+                                        "func": {
+                                          "what": "expr:global",
+                                          "name": "vcg"
+                                        },
+                                        "args": [
+                                          {
+                                            "what": "expr:rel", "name": "b"
+                                          },
+                                          {
+                                            "what": "expr:rel", "name": "q"
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          {
+                            "what": "expr:apply",
+                            "func": {
+                              "what": "expr:global", "name": "snd"
+                            },
+                            "args": [
+                              {
+                                "what": "expr:apply",
+                                "func": {
+                                  "what": "expr:global", "name": "vcg"
+                                },
+                                "args": [
+                                  {
+                                    "what": "expr:rel", "name": "b"
+                                  }, {
+                                    "what": "expr:rel", "name": "q"
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "KIf",
+                    "argnames": [
+                      "c", "t", "e"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "(,)",
+                    "args": [
+                      {
+                        "what": "expr:constructor", "name": "FAnd",
+                        "args": [
+                          {
+                            "what": "expr:apply",
+                            "func": {
+                              "what": "expr:global", "name": "defined_expr"
+                            },
+                            "args": [
+                              {
+                                "what": "expr:rel", "name": "c"
+                              }
+                            ]
+                          },
+                          {
+                            "what": "expr:constructor", "name": "FAnd",
+                            "args": [
+                              {
+                                "what": "expr:constructor", "name": "FImpl",
+                                "args": [
+                                  {
+                                    "what": "expr:constructor",
+                                    "name": "FNot",
+                                    "args": [
+                                      {
+                                        "what": "expr:constructor",
+                                        "name": "FEq",
+                                        "args": [
+                                          {
+                                            "what": "expr:rel", "name": "c"
+                                          },
+                                          {
+                                            "what": "expr:constructor",
+                                            "name": "EConst",
+                                            "args": [
+                                              {
+                                                "what": "expr:constructor",
+                                                "name": "Z0", "args": [
+                                                  
+                                                ]
+                                              }
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "what": "expr:apply",
+                                    "func": {
+                                      "what": "expr:global", "name": "fst"
+                                    },
+                                    "args": [
+                                      {
+                                        "what": "expr:apply",
+                                        "func": {
+                                          "what": "expr:global",
+                                          "name": "vcg"
+                                        },
+                                        "args": [
+                                          {
+                                            "what": "expr:rel", "name": "t"
+                                          },
+                                          {
+                                            "what": "expr:rel", "name": "q"
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "what": "expr:constructor", "name": "FImpl",
+                                "args": [
+                                  {
+                                    "what": "expr:constructor",
+                                    "name": "FEq",
+                                    "args": [
+                                      {
+                                        "what": "expr:rel", "name": "c"
+                                      },
+                                      {
+                                        "what": "expr:constructor",
+                                        "name": "EConst",
+                                        "args": [
+                                          {
+                                            "what": "expr:constructor",
+                                            "name": "Z0", "args": [
+                                              
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "what": "expr:apply",
+                                    "func": {
+                                      "what": "expr:global", "name": "fst"
+                                    },
+                                    "args": [
+                                      {
+                                        "what": "expr:apply",
+                                        "func": {
+                                          "what": "expr:global",
+                                          "name": "vcg"
+                                        },
+                                        "args": [
+                                          {
+                                            "what": "expr:rel", "name": "e"
+                                          },
+                                          {
+                                            "what": "expr:rel", "name": "q"
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      },
+                      {
+                        "what": "expr:apply",
+                        "func": {
+                          "what": "expr:global", "name": "app"
+                        },
+                        "args": [
+                          {
+                            "what": "expr:apply",
+                            "func": {
+                              "what": "expr:global", "name": "snd"
+                            },
+                            "args": [
+                              {
+                                "what": "expr:apply",
+                                "func": {
+                                  "what": "expr:global", "name": "vcg"
+                                },
+                                "args": [
+                                  {
+                                    "what": "expr:rel", "name": "t"
+                                  }, {
+                                    "what": "expr:rel", "name": "q"
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          {
+                            "what": "expr:apply",
+                            "func": {
+                              "what": "expr:global", "name": "snd"
+                            },
+                            "args": [
+                              {
+                                "what": "expr:apply",
+                                "func": {
+                                  "what": "expr:global", "name": "vcg"
+                                },
+                                "args": [
+                                  {
+                                    "what": "expr:rel", "name": "e"
+                                  }, {
+                                    "what": "expr:rel", "name": "q"
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "what": "case",
+                  "pat": {
+                    "what": "pat:constructor", "name": "KWhile",
+                    "argnames": [
+                      "inv", "c", "body"
+                    ]
+                  },
+                  "body": {
+                    "what": "expr:constructor", "name": "(,)",
+                    "args": [
+                      {
+                        "what": "expr:rel", "name": "inv"
+                      },
+                      {
+                        "what": "expr:constructor", "name": "(::)",
+                        "args": [
+                          {
+                            "what": "expr:constructor", "name": "FImpl",
+                            "args": [
+                              {
+                                "what": "expr:rel", "name": "inv"
+                              },
+                              {
+                                "what": "expr:apply",
+                                "func": {
+                                  "what": "expr:global",
+                                  "name": "defined_expr"
+                                },
+                                "args": [
+                                  {
+                                    "what": "expr:rel", "name": "c"
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          {
+                            "what": "expr:constructor", "name": "(::)",
+                            "args": [
+                              {
+                                "what": "expr:constructor", "name": "FImpl",
+                                "args": [
+                                  {
+                                    "what": "expr:constructor",
+                                    "name": "FAnd",
+                                    "args": [
+                                      {
+                                        "what": "expr:rel", "name": "inv"
+                                      },
+                                      {
+                                        "what": "expr:constructor",
+                                        "name": "FNot",
+                                        "args": [
+                                          {
+                                            "what": "expr:constructor",
+                                            "name": "FEq",
+                                            "args": [
+                                              {
+                                                "what": "expr:rel",
+                                                "name": "c"
+                                              },
+                                              {
+                                                "what": "expr:constructor",
+                                                "name": "EConst",
+                                                "args": [
+                                                  {
+                                                    "what": "expr:constructor",
+                                                    "name": "Z0",
+                                                    "args": [
+                                                      
+                                                    ]
+                                                  }
+                                                ]
+                                              }
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "what": "expr:apply",
+                                    "func": {
+                                      "what": "expr:global", "name": "fst"
+                                    },
+                                    "args": [
+                                      {
+                                        "what": "expr:apply",
+                                        "func": {
+                                          "what": "expr:global",
+                                          "name": "vcg"
+                                        },
+                                        "args": [
+                                          {
+                                            "what": "expr:rel",
+                                            "name": "body"
+                                          },
+                                          {
+                                            "what": "expr:rel", "name": "inv"
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "what": "expr:constructor", "name": "(::)",
+                                "args": [
+                                  {
+                                    "what": "expr:constructor",
+                                    "name": "FImpl",
+                                    "args": [
+                                      {
+                                        "what": "expr:constructor",
+                                        "name": "FAnd",
+                                        "args": [
+                                          {
+                                            "what": "expr:rel", "name": "inv"
+                                          },
+                                          {
+                                            "what": "expr:constructor",
+                                            "name": "FEq",
+                                            "args": [
+                                              {
+                                                "what": "expr:rel",
+                                                "name": "c"
+                                              },
+                                              {
+                                                "what": "expr:constructor",
+                                                "name": "EConst",
+                                                "args": [
+                                                  {
+                                                    "what": "expr:constructor",
+                                                    "name": "Z0",
+                                                    "args": [
+                                                      
+                                                    ]
+                                                  }
+                                                ]
+                                              }
+                                            ]
+                                          }
+                                        ]
+                                      }, {
+                                        "what": "expr:rel", "name": "q"
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "what": "expr:apply",
+                                    "func": {
+                                      "what": "expr:global", "name": "snd"
+                                    },
+                                    "args": [
+                                      {
+                                        "what": "expr:apply",
+                                        "func": {
+                                          "what": "expr:global",
+                                          "name": "vcg"
+                                        },
+                                        "args": [
+                                          {
+                                            "what": "expr:rel",
+                                            "name": "body"
+                                          },
+                                          {
+                                            "what": "expr:rel", "name": "inv"
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

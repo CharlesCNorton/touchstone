@@ -1,0 +1,19 @@
+# Toolchain for the companion proofs in this folder. The Python side (Python 3.13.2,
+# z3-solver 4.16.0, cvc5 1.3.4) is pinned in ../pyproject.toml.
+
+[rocq]                       # touchstone_encoding.v, touchstone_functor.v, touchstone_domains.v
+rocq-prover   = 9.0.0        # opam switch; provides coqc and rocq
+ocaml         = 4.14-flambda
+# build:  opam switch create rocq9 4.14-flambda && opam install rocq-prover.9.0.0
+# verify: bash verify_coq.sh
+
+[smtcoq]                     # touchstone_smtcoq.v  (a separate switch; not Rocq 9.0)
+coq           = 8.20.1
+coq-smtcoq    = 2.3+8.20
+verit         = stable2016   # LIA proofs; https://verit.loria.fr/distrib/veriT-stable2016.tar.gz
+cvc4          = 1.6          # QF_UF/BV/arrays; https://cvc4.cs.stanford.edu/downloads/builds/x86_64-linux-opt/cvc4-1.6-x86_64-linux-opt
+# build:  opam switch create certicoq-8.20 ocaml-base-compiler.4.14.2 && opam install coq.8.20.1 coq-smtcoq.2.3+8.20
+#         veriT-stable2016 builds with autoconf/flex/bison/libgmp-dev (a Docker ubuntu:20.04 container
+#         works without host sudo); put veriT and cvc4 on PATH (e.g. ~/smtsolvers). SMTCoq's LFSC
+#         signatures (*.plf) are staged from the coq-smtcoq sources by verify_smtcoq.sh.
+# verify: bash verify_smtcoq.sh    (invoked by verify_coq.sh when the toolchain is present)

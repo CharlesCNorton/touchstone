@@ -1,0 +1,19 @@
+# Touchstone pre-commit hooks. Add to a repo's .pre-commit-config.yaml, e.g.
+#   - repo: https://github.com/CharlesCNorton/touchstone
+#     rev: v1.29.0
+#     hooks:
+#       - id: touchstone-gate
+- id: touchstone-gate
+  name: touchstone gate
+  description: Verify each changed function still preserves its properties (trap freedom and any contracts).
+  entry: touchstone gate --base HEAD
+  language: python
+  pass_filenames: false
+  require_serial: true
+- id: touchstone-scan
+  name: touchstone scan
+  description: Symbolic trap-freedom scan of the repository (reads [tool.touchstone] for excludes / fail-on).
+  entry: touchstone scan .
+  language: python
+  pass_filenames: false
+  require_serial: true

@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Coq / Rocq build artifacts
+*.vo
+*.vok
+*.vos
+*.glob
+.*.aux
+.lia.cache
+.nia.cache
+.nra.cache
+.coq-native/
+
+# OCaml extraction + build artifacts (proofs/: emitted by Extraction and the build scripts)
+*.cmi
+*.cmx
+*.cmo
+*.o
+/proofs/vcgen.ml
+/proofs/vcgen.mli
+/proofs/intervals.ml
+/proofs/intervals.mli
+/proofs/encoding.ml
+/proofs/encoding.mli
+/proofs/vcgen
+/proofs/intervals
+/proofs/encoding
+/proofs/encoders.ml
+/proofs/encoders.mli
+/proofs/encoders
+# JSON extractions are emitted into proofs/ transiently by coqc; the committed images live in
+# touchstone/_generated/. Never commit the proofs/ copies.
+/proofs/*.json
+
+# OS
+.DS_Store
+Thumbs.db

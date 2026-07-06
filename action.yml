@@ -1,0 +1,84 @@
+name: "Touchstone scan"
+description: "Symbolic trap-freedom scan of a Python repository; uploads findings to GitHub code scanning as SARIF."
+branding:
+  icon: "shield"
+  color: "purple"
+
+inputs:
+  target:
+    description: "Path, owner/repo slug, or URL to scan."
+    default: "."
+  execute:
+    description: "Replay each finding in the sandbox to confirm genuine bugs (true/false)."
+    default: "false"
+  baseline:
+    description: "Path to a baseline file; only a finding not already recorded there fails the run."
+    default: ""
+  exclude:
+    description: "Comma-separated fnmatch globs to drop from triage (also read from [tool.touchstone])."
+    default: ""
+  fail-on:
+    description: "Which findings fail the run: bug | suspected | any | none (default: the built-in policy)."
+    default: ""
+  args:
+    description: "Extra arguments passed through to `touchstone scan`."
+    default: ""
+  version:
+    description: "Version spec for the pip install, e.g. '==1.14.0' (default: latest)."
+    default: ""
+  upload-sarif:
+    description: "Upload the SARIF to GitHub code scanning (true/false). Needs security-events: write."
+    default: "true"
+
+outputs:
+  sarif:
+    description: "Path to the generated SARIF file."
+    value: ${{ steps.scan.outputs.sarif }}
+  exit-code:
+    description: "The scan's exit code (0 pass, 1 a finding failed the policy)."
+    value: ${{ steps.scan.outputs.exit-code }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install touchstone-prover
+      shell: bash
+      env:
+        TS_VERSION: ${{ inputs.version }}
+      run: python3 -m pip install --upgrade "touchstone-prover${TS_VERSION}"
+
+    - name: Run touchstone scan
+      id: scan
+      shell: bash
+      env:
+        TS_TARGET: ${{ inputs.target }}
+        TS_EXECUTE: ${{ inputs.execute }}
+        TS_BASELINE: ${{ inputs.baseline }}
+        TS_EXCLUDE: ${{ inputs.exclude }}
+        TS_FAIL_ON: ${{ inputs.fail-on }}
+        TS_ARGS: ${{ inputs.args }}
+      run: |
+        sarif="${RUNNER_TEMP:-/tmp}/touchstone.sarif"
+        flags=(--sarif)
+        [ "$TS_EXECUTE" = "true" ] && flags+=(--execute)
+        [ -n "$TS_BASELINE" ] && flags+=(--baseline "$TS_BASELINE")
+        [ -n "$TS_EXCLUDE" ] && flags+=(--exclude "$TS_EXCLUDE")
+        [ -n "$TS_FAIL_ON" ] && flags+=(--fail-on "$TS_FAIL_ON")
+        set +e
+        touchstone scan "$TS_TARGET" "${flags[@]}" $TS_ARGS > "$sarif"
+        code=$?
+        set -e
+        echo "sarif=$sarif" >> "$GITHUB_OUTPUT"
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        python3 -c "import json,sys; r=json.load(open('$sarif'))['runs'][0]['results']; print('touchstone: %d finding(s)' % len(r))" || true
+
+    - name: Upload SARIF
+      if: ${{ always() && inputs.upload-sarif == 'true' }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.scan.outputs.sarif }}
+
+    - name: Fail on findings
+      if: ${{ always() }}
+      shell: bash
+      run: exit ${{ steps.scan.outputs.exit-code }}

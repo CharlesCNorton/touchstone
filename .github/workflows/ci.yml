@@ -1,0 +1,92 @@
+name: ci
+on:
+  push:
+    branches:
+      - '**'        # branch pushes only; a release tag's commit is already validated via its branch push,
+      #               so tags do not re-trigger ci (and smtcoq) -- only publish.yml runs on the tag
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  python:
+    name: self-tests + audits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: install (z3-solver and cvc5 pinned in pyproject.toml)
+        run: pip install .
+      - name: run the self-tests, soundness audits, and completeness regressions
+        run: python -m touchstone.ci
+
+  proofs:
+    name: machine-checked proofs (Rocq 9.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: make the workspace writable for the in-container non-root user
+        run: sudo chmod -R a+rwX "$GITHUB_WORKSPACE"
+      - name: build and check the Rocq companion proofs
+        uses: coq-community/docker-coq-action@v1
+        with:
+          coq_version: "9.0"
+          ocaml_version: "4.14-flambda"
+          custom_script: |
+            startGroup "verify the trust base"
+              cd proofs && bash verify_coq.sh
+            endGroup
+      - name: stage the Rocq-extracted generator, interval operators, and encoding for the audits
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-ml
+          path: |
+            proofs/vcgen.ml
+            proofs/intervals.ml
+            proofs/encoding.ml
+          if-no-files-found: error
+
+  extracted:
+    name: extracted generator and domains == in-engine
+    needs: proofs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: install (z3-solver and cvc5 pinned in pyproject.toml)
+        run: pip install .
+      - name: install the OCaml native compiler (to build the extracted code)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ocaml-nox
+          || sudo apt-get install -y --no-install-recommends ocaml
+      - name: fetch the Rocq-extracted sources from the proofs job
+        uses: actions/download-artifact@v4
+        with:
+          name: extracted-ml
+          path: proofs
+      - name: build the extracted generator, interval operators, and encoding behind their drivers
+        run: |
+          cd proofs
+          test -f vcgen.ml && test -f intervals.ml && test -f encoding.ml
+          rm -f vcgen.mli intervals.mli encoding.mli
+          for stem in vcgen intervals encoding; do
+            ocamlfind ocamlopt $stem.ml ${stem}_main.ml -o $stem 2>/dev/null \
+              || ocamlopt $stem.ml ${stem}_main.ml -o $stem 2>/dev/null \
+              || ocamlc $stem.ml ${stem}_main.ml -o $stem
+          done
+      - name: hold the in-engine generator, operators, and encoding equal to the extraction
+        run: |
+          python - <<'PY'
+          import touchstone as t
+          v = t.extracted_vcgen_audit(trials=2000)
+          assert v["available"] and v["checks"] == 2000, v
+          print(f"VCGEN: {v['checks']} VCs, in-engine generator == Rocq-extracted generator")
+          i = t.extracted_intervals_audit(trials=2000)
+          assert i["available"] and i["checks"] == 2000, i
+          print(f"INTERVALS: {i['checks']} ops, in-engine operators == Rocq-extracted operators")
+          e = t.extracted_encoding_audit()
+          assert e["available"] and e["checks"] > 0, e
+          print(f"ENCODING: {e['checks']} (a,b) pairs, in-engine py_floordiv/py_mod == Rocq-extracted")
+          PY

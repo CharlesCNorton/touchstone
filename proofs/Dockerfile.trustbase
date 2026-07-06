@@ -1,0 +1,38 @@
+# One reproducible image for the WHOLE machine-checked trust base: both opam switches the companion proofs
+# need, provisioned together. The Rocq 9.0 switch (rocq9) checks touchstone_encoding / functor / domains /
+# encoders / floats / seplogic / relyguarantee and builds the OCaml extractions; the Coq 8.20 + SMTCoq +
+# veriT switch (certicoq-8.20, the coqorg base) checks touchstone_smtcoq / obligations by re-validating an
+# SMT certificate in Coq's kernel. proofs/verify_all.sh activates each switch in turn, so `docker run` checks
+# everything that verify_coq.sh and verify_smtcoq.sh check separately -- one build, one command. Context = repo root.
+#   docker build -f proofs/Dockerfile.trustbase -t touchstone-trustbase . && docker run --rm touchstone-trustbase
+FROM coqorg/coq:8.20.1
+
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends autoconf flex bison libgmp-dev wget ca-certificates make g++ \
+ && rm -rf /var/lib/apt/lists/*
+
+USER coq
+WORKDIR /home/coq
+
+# The base image's default opam switch carries Coq 8.20.1; alias it to the name verify_all.sh expects so the
+# SMTCoq phase finds it. veriT (stable2016) supplies the LIA certificates; its 2016 sources predate gcc's
+# -fno-common default, so they compile with -fcommon.
+RUN opam switch rename "$(opam switch show)" certicoq-8.20 || true
+RUN wget -q https://verit.loria.fr/distrib/veriT-stable2016.tar.gz \
+ && tar xzf veriT-stable2016.tar.gz \
+ && cd veriT-stable2016 && autoconf && ./configure && make CC="gcc -fcommon" \
+ && mkdir -p /home/coq/.local/bin && cp veriT /home/coq/.local/bin/veriT \
+ && cd /home/coq && rm -rf veriT-stable2016 veriT-stable2016.tar.gz
+ENV PATH=/home/coq/.local/bin:${PATH}
+RUN opam install -y coq-smtcoq.2.3+8.20
+
+# A second switch for the Rocq 9.0 companion files (the encoding / functor / domains / ... proofs and the
+# OCaml extractions), per toolchain.lock [rocq]: Rocq 9.0.0 on OCaml 4.14 flambda.
+RUN opam switch create rocq9 ocaml-base-compiler.4.14.2 \
+ && opam install -y --switch=rocq9 rocq-prover.9.0.0
+
+COPY --chown=coq:coq proofs /home/coq/proofs
+COPY --chown=coq:coq touchstone /home/coq/touchstone
+WORKDIR /home/coq/proofs
+CMD ["bash", "verify_all.sh"]
