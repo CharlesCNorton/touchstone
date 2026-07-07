@@ -6227,6 +6227,19 @@ def verify_no_raise(prop, target, src, pre, repo=None, timeout=4000) -> Verdict:
         return Verdict(UNKNOWN, prop, target, "exception safety",
                        reason="a method call on a number-typed parameter is outside the integer CHC model "
                               "(value engine decides)")
+    _intparams = {a.arg for a in fn.args.args               # float() of an integer argument OverflowErrors when the int
+                  if isinstance(a.annotation, ast.Name) and a.annotation.id == "int"}   # exceeds the largest a double
+    def _floats_an_int(n):                                   # holds -- a 2**1024 threshold the integer CHC model cannot
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "float"   # carry; defer such a
+                and "float" not in (repo or {}) and len(n.args) == 1):   # float() to the value engine, which does model it
+            return False
+        a = n.args[0]
+        return ((isinstance(a, ast.Name) and a.id in _intparams)
+                or (isinstance(a, ast.Constant) and isinstance(a.value, int) and not isinstance(a.value, bool))
+                or isinstance(a, ast.BinOp))
+    if any(_floats_an_int(n) for n in ast.walk(fn)):
+        return Verdict(UNKNOWN, prop, target, "exception safety",
+                       reason="float() of an integer may OverflowError, outside the integer CHC model (value engine decides)")
     def _ctnr_ann(ann):                                      # a container annotation, bare (list) or parameterized
         if isinstance(ann, ast.Name):                        # (list[int], dict[str, int], or a typing alias)
             return ann.id in ("list", "dict", "set", "frozenset", "tuple")

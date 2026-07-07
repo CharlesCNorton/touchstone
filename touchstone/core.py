@@ -1280,6 +1280,61 @@ def _module_math_imports(mod):
     return frozenset(out)
 
 
+_MATH_OVF_CACHE = {}
+
+
+def _math_ovf_input_bound(name):
+    """The largest x >= 0 with math.<name>(x) finite, for an exp-family function that raises OverflowError on a
+    large argument (sinh / cosh / expm1 / exp2). |x| > bound (even/odd sinh/cosh) or x > bound (increasing
+    expm1/exp2) is exactly where CPython overflows. Found by bisection then ULP-refined; cached per name."""
+    b = _MATH_OVF_CACHE.get(name)
+    if b is not None:
+        return b
+    fn = getattr(_math, name)
+    def fin(x):
+        try:
+            v = fn(x)
+        except (OverflowError, ValueError):
+            return False
+        return _math.isfinite(v)
+    lo, hi = 0.0, 2000.0                                  # fn(0) finite; fn(2000) overflows for all of these
+    for _ in range(200):
+        mid = (lo + hi) * 0.5
+        if fin(mid):
+            lo = mid
+        else:
+            hi = mid
+        if _math.nextafter(lo, _math.inf) >= hi:
+            break
+    t = lo
+    while fin(_math.nextafter(t, _math.inf)):             # nail the exact largest-finite boundary
+        t = _math.nextafter(t, _math.inf)
+    while not fin(t):
+        t = _math.nextafter(t, 0.0)
+    _MATH_OVF_CACHE[name] = t
+    return t
+
+
+_FLOAT_INT_MAX_CACHE = []
+
+
+def _float_int_max():
+    """The largest int n with float(n) finite; |n| beyond it is the OverflowError float(int) raises. Found by
+    bisection between 2**1023 (finite) and 2**1024 (overflows); cached."""
+    if _FLOAT_INT_MAX_CACHE:
+        return _FLOAT_INT_MAX_CACHE[0]
+    lo, hi = 2 ** 1023, 2 ** 1024
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        try:
+            float(mid)
+            lo = mid
+        except OverflowError:
+            hi = mid
+    _FLOAT_INT_MAX_CACHE.append(lo)
+    return lo
+
+
 def _math_call(name, args, ctx):
     """A trap-bearing or rounding math function: emit the (exact) domain ValueError it raises and return a
     sound-typed over-approximated result. The result value is over-approximated only off the trap-freedom path
@@ -1412,6 +1467,21 @@ def _math_call(name, args, ctx):
             if not isfloat(x):
                 return None                                  # a non-numeric argument: abstain
             _to_fp(x)                                        # trap-check (already evaluated)
+        if _TRAPFREE and ctx.traps is not None:              # OverflowError (a trap-freedom concern; the exp-family
+            x0 = _to_fp(a0)                                  # -- sinh/cosh/expm1/exp2 -- and ldexp raise it. degrees/
+            fx = z3.And(z3.Not(z3.fpIsInf(x0)), z3.Not(z3.fpIsNaN(x0)))   # hypot/radians return inf, so they do not.
+            if name in ("sinh", "cosh"):                     # even/odd: |x| beyond the exact boundary overflows
+                trap(z3.And(fx, z3.fpGT(z3.fpAbs(x0), z3.FPVal(_math_ovf_input_bound(name), F))))
+            elif name in ("expm1", "exp2"):                  # increasing: only the large positive tail overflows
+                trap(z3.And(fx, z3.fpGT(x0, z3.FPVal(_math_ovf_input_bound(name), F))))
+            elif name == "ldexp" and len(args) >= 2 and z3.is_expr(args[1]) and z3.is_int(args[1]):
+                mi = z3.simplify(args[1])                     # ldexp(x, i) = x * 2**i overflows when |x| * 2**i > DBL_MAX
+                if z3.is_int_value(mi):
+                    ii = mi.as_long()
+                    if ii >= 1:                              # |x| > DBL_MAX * 2**-i overflows (i <= 0 never overflows)
+                        trap(z3.And(fx, z3.fpGT(z3.fpAbs(x0), z3.FPVal(_math.ldexp(_DBL_MAX, -ii), F))))
+                else:                                        # a symbolic shift: overflow is possible for any nonzero base
+                    trap(z3.And(fx, z3.Not(z3.fpIsZero(x0))))
         over()
         return z3.FreshConst(F, "m_" + name)
     return None
@@ -3748,6 +3818,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     return _as_int(a)                         # int(int) / int(bool): exact, never traps
                 if _is_fp(a) or (_TRAPFREE and isinstance(a, _Opaque)
                                  and not isinstance(a, (_SafeContainer, _DictParam, _DictLit, _MapVal))):
+                    if _is_fp(a) and _TRAPFREE and ctx.traps is not None:
+                        ctx.traps.append(z3.And(ctx.pc, z3.Or(z3.fpIsInf(a), z3.fpIsNaN(a))))   # int(inf) OverflowError, int(nan) ValueError
                     _note_overapprox(ctx, "int() of a float")    # truncation toward zero of a finite float --
                     return z3.FreshInt("int")                    # some int (REFUTED withheld; PROVED still sound)
                 raise Unsupported("int() of a string, container, or unmodeled value (may raise ValueError/TypeError)")
@@ -3768,6 +3840,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if _is_fp(a):
                 return a                                      # float(float): identity
             if z3.is_expr(a) and (z3.is_int(a) or z3.is_bool(a)):
+                ai = _as_int(a)
+                if _TRAPFREE and ctx.traps is not None:       # float(n) OverflowErrors when |n| exceeds the largest int
+                    m = z3.IntVal(_float_int_max())           # with a finite double value (the CHC engine cannot carry
+                    ctx.traps.append(z3.And(ctx.pc, z3.Or(ai > m, ai < -m)))   # this 2**1024 constant, so it abstains to here)
                 return _to_fp(a)                              # float(int) / float(bool): the exact IEEE-754 value
             raise Unsupported("float() of a non-literal string or unmodeled value (may raise ValueError)")
         if name in ("bytes", "bytearray") and name not in ctx.repo and len(node.args) <= 1:

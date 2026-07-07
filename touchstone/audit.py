@@ -4704,6 +4704,22 @@ def run_self_tests(fast=False):
     assert check("def f():\n    return 2.0 ** 3\n", target="f").status == PROVED                                # a constant folds exactly (8.0)
     assert check("def f(x: float):\n    return x ** 0\n", target="f").status == PROVED                          # x ** 0 == 1: no overflow
     assert prove("def f(x: float):\n    return x ** 2\n", "result >= 0.0", requires="isfinite(x)", target="f").status == PROVED   # prove unaffected (partial correctness)
+    # the exp-family (sinh / cosh / expm1 / exp2) and ldexp raise OverflowError on a large argument, so check must not prove an unbounded one trap-free (at the exact input boundary); a bounded-safe argument proves. degrees / hypot / radians return inf rather than raising, so they stay trap-free.
+    assert check("import math\ndef f(x: float):\n    return math.sinh(x)\n", target="f").status != PROVED    # |x| large: OverflowError
+    assert check("import math\ndef f(x: float):\n    return math.cosh(x)\n", target="f").status != PROVED
+    assert check("import math\ndef f(x: float):\n    return math.exp2(x)\n", target="f").status != PROVED     # 2 ** x, x > ~1024
+    assert check("import math\ndef f(x: float):\n    return math.expm1(x)\n", target="f").status != PROVED
+    assert check("import math\ndef f(x: float):\n    return math.ldexp(x, 5000)\n", target="f").status != PROVED   # x * 2**5000
+    assert check("import math\ndef f(x: float, i: int):\n    return math.ldexp(x, i)\n", target="f").status != PROVED   # symbolic shift can overflow
+    assert check("import math\ndef f(x: float):\n    if -700.0 <= x <= 700.0:\n        return math.sinh(x)\n    return 0.0\n", target="f").status == PROVED   # bounded: no overflow
+    assert check("import math\ndef f(x: float):\n    if x <= 1000.0:\n        return math.exp2(x)\n    return 0.0\n", target="f").status == PROVED
+    assert check("import math\ndef f(x: float):\n    if -1e50 <= x <= 1e50:\n        return math.ldexp(x, 3)\n    return 0.0\n", target="f").status == PROVED
+    assert check("import math\ndef f(x: float):\n    return math.degrees(x)\n", target="f").status == PROVED   # returns inf, never raises
+    # float(int) OverflowErrors for an int too large for a double, and int(float) raises on inf/nan; check must not prove either trap-free for an unbounded argument, while a bounded-safe one proves.
+    assert check("def f(n: int):\n    return float(n)\n", target="f").status != PROVED   # float(huge int) OverflowError
+    assert check("def f(n: int):\n    if -1000000 <= n <= 1000000:\n        return float(n)\n    return 0.0\n", target="f").status == PROVED
+    assert check("def f(x: float):\n    return int(x)\n", target="f").status != PROVED   # int(inf) OverflowError, int(nan) ValueError
+    assert check("import math\ndef f(x: float):\n    if math.isfinite(x):\n        return int(x)\n    return 0\n", target="f").status == PROVED
     # a bytes/bytearray element is an int in [0, 255]; ord/chr are the codepoint bijection over [0, 0x10FFFF]: a constant folds exactly, a single character round-trips, else not pinned.
     assert prove("def f(b: bytes):\n    if len(b) > 0:\n        return b[0]\n    return 0\n",
                  "result >= 0 and result <= 255").status == PROVED
@@ -5590,7 +5606,7 @@ def run_self_tests(fast=False):
     assert check("def f(a: list):\n    return int(a)\n", target="f").status != PROVED
     assert check("def f(s: set):\n    return int(s)\n", target="f").status != PROVED
     assert check("def f(a: list):\n    return len(a) + 1\n", target="f").status == PROVED        # scalar from len: still proves
-    assert check("def f(x: float):\n    return int(x)\n", target="f").status == PROVED            # int(float): unaffected
+    assert check("def f(x: float):\n    return int(x)\n", target="f").status != PROVED            # int(inf)/int(nan) raise, like math.floor(inf)
     # an object-typed parameter (a user class, a qualified name, or a PEP-604 union) is an opaque receiver, not a sampled integer, so a scalar op on it (100 // proto) is UNKNOWN, not a false trap; a method call stays opaque-safe, and a class-annotated method dispatch still upgrades to its visible body.
     assert check("class Conf:\n    pass\ndef f(proto: Conf):\n    return 100 // proto\n", target="f").status == UNKNOWN
     assert check("import m\ndef f(proto: m.Conf):\n    return 100 // proto\n", target="f").status == UNKNOWN
@@ -7293,10 +7309,10 @@ def run_self_tests(fast=False):
     assert prove(_T + "def f():\n    return torch.zeros(4, 5).index_select(0, torch.zeros(2)).shape[0]\n", "result == 2", target="f").status == PROVED
     assert prove(_T + "def f():\n    return torch.zeros(2, 3).argsort().shape[1]\n", "result == 3", target="f").status == PROVED
     assert prove(_T + "def f():\n    return torch.zeros(2, 3).to_sparse().to_dense().conj().real.shape[1]\n", "result == 3", target="f").status == PROVED
-    # the broader stdlib registry: bisect / heapq / itertools and the pure math ldexp / nextafter decide trap free.
+    # the broader stdlib registry: bisect / heapq / itertools and a magnitude-bounded math ldexp / nextafter decide trap free.
     assert check("import bisect\ndef f(xs: list, x):\n    return bisect.bisect(xs, x)\n", target="f").status == PROVED
     assert check("import heapq\ndef f(xs: list):\n    heapq.heapify(xs)\n    return 0\n", target="f").status == PROVED
-    assert check("import math\ndef f(x: float):\n    return math.ldexp(x, 2)\n", target="f").status == PROVED
+    assert check("import math\ndef f(x: float):\n    if -1e50 <= x <= 1e50:\n        return math.ldexp(x, 2)\n    return 0.0\n", target="f").status == PROVED   # ldexp overflows unbounded; bounded proves
     # SOUNDNESS: a slice of a bare opaque value is a sub-sequence, never a scalar, so an arithmetic op on it abstains rather than fabricate a scalar trap. The ndarray idiom a[1:] / a[:-1] raises nothing in numpy, so it must not refute as a ZeroDivisionError; a slice divisor is never a zero scalar.
     assert check("def f(o):\n    a = o.compute()\n    return a[1:] / a[:-1]\n", target="f").status == UNKNOWN
     assert check("def f(o):\n    a = o.compute()\n    return 5 // a[1:]\n", target="f").status == UNKNOWN
