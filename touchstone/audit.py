@@ -4720,6 +4720,19 @@ def run_self_tests(fast=False):
     assert check("def f(n: int):\n    if -1000000 <= n <= 1000000:\n        return float(n)\n    return 0.0\n", target="f").status == PROVED
     assert check("def f(x: float):\n    return int(x)\n", target="f").status != PROVED   # int(inf) OverflowError, int(nan) ValueError
     assert check("import math\ndef f(x: float):\n    if math.isfinite(x):\n        return int(x)\n    return 0\n", target="f").status == PROVED
+    # round(x) to an int raises on inf/nan like int(x); str * a non-int and a non-str % str are TypeErrors; next() of an empty iterator with no default raises StopIteration.
+    assert check("def f(x: float):\n    return round(x)\n", target="f").status != PROVED             # round(inf)/round(nan)
+    assert check("def f(x: float):\n    return round(x, 2)\n", target="f").status == PROVED           # 2-arg returns a float, no trap
+    assert check("import math\ndef f(x: float):\n    if math.isfinite(x):\n        return round(x)\n    return 0\n", target="f").status == PROVED
+    assert check("def f(a: str, b: bytes):\n    return a * b\n", target="f").status != PROVED         # str * bytes: TypeError
+    assert check("def f(a: str, b: list):\n    return a * b\n", target="f").status != PROVED         # str * list: TypeError
+    assert check("def f(a: str, b: int):\n    return a * b\n", target="f").status == PROVED           # str * int: valid repetition
+    assert check("def f(a: int, b: str):\n    return a % b\n", target="f").status != PROVED           # int % str: TypeError
+    assert check("def f(a: list, b: str):\n    return a % b\n", target="f").status != PROVED         # list % str: TypeError
+    assert check("def f(a: int, b: int):\n    if b != 0:\n        return a % b\n    return 0\n", target="f").status == PROVED   # int % int: valid
+    assert check("def f(a: list):\n    return next(iter(a))\n", target="f").status != PROVED          # StopIteration on empty
+    assert check("def f(a: list):\n    if a:\n        return next(iter(a))\n    return 0\n", target="f").status == PROVED   # guarded: proves
+    assert check("def f(a: list):\n    return next(iter(a), -1)\n", target="f").status == PROVED      # default: never raises
     # a bytes/bytearray element is an int in [0, 255]; ord/chr are the codepoint bijection over [0, 0x10FFFF]: a constant folds exactly, a single character round-trips, else not pinned.
     assert prove("def f(b: bytes):\n    if len(b) > 0:\n        return b[0]\n    return 0\n",
                  "result >= 0 and result <= 255").status == PROVED
@@ -5037,12 +5050,13 @@ def run_self_tests(fast=False):
     assert check("def f(xs: list):\n    return any(xs)\n", target="f").status == PROVED
     assert check("def f(xs: list):\n    return all(xs)\n", target="f").status == PROVED
     assert check("def f(s: set):\n    return any(s)\n", target="f").status == PROVED
-    # container/iterator builtins (set/frozenset/tuple/iter/next) are trap-free over an iterable.
+    # container/iterator builtins (set/frozenset/tuple/iter) are trap-free over an iterable; next() of a possibly-empty iterator raises StopIteration (guarded by non-empty, it proves).
     assert check("def f(xs):\n    return len(set(xs))\n", target="f").status == PROVED
     assert check("def f(xs):\n    s = set(xs)\n    return s[0]\n", target="f").status == REFUTED
     assert check("def f(n: int):\n    return set(n)\n", target="f").status == UNKNOWN
     assert check("def f(xs):\n    t = tuple(xs)\n    if len(t) > 0:\n        return t[0]\n    return 0\n", target="f").status == PROVED
-    assert check("def f(xs):\n    it = iter(xs)\n    return next(it)\n", target="f").status == PROVED
+    assert check("def f(xs):\n    it = iter(xs)\n    return next(it)\n", target="f").status == UNKNOWN   # StopIteration on an empty iterable
+    assert check("def f(xs):\n    it = iter(xs)\n    if xs:\n        return next(it)\n    return 0\n", target="f").status == PROVED   # guarded non-empty: proves
     assert check("def f(xs):\n    return set(10 // k for k in xs)\n", target="f").status == REFUTED
     # set union/intersection/difference/symmetric-difference carry content: membership on the result reduces to the operands', with the size relation, exactly.
     assert prove("def f(a: set, b: set, x: int):\n    if x in a:\n        return 1 if x in (a | b) else 2\n    return 0\n",

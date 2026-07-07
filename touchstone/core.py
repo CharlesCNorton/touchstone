@@ -886,8 +886,8 @@ class _Opaque:
     """A value the engine holds but cannot reason about, e.g. a free or imported name. Returning, storing, or
     passing it raises no trap, but any operation on it (arithmetic, subscript, call, truth test, type test) is
     unmodeled and surfaces as UNKNOWN. Reading such a name raises at most NameError, which is not a modeled trap."""
-    __slots__ = ("name",)
-    def __init__(self, name): self.name = name
+    __slots__ = ("name", "src_len")
+    def __init__(self, name, src_len=None): self.name = name; self.src_len = src_len   # src_len: an iter()'s source length
 
 
 class _FieldVal(_Opaque):
@@ -3439,28 +3439,29 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 raise Unsupported("operation on an unmodeled value")
             if op is ast.Add and _is_str(l) and _is_str(r):
                 return z3.Concat(l, r)
-            if op is ast.Mult:                               # string repetition by a constant count
+            if op is ast.Mult:                               # string repetition: str * int (or bool) only
                 sv, kv = (l, r) if _is_str(l) else (r, l)
                 if z3.is_int_value(kv):
                     k = kv.as_long()
                     return z3.StringVal("") if k <= 0 else z3.Concat(*([sv] * k))
-                if _is_str(kv) or _is_fp(kv) or _is_real(kv):   # str * str / float: TypeError
-                    if ctx.traps is not None:
-                        ctx.traps.append(ctx.pc)
-                    return _Opaque("strop")
-                if _TRAPFREE:                                # str * a symbolic int: trap free, content opaque
-                    _note_overapprox(ctx, "string repetition by a variable count")
-                    return z3.FreshConst(_SS, "strrep")
-                raise Unsupported("string repetition by a non-constant count")
+                if z3.is_expr(kv) and (z3.is_int(kv) or z3.is_bool(kv)):   # a symbolic int / bool count: trap free
+                    if _TRAPFREE:
+                        _note_overapprox(ctx, "string repetition by a variable count")
+                        return z3.FreshConst(_SS, "strrep")
+                    raise Unsupported("string repetition by a non-constant count")
+                if isinstance(kv, _Opaque) and not isinstance(kv, _SafeContainer):
+                    raise Unsupported("string repetition by an opaque value")   # may be int-like: abstain
+                if ctx.traps is not None:                    # str * str / float / bytes / list / set / dict: TypeError
+                    ctx.traps.append(ctx.pc)
+                return _Opaque("strop")
             if op is ast.Add:                                # str + a non-string: TypeError (unsupported operands)
                 if ctx.traps is not None:
                     ctx.traps.append(ctx.pc)
                 return _Opaque("strop")
-            if op is ast.Mod:                                # str % args: printf-style formatting, over-approximated
-                _note_overapprox(ctx, "string % formatting")  # as a trap-free string -- the same assume-the-format-
-                return z3.FreshConst(_SS, "strmod")           # matches over-approximation the f-string / print() paths
-                #                                               make; the arguments were already trap-checked
-            if ctx.traps is not None:                        # str with -, /, //, **, shifts, or bitwise: TypeError
+            if op is ast.Mod and _is_str(l):                 # str % args formatting is handled at the top of _binop;
+                _note_overapprox(ctx, "string % formatting")  # int / list / bytes % str reaching here is a TypeError
+                return z3.FreshConst(_SS, "strmod")           # (the args were already trap-checked)
+            if ctx.traps is not None:                        # non-str % str, or str with -, /, //, **, shifts, bitwise: TypeError
                 ctx.traps.append(ctx.pc)
             return _Opaque("strop")
         if op is ast.Div:                                    # true division -> float
@@ -3978,6 +3979,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 ev(a, env, ctx)
             if name == "enumerate" and isinstance(x, _SafeContainer) and not x.unindexable and not x.unsized:
                 return _SafeContainer("enumerate", length=_container_len(x, ctx), unsized=True, tuple_arity=2)
+            if name == "iter" and isinstance(x, _SafeContainer) and not x.unsized:
+                return _Opaque("iter", src_len=_container_len(x, ctx))   # single-shot iterator carrying its source length
             if (isinstance(x, (_SafeContainer, tuple, _DictParam, _DictLit, _MapVal, _DefaultDict, _Opaque))
                     or _is_str(x)):
                 return _Opaque(name)
@@ -3986,9 +3989,15 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 return _Opaque(name)
             raise Unsupported(f"{name}() of a possibly non-iterable value")
         if name == "next" and "next" not in ctx.repo and 1 <= len(node.args) <= 2:
-            # next(it[, default]): the yielded value (over-approximated); StopIteration is not a modeled trap.
-            for a in node.args:
+            # next(it[, default]): the yielded value (over-approximated). StopIteration on an empty iterator with no
+            # default is modeled when the source length is known (next(iter(container))); an opaque iterator abstains.
+            it = ev(node.args[0], env, ctx)
+            for a in node.args[1:]:
                 ev(a, env, ctx)
+            if len(node.args) == 1 and _TRAPFREE and ctx.traps is not None:
+                sl = getattr(it, "src_len", None)
+                if sl is not None:
+                    ctx.traps.append(z3.And(ctx.pc, sl == 0))   # StopIteration: empty source, no default given
             _note_overapprox(ctx, "next()")
             return _Opaque("next")
         if name in ("sorted", "list") and name not in ctx.repo and len(node.args) == 1 and (
@@ -4125,7 +4134,11 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 return _as_int(x)                        # round(int) and round(int, n) are the integer itself
             # round(float): the nearest integer (ties to even); round(float, n): a float. The exact value is
             # CPython's correctly-rounded result, left as a fresh term of the right type (an over-approximation).
-            return z3.FreshConst(_F64, "round") if len(node.args) == 2 else z3.FreshInt("round")
+            if len(node.args) == 2:
+                return z3.FreshConst(_F64, "round")          # round(float, n) returns a float; inf/nan pass through
+            if _TRAPFREE and ctx.traps is not None:          # round(inf) OverflowError, round(nan) ValueError (int result)
+                ctx.traps.append(z3.And(ctx.pc, z3.Or(z3.fpIsInf(x), z3.fpIsNaN(x))))
+            return z3.FreshInt("round")
         if name == "divmod" and len(node.args) == 2:         # divmod(a, b) == (a // b, a % b), same zero-divisor trap
             fd = ast.copy_location(ast.BinOp(left=node.args[0], op=ast.FloorDiv(), right=node.args[1]), node)
             md = ast.copy_location(ast.BinOp(left=node.args[0], op=ast.Mod(), right=node.args[1]), node)
