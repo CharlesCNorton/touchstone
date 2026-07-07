@@ -4733,6 +4733,16 @@ def run_self_tests(fast=False):
     assert check("def f(a: list):\n    return next(iter(a))\n", target="f").status != PROVED          # StopIteration on empty
     assert check("def f(a: list):\n    if a:\n        return next(iter(a))\n    return 0\n", target="f").status == PROVED   # guarded: proves
     assert check("def f(a: list):\n    return next(iter(a), -1)\n", target="f").status == PROVED      # default: never raises
+    assert check("def f(a: list):\n    return next(x for x in a)\n", target="f").status != PROVED      # next(genexp): StopIteration if empty
+    assert check("def f(a: list):\n    return next((x for x in a), -1)\n", target="f").status == PROVED   # genexp with a default
+    # ordering (< <= > >=) two incompatible types is a TypeError; == / != and same-family ordering are fine.
+    assert check("def f(a: str, b: bytes):\n    return a < b\n", target="f").status != PROVED           # str < bytes
+    assert check("def f(a: list, b: str):\n    return a > b\n", target="f").status != PROVED           # list > str
+    assert check("def f(a: bytes, b: list):\n    return a <= b\n", target="f").status != PROVED         # bytes <= list
+    assert check("def f(a: str, b: str):\n    return a < b\n", target="f").status == PROVED             # str < str: valid
+    assert check("def f(a: list, b: list):\n    return a < b\n", target="f").status == PROVED           # list < list: valid
+    assert check("def f(a: int, b: float):\n    return a < b\n", target="f").status == PROVED           # numeric compare: valid
+    assert check("def f(a: str, b: bytes):\n    return a == b\n", target="f").status == PROVED          # == across types: False, not a raise
     # a bytes/bytearray element is an int in [0, 255]; ord/chr are the codepoint bijection over [0, 0x10FFFF]: a constant folds exactly, a single character round-trips, else not pinned.
     assert prove("def f(b: bytes):\n    if len(b) > 0:\n        return b[0]\n    return 0\n",
                  "result >= 0 and result <= 255").status == PROVED

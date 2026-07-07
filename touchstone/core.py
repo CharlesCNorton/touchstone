@@ -3632,6 +3632,16 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             _scal = lambda v: z3.is_expr(v) and (z3.is_int(v) or z3.is_bool(v) or _is_fp(v))
             if (isinstance(l, _unord) and _scal(r)) or (_scal(l) and isinstance(r, _unord)):
                 raise Unsupported("ordering a container or None against a number (TypeError, not a bool)")
+            def _ord_fam(v):                                 # the ordering-comparison type family; ordering across
+                if _is_str(v): return "str"                  # families (str < bytes, list < str, list < tuple) is a
+                if isinstance(v, _SafeContainer): return "bytes" if v.byteslike else "seq"   # TypeError, not a bool
+                if isinstance(v, tuple): return "tuple"
+                return None                                  # numeric / opaque / other: decided by the checks below
+            _fl, _fr = _ord_fam(l), _ord_fam(r)
+            if _fl is not None and _fr is not None and _fl != _fr:
+                if ctx.traps is not None:                    # ordering two incompatible sequence types: TypeError
+                    ctx.traps.append(ctx.pc)
+                return z3.BoolVal(False)                     # poison: never trusted once the trap fires
         if (isinstance(l, _NdArray) or isinstance(r, _NdArray)) \
                 and op in (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq):
             return _nd_binop(l, r, ctx)                       # an ndarray rich comparison is ELEMENT-WISE: an array of
@@ -3991,6 +4001,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         if name == "next" and "next" not in ctx.repo and 1 <= len(node.args) <= 2:
             # next(it[, default]): the yielded value (over-approximated). StopIteration on an empty iterator with no
             # default is modeled when the source length is known (next(iter(container))); an opaque iterator abstains.
+            if len(node.args) == 1 and isinstance(node.args[0], ast.GeneratorExp):
+                raise Unsupported("next() of a generator expression may raise StopIteration (empty / all-filtered)")
             it = ev(node.args[0], env, ctx)
             for a in node.args[1:]:
                 ev(a, env, ctx)
