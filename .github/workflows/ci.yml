@@ -12,8 +12,8 @@ jobs:
     name: self-tests + audits
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
       - name: install (z3-solver and cvc5 pinned in pyproject.toml)
@@ -25,7 +25,7 @@ jobs:
     name: machine-checked proofs (Rocq 9.0)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: make the workspace writable for the in-container non-root user
         run: sudo chmod -R a+rwX "$GITHUB_WORKSPACE"
       - name: build and check the Rocq companion proofs
@@ -38,7 +38,7 @@ jobs:
               cd proofs && bash verify_coq.sh
             endGroup
       - name: stage the Rocq-extracted generator, interval operators, and encoding for the audits
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: extracted-ml
           path: |
@@ -52,8 +52,8 @@ jobs:
     needs: proofs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
       - name: install (z3-solver and cvc5 pinned in pyproject.toml)
@@ -62,7 +62,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ocaml-nox
           || sudo apt-get install -y --no-install-recommends ocaml
       - name: fetch the Rocq-extracted sources from the proofs job
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: extracted-ml
           path: proofs
