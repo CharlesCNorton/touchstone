@@ -46,6 +46,9 @@ def main():
     pw = t.math_pow_axiom_audit()
     print(f"AUDIT math.pow    : {pw} args vs CPython math.pow domain trap and x ** n power axioms, 0 violations")
 
+    te = t.tryexcept_differential_audit()
+    print(f"AUDIT try/except  : {te['programs']} typed-handler programs vs CPython over {te['runs']} runs, 0 disagreements")
+
     sm = t.string_method_axiom_audit()
     print(f"AUDIT str methods : {sm} strings vs CPython str over-approximation axioms, 0 violations")
 

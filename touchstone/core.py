@@ -127,16 +127,64 @@ def _overapprox(ctx, label, sort, name):
 
 class _TrapList(list):
     """A trap-condition list that also records, per appended condition, the source line being evaluated
-    (ctx._cur_line at append time), so a trap refutation can name the offending line symbolically -- with no
-    execution and without instrumenting every trap site (it IS a list, so every reader is unchanged)."""
+    (ctx._cur_line at append time) and the trap's possible exception kinds (a frozenset of builtin exception
+    names via add(), or None for a plain append = unknown), so a trap refutation can name the offending line
+    and a typed `except` handler can be matched against the kinds it provably catches -- with no execution
+    and without instrumenting every trap site (it IS a list, so every reader is unchanged)."""
     def __init__(self, ctx):
         super().__init__()
         self.lines = []
+        self.kinds = []
         self._ctx = ctx
 
     def append(self, cond):
         super().append(cond)
         self.lines.append(getattr(self._ctx, "_cur_line", None))
+        self.kinds.append(None)
+
+    def add(self, cond, kinds):
+        self.append(cond)
+        self.kinds[-1] = frozenset(kinds)
+
+    def __delitem__(self, idx):
+        super().__delitem__(idx)
+        del self.lines[idx]
+        del self.kinds[idx]
+
+
+def _trap_add(ctx, cond, kinds):
+    """Append a trap condition with its possible exception kinds when the sink tracks kinds, else plainly."""
+    if isinstance(ctx.traps, _TrapList):
+        ctx.traps.add(cond, kinds)
+    else:
+        ctx.traps.append(cond)
+
+
+def _exc_self_and_ancestors(name):
+    """The builtin exception `name` plus every base class name on its MRO, so `except LookupError` is known
+    to catch an IndexError trap. A name that is no builtin exception contributes only itself (exact match)."""
+    import builtins as _bi
+    cls = getattr(_bi, name, None)
+    if isinstance(cls, type) and issubclass(cls, BaseException):
+        return frozenset(c.__name__ for c in cls.__mro__ if isinstance(c, type) and issubclass(c, BaseException))
+    return frozenset({name})
+
+
+def _handler_catch_names(h):
+    """The exception names an except handler catches: None for a catch-all (bare / Exception / BaseException,
+    also inside a tuple), a frozenset of names for `except E` / `except (E1, E2)`, False when any element is
+    not a plain name (mod.Error) so the handler cannot be matched."""
+    if h.type is None:
+        return None
+    elts = h.type.elts if isinstance(h.type, ast.Tuple) else [h.type]
+    names = set()
+    for e in elts:
+        if not isinstance(e, ast.Name):
+            return False
+        if e.id in ("Exception", "BaseException"):
+            return None
+        names.add(e.id)
+    return frozenset(names)
 
 
 def _unchain_compare(node):
@@ -1089,7 +1137,7 @@ def _sqrt_model(a, ctx):
     while -0.0, +0.0, +Inf, and NaN pass through. The argument is promoted from int/bool."""
     a = _to_fp(a)
     if ctx.traps is not None:
-        ctx.traps.append(z3.And(ctx.pc, z3.fpLT(a, z3.FPVal(0.0, _F64))))
+        _trap_add(ctx, z3.And(ctx.pc, z3.fpLT(a, z3.FPVal(0.0, _F64))), ("ValueError",))
     return z3.fpSqrt(_RM, a)
 
 
@@ -1209,11 +1257,11 @@ def _transcendental(name, arg, ctx):
     z, one = z3.FPVal(0.0, _F64), z3.FPVal(1.0, _F64)
     if ctx.traps is not None:                                                     # the domain / overflow trap, always
         if name in ("sin", "cos"):
-            ctx.traps.append(z3.And(ctx.pc, z3.fpIsInf(x)))                       # ValueError on +-inf
+            _trap_add(ctx, z3.And(ctx.pc, z3.fpIsInf(x)), ("ValueError",))        # ValueError on +-inf
         elif name == "exp":                                                       # OverflowError for large x
-            ctx.traps.append(z3.And(ctx.pc, z3.Not(z3.fpIsInf(x)), z3.fpGT(x, z3.FPVal(709.0, _F64))))
+            _trap_add(ctx, z3.And(ctx.pc, z3.Not(z3.fpIsInf(x)), z3.fpGT(x, z3.FPVal(709.0, _F64))), ("OverflowError",))
         else:                                                                     # log: ValueError on x <= 0 (incl +-0)
-            ctx.traps.append(z3.And(ctx.pc, z3.fpLEQ(x, z)))
+            _trap_add(ctx, z3.And(ctx.pc, z3.fpLEQ(x, z)), ("ValueError",))
     if _TRAPFREE:                                                                 # trap-freedom: an arbitrary double,
         return z3.FreshConst(_F64, "trans_" + name)                              # the domain trap above being exact
     if ctx.facts is None:
@@ -1343,9 +1391,9 @@ def _math_call(name, args, ctx):
     a0 = args[0] if args else None
     F, Z = _F64, z3.FPVal(0.0, _F64)
 
-    def trap(cond):
+    def trap(cond, kinds=None):
         if ctx.traps is not None:
-            ctx.traps.append(z3.And(ctx.pc, cond))
+            _trap_add(ctx, z3.And(ctx.pc, cond), kinds) if kinds else ctx.traps.append(z3.And(ctx.pc, cond))
 
     def over():                                              # the value is over-approximated, but the domain trap
         if not _TRAPFREE:                                   # is exact, so trap freedom must still see the trap
@@ -1367,7 +1415,7 @@ def _math_call(name, args, ctx):
             pf = _fp_to_py(mf)
             if pf is not None and not (_math.isinf(pf) or _math.isnan(pf)):
                 return z3.IntVal(getattr(_math, name)(pf))
-        trap(z3.Or(z3.fpIsInf(f), z3.fpIsNaN(f)))            # ValueError converting inf / nan to an integer
+        trap(z3.Or(z3.fpIsInf(f), z3.fpIsNaN(f)), ("OverflowError", "ValueError"))   # inf -> OverflowError, nan -> ValueError
         over()
         return z3.FreshInt("m_" + name)
     if name in ("gcd", "lcm"):
@@ -1393,15 +1441,16 @@ def _math_call(name, args, ctx):
             if px is not None and py is not None:
                 try:
                     val = _math.pow(px, py)
-                except (ValueError, OverflowError):
-                    trap(z3.BoolVal(True)); over()           # the constant call always raises
+                except (ValueError, OverflowError) as _pe:
+                    trap(z3.BoolVal(True), (type(_pe).__name__,)); over()   # the constant call always raises
                     return z3.FreshConst(F, "m_pow")
                 if not (_math.isinf(val) or _math.isnan(val)):
                     return z3.FPVal(val, F)                  # exact, never raises
         fin = lambda v: z3.And(z3.Not(z3.fpIsInf(v)), z3.Not(z3.fpIsNaN(v)))
         integral = z3.fpEQ(y, z3.fpRoundToIntegral(z3.RNE(), y))   # y is a whole number (finite y)
         trap(z3.Or(z3.And(fin(x), z3.fpLT(x, Z), fin(y), z3.Not(integral)),   # negative finite base ** fractional
-                   z3.And(z3.fpIsZero(x), fin(y), z3.fpLT(y, Z))))            # zero base ** finite negative
+                   z3.And(z3.fpIsZero(x), fin(y), z3.fpLT(y, Z))),            # zero base ** finite negative
+             ("ValueError",))
         over()
         r = z3.Function("py_math_pow", F, F, F)(x, y)
         if _TRAPFREE:                                        # OverflowError: the finite result exceeds DBL_MAX (a
@@ -1411,9 +1460,9 @@ def _math_call(name, args, ctx):
                 ev = int(yv) if yv == int(yv) else yv        # integral exponent shares _fp_pow's cache key
                 hi, lo = _fpow_overflow_threshold(ev)
                 if hi is not None:                           # y > 1: |x| > hi overflows
-                    trap(z3.And(fin(x), z3.fpGT(absx, z3.FPVal(hi, F))))
+                    trap(z3.And(fin(x), z3.fpGT(absx, z3.FPVal(hi, F))), ("OverflowError",))
                 else:                                        # y < 0: 0 < |x| < lo overflows
-                    trap(z3.And(fin(x), z3.fpGT(absx, Z), z3.fpLT(absx, z3.FPVal(lo, F))))
+                    trap(z3.And(fin(x), z3.fpGT(absx, Z), z3.fpLT(absx, z3.FPVal(lo, F))), ("OverflowError",))
             elif yv is None:                                 # a symbolic exponent: the coarse |x| bound
                 trap(z3.Or(z3.And(fin(x), fin(y), z3.fpGT(y, one), z3.fpGT(absx, one), z3.fpIsInf(r)),   # y>1, |x|>1
                            z3.And(fin(x), fin(y), z3.fpLT(y, Z), z3.fpGT(absx, Z), z3.fpLT(absx, one), z3.fpIsInf(r))))  # y<0, 0<|x|<1
@@ -1432,9 +1481,9 @@ def _math_call(name, args, ctx):
             k = _as_int(args[1]) if len(args) > 1 and z3.is_expr(args[1]) and z3.is_int(args[1]) else None
             if k is None:
                 return None
-            trap(z3.Or(n < 0, k < 0))                        # ValueError: a negative argument
+            trap(z3.Or(n < 0, k < 0), ("ValueError",))       # ValueError: a negative argument
         else:
-            trap(n < 0)                                      # factorial / isqrt of a negative: ValueError
+            trap(n < 0, ("ValueError",))                     # factorial / isqrt of a negative: ValueError
         over()
         r = z3.FreshInt(name)
         if ctx.facts is not None:
@@ -1444,22 +1493,22 @@ def _math_call(name, args, ctx):
         if name in ("fmod", "remainder"):
             if len(args) < 2 or not isfloat(a0) or not isfloat(args[1]):
                 return None
-            trap(z3.Or(z3.fpIsInf(_to_fp(a0)), z3.fpIsZero(_to_fp(args[1]))))   # ValueError: an infinite dividend or zero divisor
+            trap(z3.Or(z3.fpIsInf(_to_fp(a0)), z3.fpIsZero(_to_fp(args[1]))), ("ValueError",))   # ValueError: an infinite dividend or zero divisor
         else:
             if not isfloat(a0):
                 return None
             f = _to_fp(a0)
             one, neg1 = z3.FPVal(1.0, F), z3.FPVal(-1.0, F)
             if name in ("log2", "log10"):
-                trap(z3.fpLEQ(f, Z))                         # log of a non-positive: ValueError
+                trap(z3.fpLEQ(f, Z), ("ValueError",))        # log of a non-positive: ValueError
             elif name == "log1p":
-                trap(z3.fpLEQ(f, neg1))
+                trap(z3.fpLEQ(f, neg1), ("ValueError",))
             elif name in ("asin", "acos"):
-                trap(z3.Or(z3.fpLT(f, neg1), z3.fpGT(f, one)))   # outside [-1, 1]
+                trap(z3.Or(z3.fpLT(f, neg1), z3.fpGT(f, one)), ("ValueError",))   # outside [-1, 1]
             elif name == "acosh":
-                trap(z3.fpLT(f, one))                        # x < 1
+                trap(z3.fpLT(f, one), ("ValueError",))       # x < 1
             else:                                            # atanh
-                trap(z3.Or(z3.fpLEQ(f, neg1), z3.fpGEQ(f, one)))
+                trap(z3.Or(z3.fpLEQ(f, neg1), z3.fpGEQ(f, one)), ("ValueError",))
         over()
         return z3.FreshConst(F, "m_" + name)
     if name in _MATH_PURE_FLOAT:
@@ -1471,17 +1520,17 @@ def _math_call(name, args, ctx):
             x0 = _to_fp(a0)                                  # -- sinh/cosh/expm1/exp2 -- and ldexp raise it. degrees/
             fx = z3.And(z3.Not(z3.fpIsInf(x0)), z3.Not(z3.fpIsNaN(x0)))   # hypot/radians return inf, so they do not.
             if name in ("sinh", "cosh"):                     # even/odd: |x| beyond the exact boundary overflows
-                trap(z3.And(fx, z3.fpGT(z3.fpAbs(x0), z3.FPVal(_math_ovf_input_bound(name), F))))
+                trap(z3.And(fx, z3.fpGT(z3.fpAbs(x0), z3.FPVal(_math_ovf_input_bound(name), F))), ("OverflowError",))
             elif name in ("expm1", "exp2"):                  # increasing: only the large positive tail overflows
-                trap(z3.And(fx, z3.fpGT(x0, z3.FPVal(_math_ovf_input_bound(name), F))))
+                trap(z3.And(fx, z3.fpGT(x0, z3.FPVal(_math_ovf_input_bound(name), F))), ("OverflowError",))
             elif name == "ldexp" and len(args) >= 2 and z3.is_expr(args[1]) and z3.is_int(args[1]):
                 mi = z3.simplify(args[1])                     # ldexp(x, i) = x * 2**i overflows when |x| * 2**i > DBL_MAX
                 if z3.is_int_value(mi):
                     ii = mi.as_long()
                     if ii >= 1:                              # |x| > DBL_MAX * 2**-i overflows (i <= 0 never overflows)
-                        trap(z3.And(fx, z3.fpGT(z3.fpAbs(x0), z3.FPVal(_math.ldexp(_DBL_MAX, -ii), F))))
+                        trap(z3.And(fx, z3.fpGT(z3.fpAbs(x0), z3.FPVal(_math.ldexp(_DBL_MAX, -ii), F))), ("OverflowError",))
                 else:                                        # a symbolic shift: overflow is possible for any nonzero base
-                    trap(z3.And(fx, z3.Not(z3.fpIsZero(x0))))
+                    trap(z3.And(fx, z3.Not(z3.fpIsZero(x0))), ("OverflowError",))
         over()
         return z3.FreshConst(F, "m_" + name)
     return None
@@ -1636,7 +1685,7 @@ def _str_format(fmt, args, ctx, kwnames=None):
         return None                                          # mixing automatic and manual numbering raises
     if missing_named or max_index >= len(args):
         if ctx.traps is not None:
-            ctx.traps.append(ctx.pc)                         # KeyError (named field) / IndexError (positional): no argument
+            _trap_add(ctx, ctx.pc, ("KeyError", "IndexError"))   # KeyError (named field) / IndexError (positional): no argument
         return _Opaque("format")
     _note_overapprox(ctx, "str.format")
     return z3.FreshConst(_SS, "fmt")                         # a string of statically-unknown content
@@ -1749,12 +1798,12 @@ def _str_call(meth, s, a, ctx, kwnames=None):
     if meth in ("index", "rindex") and len(a) == 1 and _is_str(a[0]):
         idx = z3.LastIndexOf(s, a[0]) if meth == "rindex" else z3.IndexOf(s, a[0], z3.IntVal(0))
         if ctx.traps is not None:
-            ctx.traps.append(z3.And(ctx.pc, idx < 0))               # ValueError when sub is not found
+            _trap_add(ctx, z3.And(ctx.pc, idx < 0), ("ValueError",))   # ValueError when sub is not found
         return idx
     if meth == "index" and len(a) == 2 and _is_str(a[0]):           # index(sub, start): search from start, raising
         idx = z3.IndexOf(s, a[0], _as_int(a[1]))                    # ValueError if sub is absent in s[start:]
         if ctx.traps is not None:
-            ctx.traps.append(z3.And(ctx.pc, idx < 0))
+            _trap_add(ctx, z3.And(ctx.pc, idx < 0), ("ValueError",))
         return idx
     if meth in ("partition", "rpartition") and len(a) == 1 and _is_str(a[0]):
         return _str_partition(s, a[0], meth == "rpartition")
@@ -1797,7 +1846,7 @@ def _str_call(meth, s, a, ctx, kwnames=None):
             return _StrSeq("split", length=k)
         if 1 <= len(a) <= 2 and _is_str(a[0]):                       # s.split(sep[, maxsplit]): empty sep raises
             if ctx.traps is not None:
-                ctx.traps.append(z3.And(ctx.pc, z3.Length(a[0]) == 0))   # ValueError on an empty separator
+                _trap_add(ctx, z3.And(ctx.pc, z3.Length(a[0]) == 0), ("ValueError",))   # ValueError on an empty separator
             if len(a) == 2:
                 _as_int(a[1])                                        # maxsplit is trap-checked
             k = z3.FreshInt("splitlen")                              # a non-empty separator yields >= 1 part (the whole
@@ -1975,7 +2024,7 @@ def _map_get(m, q, ctx):
             break                                            # an undecidable newer key shadows older ones
     if not keys:
         if ctx.traps is not None:
-            ctx.traps.append(ctx.pc)                         # an empty dict: every read is a KeyError
+            _trap_add(ctx, ctx.pc, ("KeyError",))            # an empty dict: every read is a KeyError
         return _Opaque("keyerror")
     if not all(z3.is_expr(v) for v in m.vals):
         raise Unsupported("dict value is not a modeled scalar")
@@ -1986,7 +2035,7 @@ def _map_get(m, q, ctx):
         raise Unsupported("dict with mixed numeric key types")   # 1 / 1.0 / True conflate; not resolved here
     contains = z3.Or(*[_term_eq(q, k) for k in keys])
     if ctx.traps is not None:
-        ctx.traps.append(z3.And(ctx.pc, z3.Not(contains)))  # KeyError when q is none of the keys
+        _trap_add(ctx, z3.And(ctx.pc, z3.Not(contains)), ("KeyError",))   # KeyError when q is none of the keys
     res = z3.FreshConst(m.vals[0].sort(), "kdef")           # never trusted: a matching branch always wins
     for k, v in zip(keys, m.vals):                          # oldest first, so the newest entry is outermost
         res = z3.If(_term_eq(q, k), v, res)
@@ -2101,9 +2150,9 @@ def _fp_pow(base, expnode, ctx):
         if pb is not None:
             try:
                 val = pb ** n
-            except (OverflowError, ZeroDivisionError):
+            except (OverflowError, ZeroDivisionError) as _pe:
                 if ctx.traps is not None:
-                    ctx.traps.append(z3.And(ctx.pc, z3.BoolVal(True)))   # the constant power always raises
+                    _trap_add(ctx, z3.And(ctx.pc, z3.BoolVal(True)), (type(_pe).__name__,))   # the constant power always raises
                 if _TRAPFREE or ctx.facts is not None:
                     return z3.FreshConst(_F64, "fpow")
                 raise Unsupported("float ** to a power |n| >= 2 needs the over-approximation channel (use prove / verify_predicate)")
@@ -2117,12 +2166,12 @@ def _fp_pow(base, expnode, ctx):
         fb = z3.And(z3.Not(z3.fpIsNaN(base)), z3.Not(z3.fpIsInf(base)))
         ab = z3.fpAbs(base)
         if hi is not None:                               # n > 0: |x| > hi overflows
-            ctx.traps.append(z3.And(ctx.pc, fb, z3.fpGT(ab, z3.FPVal(hi, _F64))))
+            _trap_add(ctx, z3.And(ctx.pc, fb, z3.fpGT(ab, z3.FPVal(hi, _F64))), ("OverflowError",))
         else:                                            # n < 0: 0 < |x| < lo overflows
-            ctx.traps.append(z3.And(ctx.pc, fb, z3.fpGT(ab, z3.FPVal(0.0, _F64)), z3.fpLT(ab, z3.FPVal(lo, _F64))))
+            _trap_add(ctx, z3.And(ctx.pc, fb, z3.fpGT(ab, z3.FPVal(0.0, _F64)), z3.fpLT(ab, z3.FPVal(lo, _F64))), ("OverflowError",))
     if ctx.facts is None:
         if n < 0 and ctx.traps is not None:
-            ctx.traps.append(z3.And(ctx.pc, z3.fpIsZero(base)))   # 0.0 ** (negative integer) -> ZeroDivisionError
+            _trap_add(ctx, z3.And(ctx.pc, z3.fpIsZero(base)), ("ZeroDivisionError",))   # 0.0 ** (negative integer) -> ZeroDivisionError
         if _TRAPFREE:                                    # trap freedom: a power |n| >= 2 raises at base 0 (n < 0) or on overflow
             r0 = z3.FreshConst(_F64, "fpow")             # the value is opaque, but the trap channel is exact
             _overflow_trap(r0)
@@ -2131,7 +2180,7 @@ def _fp_pow(base, expnode, ctx):
     _note_overapprox(ctx, "float ** (a constant integral power)")
     z, one = z3.FPVal(0.0, _F64), z3.FPVal(1.0, _F64)
     if n < 0 and ctx.traps is not None:
-        ctx.traps.append(z3.And(ctx.pc, z3.fpIsZero(base)))   # 0.0 ** (negative integer) -> ZeroDivisionError
+        _trap_add(ctx, z3.And(ctx.pc, z3.fpIsZero(base)), ("ZeroDivisionError",))   # 0.0 ** (negative integer) -> ZeroDivisionError
     r = z3.Function("py_fpow_%s%d" % ("m" if n < 0 else "", abs(n)), _F64, _F64)(base)
     _overflow_trap(r)
     finite = z3.And(z3.Not(z3.fpIsNaN(base)), z3.Not(z3.fpIsInf(base)))
@@ -2564,7 +2613,7 @@ def _np_array_ctor(name, node, env, ctx):
         return _abstain()                                     # a float or an opaque size
     n = args[0]
     if ctx.traps is not None:
-        ctx.traps.append(z3.And(ctx.pc, n < 0))               # ValueError: negative dimensions are not allowed
+        _trap_add(ctx, z3.And(ctx.pc, n < 0), ("ValueError",))   # ValueError: negative dimensions are not allowed
     return _NdArray((z3.If(n < 0, z3.IntVal(0), n),))         # a 1-D ndarray
 
 
@@ -3344,7 +3393,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         r = ev(node.right, env, ctx)
         if isinstance(l, _NoneVal) or isinstance(r, _NoneVal):   # None + x and every arithmetic/bitwise op on None
             if ctx.traps is not None:                            # raise TypeError: a reachable trap
-                ctx.traps.append(ctx.pc)
+                _trap_add(ctx, ctx.pc, ("TypeError",))
             return _Opaque("noneop")
         if op in (ast.BitOr, ast.BitAnd, ast.Sub, ast.BitXor) and _is_set_like(l) and _is_set_like(r):
             return _set_binop({ast.BitOr: "|", ast.BitAnd: "&", ast.Sub: "-", ast.BitXor: "^"}[op], l, r, ctx)
@@ -3382,7 +3431,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     # undecided. Abstain rather than fabricate a TypeError trap (a false refutation of xs + [1]).
                     raise Unsupported("adding a sequence literal to a container / ndarray / opaque value is undecided")
                 if ctx.traps is not None:                    # sequence literal + a scalar / str / bytes / set: TypeError
-                    ctx.traps.append(ctx.pc)
+                    _trap_add(ctx, ctx.pc, ("TypeError",))
                 return _Opaque("seqop")
             if op is ast.Mult:
                 tv, kv = (l, r) if isinstance(l, tuple) else (r, l)
@@ -3396,10 +3445,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 if isinstance(kv, _Opaque) and not isinstance(kv, _SafeContainer):
                     raise Unsupported("sequence repetition by an ndarray / opaque value")   # numpy broadcasts: abstain
                 if ctx.traps is not None:                    # seq * a sequence / str / float / Fraction: TypeError
-                    ctx.traps.append(ctx.pc)
+                    _trap_add(ctx, ctx.pc, ("TypeError",))
                 return _Opaque("seqop")
             if ctx.traps is not None:                        # any other operator on a list/tuple (-, /, //, **, &, ...) is a TypeError
-                ctx.traps.append(ctx.pc)
+                _trap_add(ctx, ctx.pc, ("TypeError",))
             return _Opaque("seqop")
         if (isinstance(l, _SafeContainer) and isinstance(r, _SafeContainer) and op is ast.Add
                 and not l.unindexable and not r.unindexable and l.byteslike == r.byteslike):
@@ -3427,7 +3476,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if op is ast.Mult: return a * b
             if op is ast.Div:
                 if ctx.traps is not None:
-                    ctx.traps.append(z3.And(ctx.pc, b == 0))
+                    _trap_add(ctx, z3.And(ctx.pc, b == 0), ("ZeroDivisionError",))
                 return a / b
             raise Unsupported(f"rational operator {op.__name__}")
         if _is_str(l) or _is_str(r):
@@ -3452,26 +3501,26 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 if isinstance(kv, _Opaque) and not isinstance(kv, _SafeContainer):
                     raise Unsupported("string repetition by an opaque value")   # may be int-like: abstain
                 if ctx.traps is not None:                    # str * str / float / bytes / list / set / dict: TypeError
-                    ctx.traps.append(ctx.pc)
+                    _trap_add(ctx, ctx.pc, ("TypeError",))
                 return _Opaque("strop")
             if op is ast.Add:                                # str + a non-string: TypeError (unsupported operands)
                 if ctx.traps is not None:
-                    ctx.traps.append(ctx.pc)
+                    _trap_add(ctx, ctx.pc, ("TypeError",))
                 return _Opaque("strop")
             if op is ast.Mod and _is_str(l):                 # str % args formatting is handled at the top of _binop;
                 _note_overapprox(ctx, "string % formatting")  # int / list / bytes % str reaching here is a TypeError
                 return z3.FreshConst(_SS, "strmod")           # (the args were already trap-checked)
             if ctx.traps is not None:                        # non-str % str, or str with -, /, //, **, shifts, bitwise: TypeError
-                ctx.traps.append(ctx.pc)
+                _trap_add(ctx, ctx.pc, ("TypeError",))
             return _Opaque("strop")
         if op is ast.Div:                                    # true division -> float
             if _is_fp(l) or _is_fp(r):
                 if ctx.traps is not None:
-                    ctx.traps.append(z3.And(ctx.pc, _is_zero(r)))   # ZeroDivisionError
+                    _trap_add(ctx, z3.And(ctx.pc, _is_zero(r)), ("ZeroDivisionError",))   # ZeroDivisionError
                 return z3.fpDiv(_RM, _to_fp(l), _to_fp(r))          # a float operand: CPython coerces, then divides
             la, lb = _as_int(l), _as_int(r)                         # int / int: correctly rounded, signed
             if ctx.traps is not None:
-                ctx.traps.append(z3.And(ctx.pc, lb == 0))                     # ZeroDivisionError
+                _trap_add(ctx, z3.And(ctx.pc, lb == 0), ("ZeroDivisionError",))   # ZeroDivisionError
             mag = z3.fpToFP(_RM, z3.ToReal(z3.If(la < 0, -la, la)) / z3.ToReal(z3.If(lb < 0, -lb, lb)), _F64)
             return z3.If(z3.Xor(la < 0, lb < 0), z3.fpNeg(mag), mag)          # sign = sign(a) xor sign(b)
         if op is ast.Pow:
@@ -3495,7 +3544,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                             # and refutes even though the RESULT value below is over-approximated (a fresh int).
                             hard.append(trap)
                         else:
-                            ctx.traps.append(trap)             # operands possibly over-approximated: leave it suppressible
+                            _trap_add(ctx, trap, ("ZeroDivisionError",))   # operands possibly over-approximated: leave it suppressible
                     over_cap = (isinstance(node.right, ast.Constant) and isinstance(node.right.value, int)
                                 and not isinstance(node.right.value, bool) and node.right.value > 64)
                     _note_overapprox(ctx, "** with a constant exponent over the unroll cap (64)" if over_cap
@@ -3508,7 +3557,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         if op in (ast.FloorDiv, ast.Mod) and (_is_fp(l) or _is_fp(r)):
             lf, rf = _to_fp(l), _to_fp(r)
             if ctx.traps is not None:
-                ctx.traps.append(z3.And(ctx.pc, z3.fpIsZero(rf)))       # float // 0.0 / % 0.0: ZeroDivisionError
+                _trap_add(ctx, z3.And(ctx.pc, z3.fpIsZero(rf)), ("ZeroDivisionError",))   # float // 0.0 / % 0.0: ZeroDivisionError
             return _fp_arith(op, lf, rf)
         if _is_fp(l) or _is_fp(r):
             return _fp_arith(op, l, r)
@@ -3528,7 +3577,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                             and not getattr(ctx, "havoc", False)):
                         hard.append(trap)                    # operands exact: refutes despite the over-approximated value
                     else:
-                        ctx.traps.append(trap)               # operands possibly over-approximated: leave it suppressible
+                        _trap_add(ctx, trap, ("ValueError",))   # operands possibly over-approximated: leave it suppressible
                 _note_overapprox(ctx, "a variable bit shift")
                 return z3.FreshInt("shift")
             raise Unsupported(f"{op.__name__} requires a constant non-negative shift")
@@ -3560,7 +3609,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             raise Unsupported(f"binop {op.__name__}")
         if op in (ast.FloorDiv, ast.Mod):
             if ctx.traps is not None:
-                ctx.traps.append(z3.And(ctx.pc, r == 0))
+                _trap_add(ctx, z3.And(ctx.pc, r == 0), ("ZeroDivisionError",))
             if ctx.divaux is not None:                       # linearize for the CHC engine
                 q = z3.Int(f"_dq{len(ctx.divvars)}"); ctx.divvars.append(q)
                 ctx.divaux.append(z3.Implies(r > 0, z3.And(r * q <= l, l < r * q + r)))
@@ -3640,7 +3689,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             _fl, _fr = _ord_fam(l), _ord_fam(r)
             if _fl is not None and _fr is not None and _fl != _fr:
                 if ctx.traps is not None:                    # ordering two incompatible sequence types: TypeError
-                    ctx.traps.append(ctx.pc)
+                    _trap_add(ctx, ctx.pc, ("TypeError",))
                 return z3.BoolVal(False)                     # poison: never trusted once the trap fires
         if (isinstance(l, _NdArray) or isinstance(r, _NdArray)) \
                 and op in (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq):
@@ -3691,7 +3740,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if op is ast.NotEq:
                 return z3.BoolVal(True)                      # CPython: "a" != 1 is True
             if ctx.traps is not None:                        # ordering str against a number is a TypeError,
-                ctx.traps.append(z3.And(ctx.pc, z3.BoolVal(True)))   # a trap on this path, like div-by-zero
+                _trap_add(ctx, z3.And(ctx.pc, z3.BoolVal(True)), ("TypeError",))   # a trap on this path, like div-by-zero
             return z3.BoolVal(False)                         # poison: never trusted once the trap fires
         if op is ast.Is or op is ast.IsNot:                  # identity of two non-None values is opaque; `is` never raises
             _isc = getattr(ctx, "is_cache", None)            # a is b has ONE truth value for given operands and is
@@ -3733,7 +3782,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         name = node.func.id
         if name in env and isinstance(env[name], _NoneVal):  # calling a name bound to None raises TypeError: a trap
             if ctx.traps is not None:
-                ctx.traps.append(ctx.pc)
+                _trap_add(ctx, ctx.pc, ("TypeError",))
             return _Opaque("nonecall")
         if name == "abs" and len(node.args) == 1:
             a = ev(node.args[0], env, ctx)
@@ -3770,10 +3819,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 if 0 <= k <= _MAXCP:
                     return z3.StringVal(chr(k))
                 if ctx.traps is not None:
-                    ctx.traps.append(ctx.pc)                  # a constant out of range: always ValueError
+                    _trap_add(ctx, ctx.pc, ("ValueError",))   # a constant out of range: always ValueError
                 return z3.FreshConst(_SS, "chr")
             if ctx.traps is not None:
-                ctx.traps.append(z3.And(ctx.pc, z3.Or(a < 0, a > _MAXCP)))
+                _trap_add(ctx, z3.And(ctx.pc, z3.Or(a < 0, a > _MAXCP)), ("ValueError",))
             if not _TRAPFREE:                                 # the range trap is exact; the codepoint is over-approximated
                 _note_overapprox(ctx, "chr")
             r = _CHR(a)                                        # one character with codepoint a; round-trips with ord
@@ -3788,7 +3837,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 if z3.is_string_value(am) and len(am.as_string()) == 1:   # a constant character folds to its codepoint
                     return z3.IntVal(ord(am.as_string()))
                 if ctx.traps is not None:
-                    ctx.traps.append(z3.And(ctx.pc, z3.Length(a) != 1))
+                    _trap_add(ctx, z3.And(ctx.pc, z3.Length(a) != 1), ("TypeError",))
                 if not _TRAPFREE:                            # the length trap is exact; the codepoint is over-approximated
                     _note_overapprox(ctx, "ord")
                 r = _ORD(a)                                    # in [0, 0x10FFFF] and round-trips with chr (single char)
@@ -3821,7 +3870,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     return z3.IntVal(int(args[0].value, base))
                 except ValueError:
                     if ctx.traps is not None:
-                        ctx.traps.append(ctx.pc)
+                        _trap_add(ctx, ctx.pc, ("ValueError",))
                     return z3.IntVal(0)                       # poison: never trusted once the trap fires
             if len(args) == 1 and not kws:
                 a = ev(args[0], env, ctx)                      # the argument is trap-checked as it is evaluated
@@ -3830,7 +3879,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 if _is_fp(a) or (_TRAPFREE and isinstance(a, _Opaque)
                                  and not isinstance(a, (_SafeContainer, _DictParam, _DictLit, _MapVal))):
                     if _is_fp(a) and _TRAPFREE and ctx.traps is not None:
-                        ctx.traps.append(z3.And(ctx.pc, z3.Or(z3.fpIsInf(a), z3.fpIsNaN(a))))   # int(inf) OverflowError, int(nan) ValueError
+                        _trap_add(ctx, z3.And(ctx.pc, z3.Or(z3.fpIsInf(a), z3.fpIsNaN(a))), ("OverflowError", "ValueError"))   # int(inf) OverflowError, int(nan) ValueError
                     _note_overapprox(ctx, "int() of a float")    # truncation toward zero of a finite float --
                     return z3.FreshInt("int")                    # some int (REFUTED withheld; PROVED still sound)
                 raise Unsupported("int() of a string, container, or unmodeled value (may raise ValueError/TypeError)")
@@ -3845,7 +3894,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     return z3.FPVal(float(node.args[0].value), _F64)
                 except ValueError:
                     if ctx.traps is not None:
-                        ctx.traps.append(ctx.pc)
+                        _trap_add(ctx, ctx.pc, ("ValueError",))
                     return z3.FPVal(0.0, _F64)                # poison: never trusted once the trap fires
             a = ev(node.args[0], env, ctx)                    # the argument is trap-checked as it is evaluated
             if _is_fp(a):
@@ -3854,7 +3903,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 ai = _as_int(a)
                 if _TRAPFREE and ctx.traps is not None:       # float(n) OverflowErrors when |n| exceeds the largest int
                     m = z3.IntVal(_float_int_max())           # with a finite double value (the CHC engine cannot carry
-                    ctx.traps.append(z3.And(ctx.pc, z3.Or(ai > m, ai < -m)))   # this 2**1024 constant, so it abstains to here)
+                    _trap_add(ctx, z3.And(ctx.pc, z3.Or(ai > m, ai < -m)), ("OverflowError",))   # this 2**1024 constant, so it abstains to here)
                 return _to_fp(a)                              # float(int) / float(bool): the exact IEEE-754 value
             raise Unsupported("float() of a non-literal string or unmodeled value (may raise ValueError)")
         if name in ("bytes", "bytearray") and name not in ctx.repo and len(node.args) <= 1:
@@ -3867,7 +3916,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if z3.is_expr(a) and (z3.is_int(a) or z3.is_bool(a)):
                 n = _as_int(a)
                 if ctx.traps is not None:                     # ValueError: negative count
-                    ctx.traps.append(z3.And(ctx.pc, n < 0))
+                    _trap_add(ctx, z3.And(ctx.pc, n < 0), ("ValueError",))
                 return _SafeContainer(name, byteslike=True, immutable=(name == "bytes"),
                                       length=z3.If(n >= 0, n, z3.IntVal(0)))
             if isinstance(a, _SafeContainer) and a.byteslike:   # bytes(b) / bytearray(b): a copy of equal length
@@ -3913,13 +3962,13 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if not z3.is_int_value(step):
                 if _TRAPFREE:                                # a symbolic step: ValueError iff step == 0, length opaque
                     if ctx.traps is not None:
-                        ctx.traps.append(z3.And(ctx.pc, step == 0))
+                        _trap_add(ctx, z3.And(ctx.pc, step == 0), ("ValueError",))
                     return _SafeContainer("range", immutable=True)
                 raise Unsupported("range() with a non-constant step")
             s = step.as_long()
             if s == 0:
                 if ctx.traps is not None:
-                    ctx.traps.append(ctx.pc)                  # range() arg 3 must not be zero: ValueError
+                    _trap_add(ctx, ctx.pc, ("ValueError",))   # range() arg 3 must not be zero: ValueError
                 return _SafeContainer("range", immutable=True)   # a consumable value past the trap, so list(range(
                 #                                                  0, 10, 0)) reaches the trap instead of choking
             # length = ceil((stop - start) / step) clamped at 0; dividing by a positive quantity (s or -s) makes
@@ -3966,7 +4015,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             x = ev(node.args[0], env, ctx)
             if isinstance(x, _SafeContainer) and x.unindexable:
                 if ctx.traps is not None:
-                    ctx.traps.append(ctx.pc)                      # set / frozenset: reversed() raises TypeError
+                    _trap_add(ctx, ctx.pc, ("TypeError",))        # set / frozenset: reversed() raises TypeError
                 return _Opaque("reversed")                        # poison: never trusted once the trap fires
             if isinstance(x, _SafeContainer):                     # list / bytes / range: a reversed sized sequence
                 return _SafeContainer("reversed", byteslike=x.byteslike, length=_container_len(x, ctx), unsized=True)
@@ -4009,7 +4058,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if len(node.args) == 1 and _TRAPFREE and ctx.traps is not None:
                 sl = getattr(it, "src_len", None)
                 if sl is not None:
-                    ctx.traps.append(z3.And(ctx.pc, sl == 0))   # StopIteration: empty source, no default given
+                    _trap_add(ctx, z3.And(ctx.pc, sl == 0), ("StopIteration",))   # StopIteration: empty source, no default given
             _note_overapprox(ctx, "next()")
             return _Opaque("next")
         if name in ("sorted", "list") and name not in ctx.repo and len(node.args) == 1 and (
@@ -4110,7 +4159,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     if _has_dflt:
                         return dflt
                     if _TRAPFREE and ctx.traps is not None:
-                        ctx.traps.append(ctx.pc)             # min/max of an empty sequence always raises
+                        _trap_add(ctx, ctx.pc, ("ValueError",))   # min/max of an empty sequence always raises
                         return z3.FreshInt(name)
                     raise Unsupported(f"{name}() of an empty sequence raises ValueError")
                 elif (_TRAPFREE and isinstance(seq, _SafeContainer) and ctx.traps is not None):
@@ -4149,7 +4198,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if len(node.args) == 2:
                 return z3.FreshConst(_F64, "round")          # round(float, n) returns a float; inf/nan pass through
             if _TRAPFREE and ctx.traps is not None:          # round(inf) OverflowError, round(nan) ValueError (int result)
-                ctx.traps.append(z3.And(ctx.pc, z3.Or(z3.fpIsInf(x), z3.fpIsNaN(x))))
+                _trap_add(ctx, z3.And(ctx.pc, z3.Or(z3.fpIsInf(x), z3.fpIsNaN(x))), ("OverflowError", "ValueError"))
             return z3.FreshInt("round")
         if name == "divmod" and len(node.args) == 2:         # divmod(a, b) == (a // b, a % b), same zero-divisor trap
             fd = ast.copy_location(ast.BinOp(left=node.args[0], op=ast.FloorDiv(), right=node.args[1]), node)
@@ -4169,7 +4218,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if isinstance(a, _StrSeq):
                 if a.unsized:                                # a lazy map(str, ...) iterator has no len(): TypeError
                     if ctx.traps is not None:
-                        ctx.traps.append(ctx.pc)
+                        _trap_add(ctx, ctx.pc, ("TypeError",))
                     return z3.FreshInt("maplen")
                 if a.length is not None:                     # split(sep) is >= 1 part, so split(sep)[0] / [-1] decide
                     return a.length
@@ -4183,18 +4232,18 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 raise Unsupported("len of a split result needs the over-approximation channel")
             if isinstance(a, _NoneVal):                      # len(None): None is not sized -- TypeError, every input
                 if ctx.traps is not None:
-                    ctx.traps.append(ctx.pc)
+                    _trap_add(ctx, ctx.pc, ("TypeError",))
                 return z3.FreshInt("nonelen")
             if isinstance(a, _NdArray):                      # len(ndarray): shape[0] (a 0-d array is not sized: TypeError)
                 if not a.shape:
                     if ctx.traps is not None:
-                        ctx.traps.append(ctx.pc)
+                        _trap_add(ctx, ctx.pc, ("TypeError",))
                     return z3.FreshInt("ndlen")
                 return a.shape[0]
             if _TRAPFREE and isinstance(a, _SafeContainer):  # a container parameter: a stable nonneg length,
                 if a.unsized:                                # a lazy iterator (zip / chain / ...) has no len(): the
                     if ctx.traps is not None:                # an iterator has no len(): TypeError
-                        ctx.traps.append(ctx.pc)
+                        _trap_add(ctx, ctx.pc, ("TypeError",))
                     return z3.FreshInt("iterlen")
                 return _container_len(a, ctx)                # shared with the bounds check on a[i]
             if _TRAPFREE and isinstance(a, _DictParam):       # len(d) for a dict parameter: a stable by-name nonneg
@@ -4234,7 +4283,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             _tn = node.args[1]                                # the 2nd argument must be a type or tuple of types; a
             if (ctx.traps is not None and not BEST_EFFORT     # value that is a modeled scalar (a bare parameter or
                     and isinstance(_tn, ast.Name) and _definitely_not_iterable(env.get(_tn.id))):   # local bound to an
-                ctx.traps.append(ctx.pc)                      # int/float/bool) is never a type -> isinstance TypeError
+                _trap_add(ctx, ctx.pc, ("TypeError",))        # int/float/bool) is never a type -> isinstance TypeError
             if not (z3.is_expr(v) or isinstance(v, tuple)):   # an opaque/unmodeled value: its type is unknown,
                 if _TRAPFREE:                                 # isinstance never traps; the result is arbitrary
                     return z3.FreshConst(z3.BoolSort(), "hi")
@@ -4300,7 +4349,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 return num
             den = _to_real(ev(node.args[1], env, ctx))
             if ctx.traps is not None:
-                ctx.traps.append(z3.And(ctx.pc, den == 0))
+                _trap_add(ctx, z3.And(ctx.pc, den == 0), ("ZeroDivisionError",))
             return num / den
         if name == "complex" and 1 <= len(node.args) <= 2:
             re = _to_fp(ev(node.args[0], env, ctx))
@@ -4484,7 +4533,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     return _SafeContainer("islice", length=n, unsized=True)   # islice(it, None) -> all of it
                 if z3.is_expr(stop) and z3.is_int(stop):
                     if ctx.traps is not None:
-                        ctx.traps.append(z3.And(ctx.pc, stop < 0))   # ValueError: a negative stop
+                        _trap_add(ctx, z3.And(ctx.pc, stop < 0), ("ValueError",))   # ValueError: a negative stop
                     return _SafeContainer("islice", length=z3.If(stop < 0, z3.IntVal(0),
                                                                   z3.If(stop < n, stop, n)), unsized=True)   # min(stop, len)
                 raise Unsupported("itertools.islice with a non-integer stop")
@@ -4567,7 +4616,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     finally:
                         ctx.pc = saved
                     if init is None and ctx.traps is not None:    # reduce of an empty iterable with no initial: TypeError
-                        ctx.traps.append(z3.And(ctx.pc, _container_len(seq, ctx) <= 0))
+                        _trap_add(ctx, z3.And(ctx.pc, _container_len(seq, ctx) <= 0), ("TypeError",))
                     return _Opaque("reduce")
                 raise Unsupported("functools.reduce over a non-container iterable")
             if (node.func.value.id == "statistics" and "statistics" not in env
@@ -4577,7 +4626,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 seq = ev(node.args[0], env, ctx)
                 if isinstance(seq, _SafeContainer) and ctx.traps is not None:
                     need = 2 if node.func.attr in ("stdev", "variance") else 1
-                    ctx.traps.append(z3.And(ctx.pc, _container_len(seq, ctx) < need))
+                    _trap_add(ctx, z3.And(ctx.pc, _container_len(seq, ctx) < need), ("ValueError",))   # StatisticsError is a ValueError
                     return z3.FreshConst(_F64, "stat")
                 raise Unsupported("statistics reducer over a non-container")
             if (node.func.value.id == "random" and node.func.attr == "choice"
@@ -4585,11 +4634,11 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 # random.choice(seq): IndexError on an empty sequence; returns an element.
                 seq = ev(node.args[0], env, ctx)
                 if isinstance(seq, _SafeContainer) and not seq.unindexable and not seq.unsized and ctx.traps is not None:
-                    ctx.traps.append(z3.And(ctx.pc, _container_len(seq, ctx) <= 0))
+                    _trap_add(ctx, z3.And(ctx.pc, _container_len(seq, ctx) <= 0), ("IndexError",))
                     return _container_element(seq, ctx)
                 if _is_str(seq):
                     if ctx.traps is not None:
-                        ctx.traps.append(z3.And(ctx.pc, z3.Length(seq) == 0))
+                        _trap_add(ctx, z3.And(ctx.pc, z3.Length(seq) == 0), ("IndexError",))
                     c = z3.FreshConst(z3.StringSort(), "choice")
                     if ctx.facts is not None:
                         ctx.facts.append(z3.Length(c) == 1)
@@ -4601,7 +4650,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 seq = ev(node.args[0], env, ctx)
                 k = ev(node.args[1], env, ctx)
                 if isinstance(seq, _SafeContainer) and z3.is_expr(k) and z3.is_int(k) and ctx.traps is not None:
-                    ctx.traps.append(z3.And(ctx.pc, z3.Or(k < 0, k > _container_len(seq, ctx))))
+                    _trap_add(ctx, z3.And(ctx.pc, z3.Or(k < 0, k > _container_len(seq, ctx))), ("ValueError",))
                     return _SafeContainer("sample", length=k)
                 raise Unsupported("random.sample over a non-container / non-integer k")
             if (node.func.value.id == "random" and node.func.attr == "randint"
@@ -4610,7 +4659,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 a0 = _as_int(ev(node.args[0], env, ctx))
                 b0 = _as_int(ev(node.args[1], env, ctx))
                 if ctx.traps is not None:
-                    ctx.traps.append(z3.And(ctx.pc, a0 > b0))
+                    _trap_add(ctx, z3.And(ctx.pc, a0 > b0), ("ValueError",))
                 r = z3.FreshInt("randint")
                 if ctx.facts is not None:
                     ctx.facts.append(z3.And(r >= a0, r <= b0))
@@ -4623,7 +4672,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 nm = node.args[0].id if isinstance(node.args[0], ast.Name) else None
                 if (isinstance(seq, _SafeContainer) and not seq.unindexable and not seq.unsized
                         and ctx.traps is not None and nm is not None and nm in ctx.mutate_once):
-                    ctx.traps.append(z3.And(ctx.pc, _container_len(seq, ctx) <= 0))
+                    _trap_add(ctx, z3.And(ctx.pc, _container_len(seq, ctx) <= 0), ("IndexError",))
                     return _container_element(seq, ctx)
                 raise Unsupported("heapq.heappop of a non-container / multiply-mutated heap")
             if (node.func.value.id == "math" and node.func.attr == "prod"
@@ -4680,7 +4729,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 margs = [ev(a, env, ctx) for a in node.args]   # each argument trap-checked as it is evaluated
                 if len(margs) == 2 and _is_str(margs[0]) and _is_str(margs[1]):
                     if ctx.traps is not None:
-                        ctx.traps.append(z3.And(ctx.pc, z3.Length(margs[0]) != z3.Length(margs[1])))
+                        _trap_add(ctx, z3.And(ctx.pc, z3.Length(margs[0]) != z3.Length(margs[1])), ("ValueError",))
                     return _Opaque("transtable")
                 if len(margs) in (1, 3):
                     return _Opaque("transtable")
@@ -4768,7 +4817,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     return _res
         if isinstance(recv, _NoneVal):                       # None.method() raises AttributeError: a reachable trap
             if ctx.traps is not None:                        # (the arguments above are still trap-checked first)
-                ctx.traps.append(ctx.pc)
+                _trap_add(ctx, ctx.pc, ("AttributeError",))
             return _Opaque("nonemethod")
         if isinstance(recv, _NdArray):                       # ndarray / tensor methods: reshape, reductions, ...
             res = _nd_method(recv, meth, a, node, env, ctx)
@@ -4827,23 +4876,23 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if isinstance(recv, _SafeContainer) and not recv.immutable and len(a) <= 1:
                 n = _container_len(recv, ctx)
                 if not a:
-                    ctx.traps.append(z3.And(ctx.pc, n <= 0))                       # pop() from an empty list
+                    _trap_add(ctx, z3.And(ctx.pc, n <= 0), ("IndexError",))        # pop() from an empty list
                 elif z3.is_expr(a[0]) and a[0].sort() == z3.IntSort():
-                    ctx.traps.append(z3.And(ctx.pc, z3.Or(a[0] < -n, a[0] >= n)))  # pop(i) out of range
+                    _trap_add(ctx, z3.And(ctx.pc, z3.Or(a[0] < -n, a[0] >= n)), ("IndexError",))   # pop(i) out of range
                 else:
                     raise Unsupported("list.pop with a non-integer index")
                 return z3.FreshInt("pop")
             if isinstance(recv, _DictParam) and len(a) == 1:
                 mem = _dict_member(recv, a[0])
                 if mem is not None:
-                    ctx.traps.append(z3.And(ctx.pc, z3.Not(mem)))                  # dict.pop(k) on a missing key
+                    _trap_add(ctx, z3.And(ctx.pc, z3.Not(mem)), ("KeyError",))     # dict.pop(k) on a missing key
                     return z3.FreshInt("dpop")
             if isinstance(recv, _DictParam) and len(a) == 2:
                 return z3.FreshInt("dpopdef")                                      # dict.pop(k, default): never raises
         if meth == "popitem" and isinstance(recv, _DictParam) and ctx.traps is not None and not BEST_EFFORT \
                 and _gated and not a:
             n = _container_len(recv, ctx)
-            ctx.traps.append(z3.And(ctx.pc, n <= 0))                               # popitem() on an empty dict: KeyError
+            _trap_add(ctx, z3.And(ctx.pc, n <= 0), ("KeyError",))                  # popitem() on an empty dict: KeyError
             return (z3.FreshInt("pik"), z3.FreshInt("piv"))                        # the popped (key, value) 2-tuple
         # list.index(x) / tuple.index(x) / list.remove(x): ValueError when x is not present, against the
         # sequence's stable membership predicate, so an `x in xs` guard proves it. index is non-mutating, so it
@@ -4855,7 +4904,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 and (meth == "index" or (not recv.immutable and _gated))):
             mem = _seq_member(recv, a[0], ctx)
             if mem is not None:
-                ctx.traps.append(z3.And(ctx.pc, z3.Not(mem)))                      # x not in the sequence: ValueError
+                _trap_add(ctx, z3.And(ctx.pc, z3.Not(mem)), ("ValueError",))       # x not in the sequence: ValueError
                 return z3.FreshInt(meth)
         # dict.get(k) on a dict parameter returns None when k is absent, so using the result in arithmetic, as
         # an index, or any None-trapping operation is a TypeError (modeled by the None machinery): a default
@@ -4891,7 +4940,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 k = z3.FreshInt("bcount"); ctx.facts.append(z3.And(k >= 0, k <= n)); return k
             k = z3.FreshInt("bfind"); ctx.facts.append(z3.And(k >= -1, k < n))
             if meth in ("index", "rindex") and ctx.traps is not None:
-                ctx.traps.append(z3.And(ctx.pc, k < 0))       # ValueError when the subsequence is not found
+                _trap_add(ctx, z3.And(ctx.pc, k < 0), ("ValueError",))   # ValueError when the subsequence is not found
             return k
         if isinstance(recv, _SafeContainer) and recv.byteslike and not recv.unindexable:
             if meth == "hex" and not a:                       # bytes.hex() -> a str of hex digits, never raises
@@ -5058,7 +5107,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             idx = ev(node.slice, env, ctx)
             if z3.is_expr(idx) and idx.sort() == z3.IntSort():
                 if ctx.traps is not None:
-                    ctx.traps.append(z3.And(ctx.pc, z3.Or(idx < -base.length, idx >= base.length)))   # IndexError
+                    _trap_add(ctx, z3.And(ctx.pc, z3.Or(idx < -base.length, idx >= base.length)), ("IndexError",))   # IndexError
                 return z3.FreshConst(z3.StringSort(), "splitelem")
             raise Unsupported("split-result index is not an integer")
         if _TRAPFREE and isinstance(base, _DefaultDict):
@@ -5072,7 +5121,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             kt = ev(node.slice, env, ctx)
             mem = _dict_member(base, kt)
             if mem is not None and ctx.traps is not None:
-                ctx.traps.append(z3.And(ctx.pc, z3.Not(mem)))   # KeyError when the key is not present
+                _trap_add(ctx, z3.And(ctx.pc, z3.Not(mem)), ("KeyError",))   # KeyError when the key is not present
                 if (isinstance(node.value, ast.Name) and node.value.id in getattr(ctx, "readonly_dicts", ())):
                     # a read-only dict's d[k] is a fixed function of k -- memoize it so re-reading the same key gives
                     # ONE value, making a guard `if d[k] != 0:` protect a later `10 // d[k]` (else the two reads were
@@ -5095,7 +5144,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             else:
                 ev(node.slice, env, ctx)
             if ctx.traps is not None:
-                ctx.traps.append(ctx.pc)
+                _trap_add(ctx, ctx.pc, ("TypeError",))
             return _Opaque("itersub")
         if _TRAPFREE and isinstance(base, _Opaque) and not isinstance(base, _DictLit):
             if isinstance(node.slice, ast.Slice):            # a slice of an opaque value never traps (Python clamps),
@@ -5114,7 +5163,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if isinstance(base, _SafeContainer) and ctx.traps is not None \
                     and z3.is_expr(idx) and idx.sort() == z3.IntSort():
                 n = _container_len(base, ctx)                # bounds VC: IndexError when the index leaves [-len, len)
-                ctx.traps.append(z3.And(ctx.pc, z3.Or(idx < -n, idx >= n)))
+                _trap_add(ctx, z3.And(ctx.pc, z3.Or(idx < -n, idx >= n)), ("IndexError",))
                 if base.tuple_arity is not None:             # zip / enumerate / items element: a fixed N-tuple
                     return tuple(z3.FreshInt("telem") for _ in range(base.tuple_arity))
                 if isinstance(base.elem, _SafeContainer):    # list[list[..]] etc.: the element is an inner sequence
@@ -5171,7 +5220,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             return _Opaque("ndattr")                         # .dtype / .device / ...: opaque, raises no modeled trap
         if isinstance(v, _NoneVal):                          # None.x raises AttributeError: a trap
             if ctx.traps is not None:
-                ctx.traps.append(ctx.pc)
+                _trap_add(ctx, ctx.pc, ("AttributeError",))
             return _Opaque("noneattr")
         base = getattr(v, "name", None)                      # an opaque object's field: a stable value keyed by its
         if base is not None:                                 # path (o.x, o.a.x), duck-typed numeric in arithmetic so
@@ -5401,7 +5450,7 @@ def _slice_len(n, slc, env, ctx):
     if slc.step is not None:
         sv = ev(slc.step, env, ctx)                          # trap-check the step; range step 0 is a ValueError
         if ctx.traps is not None and z3.is_expr(sv) and (z3.is_int(sv) or z3.is_bool(sv)):
-            ctx.traps.append(z3.And(ctx.pc, _as_int(sv) == 0))
+            _trap_add(ctx, z3.And(ctx.pc, _as_int(sv) == 0), ("ValueError",))
     if k == 1:                                               # step 1 / None: exact clamped length
         clamp = lambda x, d: d if x is None else z3.If(x < 0, _zmax(n + x, z3.IntVal(0)), _zmin(x, n))
         return _zmax(clamp(hi, n) - clamp(lo, z3.IntVal(0)), z3.IntVal(0))
@@ -5446,7 +5495,7 @@ def _str_subscript(base, slc, env, ctx):
     idx = _as_int(ev(slc, env, ctx))
     real = z3.If(idx < 0, n + idx, idx)
     if ctx.traps is not None:
-        ctx.traps.append(z3.And(ctx.pc, z3.Or(real < 0, real >= n)))   # IndexError
+        _trap_add(ctx, z3.And(ctx.pc, z3.Or(real < 0, real >= n)), ("IndexError",))   # IndexError
     return z3.SubString(base, real, z3.IntVal(1))
 
 
@@ -5952,11 +6001,11 @@ def _assign_target(tgt, val, env, ctx):
         else:
             idx = None if isinstance(tgt.slice, ast.Slice) else ev(tgt.slice, env, ctx)
             if isinstance(base, _SafeContainer) and (base.immutable or base.unindexable) and ctx.traps is not None:
-                ctx.traps.append(ctx.pc)                     # tuple / set item assignment always raises TypeError
+                _trap_add(ctx, ctx.pc, ("TypeError",))       # tuple / set item assignment always raises TypeError
             elif idx is not None and isinstance(base, _SafeContainer) and ctx.traps is not None \
                     and z3.is_expr(idx) and idx.sort() == z3.IntSort():
                 n = _container_len(base, ctx)
-                ctx.traps.append(z3.And(ctx.pc, z3.Or(idx < -n, idx >= n)))   # IndexError on store
+                _trap_add(ctx, z3.And(ctx.pc, z3.Or(idx < -n, idx >= n)), ("IndexError",))   # IndexError on store
     else:
         raise Unsupported("complex assignment target")
 
@@ -6122,7 +6171,7 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
     ctx.numeric_params = frozenset(a.arg for a in _params     # params explicitly typed int/float/bool: a number, so
                                    if isinstance(a.annotation, ast.Name)   # a method call on one is an AttributeError,
                                    and a.annotation.id in ("int", "float", "bool"))   # not a duck-typed opaque object
-    local_traps = _TrapList(ctx) if getattr(ctx, "track_trap_lines", False) else []
+    local_traps = _TrapList(ctx)                              # always kind/line-tracking (a plain list to readers)
     ctx.traps = local_traps
 
     def walk(stmts, env, pc):
@@ -6163,7 +6212,7 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                             # (CPython requires the exact arity), so an unguarded a, b = xs is refuted on a
                             # length-mismatched witness, a len() == N guard proves it, and each name becomes an
                             # arbitrary element. A starred target (a, *b, c) is handled just below.
-                            ctx.traps.append(z3.And(ctx.pc, _container_len(val, ctx) != len(tgt.elts)))
+                            _trap_add(ctx, z3.And(ctx.pc, _container_len(val, ctx) != len(tgt.elts)), ("ValueError",))
                             e2 = dict(e)
                             for nm in tgt.elts:
                                 e2[nm.id] = z3.FreshInt("unpack")
@@ -6177,7 +6226,7 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                             # b[0] / len(b) stays sound (b is empty exactly when len(seq) == the fixed count).
                             fixed = len(tgt.elts) - 1
                             L = _container_len(val, ctx)
-                            ctx.traps.append(z3.And(ctx.pc, L < fixed))
+                            _trap_add(ctx, z3.And(ctx.pc, L < fixed), ("ValueError",))
                             e2 = dict(e)
                             for t in tgt.elts:
                                 if t is _stars[0]:
@@ -6233,7 +6282,7 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                             if not (z3.is_expr(idx) and z3.is_int(idx)):
                                 raise Unsupported("list item assignment with a non-integer index")
                             if ctx.traps is not None:
-                                ctx.traps.append(z3.And(p, z3.Or(idx < -n, idx >= n)))   # IndexError on store
+                                _trap_add(ctx, z3.And(p, z3.Or(idx < -n, idx >= n)), ("IndexError",))   # IndexError on store
                             e2 = dict(e)
                             if z3.is_int_value(idx) and -n <= idx.as_long() < n:
                                 items = list(base); items[idx.as_long()] = val
@@ -6249,11 +6298,11 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                             is_slice = isinstance(tgt.slice, ast.Slice)
                             idx = None if is_slice else ev(tgt.slice, e, ctx)
                             if isinstance(base, _SafeContainer) and (base.immutable or base.unindexable) and ctx.traps is not None:
-                                ctx.traps.append(p)          # item assignment to a tuple / set always raises TypeError
+                                _trap_add(ctx, p, ("TypeError",))   # item assignment to a tuple / set always raises TypeError
                             elif idx is not None and isinstance(base, _SafeContainer) and ctx.traps is not None \
                                     and z3.is_expr(idx) and idx.sort() == z3.IntSort():
                                 n = _container_len(base, ctx)
-                                ctx.traps.append(z3.And(p, z3.Or(idx < -n, idx >= n)))   # IndexError on store
+                                _trap_add(ctx, z3.And(p, z3.Or(idx < -n, idx >= n)), ("IndexError",))   # IndexError on store
                         e2 = dict(e)
                         _bn = getattr(base, "name", None)        # a[k] = v mutates the container in place. Only when the
                         if _bn in args:                          # base is a PARAMETER (directly, or through an alias whose
@@ -6307,7 +6356,7 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         # NOT a refutation. Trap freedom keeps the AssertionError trap (the assert is the bug).
                         ctx.diverge.append(z3.And(p, z3.Not(c)))
                     elif ctx.traps is not None:               # a failing assert is an AssertionError trap
-                        ctx.traps.append(z3.And(p, z3.Not(c)))
+                        _trap_add(ctx, z3.And(p, z3.Not(c)), ("AssertionError",))
                     nxt.append((e, z3.And(p, c)))             # past the assert, the condition held -- assume it
                 elif isinstance(s, ast.Raise) and _TRAPFREE:
                     nm = (s.exc.func.id if isinstance(s.exc, ast.Call) and isinstance(s.exc.func, ast.Name)
@@ -6320,7 +6369,7 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         ctx.diverge.append(p)                 # a value spec: a raise diverges (returns no value), so
                         #                                       its path carries no postcondition obligation
                     elif nm in _MODELED_TRAP_NAMES and ctx.traps is not None:
-                        ctx.traps.append(p)                   # trap freedom: raising a modeled exception is a reachable trap
+                        _trap_add(ctx, p, (nm,))              # trap freedom: raising a modeled exception is a reachable trap
                     # the raise terminates this path (no fall-through)
                 elif isinstance(s, (ast.Break, ast.Continue)) and _TRAPFREE:
                     pass                                      # terminates this path within the havoc'd loop
@@ -6492,18 +6541,37 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                     walk(s.orelse, he, p)
                     nxt.append((he, p))
                 elif isinstance(s, ast.Try) and _TRAPFREE:
-                    # A try / except with a SINGLE catch-all handler, no finally, whose handler reads no name the
-                    # body assigns (so the pre-try env is a sound view for the handler): model the recovery
-                    # exactly. The body's traps are CAUGHT, so the body returns / falls through on its NON-trapping
-                    # inputs and the handler runs on the trapping ones -- `try: return 10 // x except: return 0`
-                    # proves `result >= 0`. Anything else (a typed handler whose trap the untyped engine cannot
-                    # match, a finally, multiple handlers, or a handler that reads body-assigned state) stays
-                    # havoc'd -- sound but UNKNOWN.
-                    if (len(s.handlers) == 1 and _is_catchall_handler(s.handlers[0]) and not s.finalbody
-                            and not (_names_read(s.handlers[0].body) & _stmt_assigned_names(s.body))):
-                        sr, sn, st_ = len(rets), len(none_list), len(ctx.traps)
-                        body_falls = walk(s.body, e, p)
-                        caught = list(ctx.traps[st_:])        # the body's traps, all caught by the catch-all
+                    # try / except recovery. A body trap whose exception KIND every element of some handler's
+                    # catch set provably covers (a catch-all covers everything; `except LookupError` covers an
+                    # IndexError trap via the builtin exception MRO) is CAUGHT: the body returns / falls through
+                    # only on its non-trapping inputs and the handlers run on the trapping ones. When every body
+                    # trap is caught (no finally, matchable handlers, handlers reading no body-assigned name),
+                    # the recovery is exact; anything else stays havoc'd -- sound but UNKNOWN. Caught traps also
+                    # must not REFUTE: the body's exact/hard first-iteration channels are dropped whenever a
+                    # handler exists (a caught trap is not a bug; the plain traps still gate PROVED when they
+                    # escape, and ctx.havoc gates REFUTED).
+                    hsets = [_handler_catch_names(h) for h in s.handlers]
+                    sr, sn, st_ = len(rets), len(none_list), len(ctx.traps)
+                    eh, hh = getattr(ctx, "exact_traps", None), getattr(ctx, "hard_traps", None)
+                    se = len(eh) if eh is not None else 0
+                    sh = len(hh) if hh is not None else 0
+                    body_falls = walk(s.body, e, p)
+                    caught = list(ctx.traps[st_:])            # the body's traps
+                    bkinds = (ctx.traps.kinds[st_:] if isinstance(ctx.traps, _TrapList)
+                              else [None] * len(caught))
+                    if s.handlers:                            # a handler may catch them: a caught exact/hard trap
+                        if eh is not None:                    # is no witness, so the body's contributions cannot
+                            del eh[se:]                       # refute (dropped even when the analysis bails below)
+                        if hh is not None:
+                            del hh[sh:]
+                    hreads = set().union(*[_names_read(h.body) for h in s.handlers]) if s.handlers else set()
+                    all_caught = (bool(s.handlers) and not s.finalbody
+                                  and all(hs is not False for hs in hsets)
+                                  and not (hreads & _stmt_assigned_names(s.body))
+                                  and all(k is not None and all(
+                                          any(hs is None or (hs & _exc_self_and_ancestors(kn)) for hs in hsets)
+                                          for kn in k) for k in bkinds))
+                    if all_caught:
                         tc = z3.Or(*caught) if caught else z3.BoolVal(False)
                         del ctx.traps[st_:]
                         ntc = z3.Not(tc)
@@ -6513,10 +6581,14 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                             none_list[_i] = z3.And(none_list[_i], ntc)
                         for fe, fp in body_falls:             # a clean body fall-through runs the else, else continues
                             nxt += (walk(s.orelse, fe, z3.And(fp, ntc)) if s.orelse else [(fe, z3.And(fp, ntc))])
-                        nxt += walk(s.handlers[0].body, e, z3.And(p, tc))   # the handler runs on the trapping paths
+                        for h in s.handlers:                  # each handler may run where a caught trap fired
+                            he2 = dict(e)
+                            if h.name:                        # except E as nm: the exception object is opaque
+                                he2[h.name] = _Opaque("exc")
+                            nxt += walk(h.body, he2, z3.And(p, tc))
                     else:
-                        for sub in [s.body, s.orelse, s.finalbody] + [h.body for h in s.handlers]:
-                            walk(sub, e, p)                   # every block is reachable: each must be trap free
+                        for sub in [s.orelse, s.finalbody] + [h.body for h in s.handlers]:
+                            walk(sub, e, p)                   # every other block is reachable: each must be trap free
                         ctx.havoc = True
                         he = dict(e)
                         for nm in _stmt_assigned_names([s]):  # where an exception fired is uncertain: havoc

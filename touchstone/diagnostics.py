@@ -89,8 +89,9 @@ Modeled subset:
               Constrained Horn Clauses), self-recursion, and interprocedural calls across the call graph
   properties  any boolean Python expression over the parameters and `result`: arithmetic, comparisons,
               membership, len, indexing, and the modeled methods
-  traps       division by zero, index and key errors, failing asserts, and (as a companion) signed
-              machine-integer overflow
+  traps       division by zero, index and key errors, float overflow, failing asserts, and (as a
+              companion) signed machine-integer overflow; a try/except whose handlers provably catch
+              every body trap kind (by name, tuple, base class, or catch-all) recovers exactly
 
 Trust base:
   the core encodings (operational semantics, VC generator, division/modulo, intervals, floats, strings,

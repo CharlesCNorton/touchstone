@@ -5570,9 +5570,12 @@ def _build_cfg(body, user_bases=None):
                     run_finally(emit(h.body, hb, loops, handlers))
                 cur = after
             elif isinstance(s, ast.Assert):
-                rb, cb = nb(), nb()                           # assert e  ==  if not e: raise AssertionError
-                cur.term = ("branch", s.test, cb.id, rb.id)
-                rb.term = ("raise", "AssertionError")
+                rb, cb = nb(), nb()                           # assert e  ==  if not e: raise AssertionError,
+                cur.term = ("branch", s.test, cb.id, rb.id)   # routed to the innermost handler that catches it
+                anc = _exc_ancestors("AssertionError", user_bases)
+                target_h = next((hid for hid, caught in reversed(handlers)
+                                 if caught is None or (anc & caught)), None)
+                rb.term = ("goto", target_h) if target_h is not None else ("raise", "AssertionError")
                 cur = cb
             elif isinstance(s, (ast.Pass, ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal)):
                 pass                                          # import / global / nonlocal: no-ops here

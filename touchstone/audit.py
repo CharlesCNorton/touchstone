@@ -693,6 +693,76 @@ def stdlib_trapfree_audit():
     return n
 
 
+def tryexcept_differential_audit():
+    """Cross-check every decided try/except verdict against CPython over exhaustive small input pools: a PROVED whose function raises an uncaught modeled exception on some pool input, or a REFUTED whose function raises on none, is a SoundnessError. The corpus pairs each trap kind (subscript, dict key, division, pow overflow/domain, conversion, next, raise, assert) with matching, mismatched, base-class, tuple, multiple, named, bare, and else/nested handler shapes -- the typed-catching surface. Returns {'programs', 'runs'}."""
+    MT = (ValueError, TypeError, KeyError, IndexError, ZeroDivisionError, AssertionError,
+          OverflowError, StopIteration, AttributeError)
+    LISTS = [[], [1], [1, 2, 3]]
+    DICTS = [{}, {"k": 1}]
+    KEYS = ["k", "missing"]
+    INTS = [-2, -1, 0, 1, 2, 3]
+    FLOATS = [0.0, 1.0, -1.0, 2.5, -2.5, 1e308, -1e308, float("inf"), float("-inf"), float("nan")]
+    STRS = ["", "a", "abcd"]
+    CORPUS = [
+        # (source, pools per parameter)
+        ("def f(a: list):\n    try:\n        return a[0]\n    except IndexError:\n        return 0\n", [LISTS]),
+        ("def f(a: list):\n    try:\n        return a[0]\n    except LookupError:\n        return 0\n", [LISTS]),
+        ("def f(a: list):\n    try:\n        return a[0]\n    except KeyError:\n        return 0\n", [LISTS]),
+        ("def f(a: list):\n    try:\n        return a[0]\n    except (IndexError, ValueError):\n        return 0\n", [LISTS]),
+        ("def f(a: list):\n    try:\n        return a[0]\n    except IndexError as e:\n        return 0\n", [LISTS]),
+        ("def f(a: list):\n    try:\n        return a[0]\n    except:\n        return 0\n", [LISTS]),
+        ("def f(a: list):\n    try:\n        return a[0]\n    except Exception:\n        return 0\n", [LISTS]),
+        ("def f(d: dict, k):\n    try:\n        return d[k]\n    except KeyError:\n        return -1\n", [DICTS, KEYS]),
+        ("def f(d: dict, k):\n    try:\n        return d[k]\n    except IndexError:\n        return -1\n", [DICTS, KEYS]),
+        ("def f(d: dict, k):\n    try:\n        return d[k]\n    except LookupError:\n        return -1\n", [DICTS, KEYS]),
+        ("def f(x: int):\n    try:\n        return 10 // x\n    except ZeroDivisionError:\n        return 0\n", [INTS]),
+        ("def f(x: int):\n    try:\n        return 10 // x\n    except ArithmeticError:\n        return 0\n", [INTS]),
+        ("def f(x: int):\n    try:\n        return 10 // x\n    except ValueError:\n        return 0\n", [INTS]),
+        ("def f(a: list, x: int):\n    try:\n        return a[0] // x\n    except (IndexError, ZeroDivisionError):\n        return 0\n", [LISTS, INTS]),
+        ("def f(a: list, x: int):\n    try:\n        return a[0] // x\n    except IndexError:\n        return 0\n", [LISTS, INTS]),
+        ("def f(a: list, x: int):\n    try:\n        return a[0] // x\n    except IndexError:\n        return 0\n    except ZeroDivisionError:\n        return 1\n", [LISTS, INTS]),
+        ("def f():\n    try:\n        return 0 ** -1\n    except:\n        return -1\n", []),
+        ("def f():\n    try:\n        return 0 ** -1\n    except ZeroDivisionError:\n        return -1\n", []),
+        ("import math\ndef f(x: float):\n    try:\n        return math.sqrt(x)\n    except ValueError:\n        return 0.0\n", [FLOATS]),
+        ("import math\ndef f(x: float):\n    try:\n        return math.pow(x, 3.0)\n    except (OverflowError, ValueError):\n        return 0.0\n", [FLOATS]),
+        ("import math\ndef f(x: float):\n    try:\n        return math.pow(x, 3.0)\n    except ValueError:\n        return 0.0\n", [FLOATS]),
+        ("def f(s: str):\n    try:\n        return s[3]\n    except IndexError:\n        return ''\n", [STRS]),
+        ("def f(a: list):\n    try:\n        return next(iter(a))\n    except StopIteration:\n        return -1\n", [LISTS]),
+        ("def f(x: int):\n    try:\n        if x > 0:\n            raise ValueError(x)\n        return x\n    except ValueError:\n        return -1\n", [INTS]),
+        ("def f(x: int):\n    try:\n        if x > 0:\n            raise ValueError(x)\n        return x\n    except TypeError:\n        return -1\n", [INTS]),
+        ("def f(x: float):\n    try:\n        return int(x)\n    except (OverflowError, ValueError):\n        return 0\n", [FLOATS]),
+        ("def f(x: float):\n    try:\n        return int(x)\n    except OverflowError:\n        return 0\n", [FLOATS]),
+        ("def f(x: int):\n    try:\n        assert x > 0\n        return x\n    except AssertionError:\n        return 0\n", [INTS]),
+        ("def f(a: list):\n    try:\n        v = a[0]\n    except IndexError:\n        return -1\n    else:\n        return v\n", [LISTS]),
+        ("def f(a: list, b: list):\n    try:\n        return a[0]\n    except IndexError:\n        return b[0]\n", [LISTS, LISTS]),
+        ("def f(a: list, x: int):\n    try:\n        try:\n            return a[0]\n        except IndexError:\n            return 10 // x\n    except ZeroDivisionError:\n        return 0\n", [LISTS, INTS]),
+    ]
+    import itertools
+    programs = runs = 0
+    for src, pools in CORPUS:
+        v = check(src, target="f")
+        programs += 1
+        if v.status not in (PROVED, REFUTED):
+            continue                                          # a sound abstention needs no oracle
+        ns = {}
+        exec(src, ns)                                         # the corpus is bundled source, not analyzed input
+        fn = ns["f"]
+        uncaught = False
+        for combo in (itertools.product(*pools) if pools else [()]):
+            runs += 1
+            try:
+                fn(*combo)
+            except MT:
+                uncaught = True
+            except Exception:
+                pass                                          # an unmodeled exception never contradicts
+        if v.status == PROVED and uncaught:
+            raise SoundnessError(f"try/except PROVED but CPython raises uncaught: {src!r}")
+        if v.status == REFUTED and not uncaught:
+            raise SoundnessError(f"try/except REFUTED but no pool input raises: {src!r}")
+    return {"programs": programs, "runs": runs}
+
+
 def string_method_axiom_audit(trials=3000, seed=20240920):
     """Validate the str over-approximation axioms against CPython: strip leaves a substring no longer than s (lstrip a suffix, rstrip a prefix), case maps empty iff s is, count in [0, ..] and 0 when absent, replace a no-op when old is absent, pad to max(len(s), width); over ASCII/Unicode whitespace and case oddities. SoundnessError on a violation."""
     rng = random.Random(seed)
@@ -4735,6 +4805,22 @@ def run_self_tests(fast=False):
     assert check("def f(a: list):\n    return next(iter(a), -1)\n", target="f").status == PROVED      # default: never raises
     assert check("def f(a: list):\n    return next(x for x in a)\n", target="f").status != PROVED      # next(genexp): StopIteration if empty
     assert check("def f(a: list):\n    return next((x for x in a), -1)\n", target="f").status == PROVED   # genexp with a default
+    # typed except handlers catch traps by exception KIND: a handler (or tuple / base class / one of several) that provably covers every body trap kind makes the recovery exact, a mismatched or unmatchable one stays UNKNOWN, and a caught trap never refutes (the 0 ** -1 hard trap included).
+    assert check("def f(a: list):\n    try:\n        return a[0]\n    except IndexError:\n        return 0\n", target="f").status == PROVED
+    assert check("def f(a: list):\n    try:\n        return a[0]\n    except LookupError:\n        return 0\n", target="f").status == PROVED   # base class catches
+    assert check("def f(a: list):\n    try:\n        return a[0]\n    except KeyError:\n        return 0\n", target="f").status != PROVED     # wrong kind: IndexError escapes
+    assert check("def f(d: dict, k):\n    try:\n        return d[k]\n    except KeyError:\n        return -1\n", target="f").status == PROVED
+    assert check("def f(a: list, x: int):\n    try:\n        return a[0] // x\n    except (IndexError, ZeroDivisionError):\n        return 0\n", target="f").status == PROVED   # tuple handler
+    assert check("def f(a: list, x: int):\n    try:\n        return a[0] // x\n    except IndexError:\n        return 0\n    except ZeroDivisionError:\n        return 1\n", target="f").status == PROVED   # two handlers
+    assert check("def f(a: list, x: int):\n    try:\n        return a[0] // x\n    except IndexError:\n        return 0\n", target="f").status != PROVED   # ZeroDivisionError escapes
+    assert check("def f(a: list):\n    try:\n        return a[0]\n    except IndexError as e:\n        return 0\n", target="f").status == PROVED   # named binding
+    assert check("def f():\n    try:\n        return 0 ** -1\n    except:\n        return -1\n", target="f").status == PROVED       # a caught exact trap does not refute
+    assert check("def f():\n    try:\n        return 0 ** -1\n    except ZeroDivisionError:\n        return -1\n", target="f").status == PROVED
+    assert check("import math\ndef f(x: float):\n    try:\n        return math.pow(x, 3.0)\n    except (OverflowError, ValueError):\n        return 0.0\n", target="f").status == PROVED
+    assert check("import math\ndef f(x: float):\n    try:\n        return math.pow(x, 3.0)\n    except ValueError:\n        return 0.0\n", target="f").status != PROVED   # OverflowError escapes
+    assert check("def f(x: int):\n    try:\n        if x > 0:\n            raise ValueError(x)\n        return x\n    except ValueError:\n        return -1\n", target="f").status == PROVED   # a raised kind is caught by name
+    assert check("def f(a: list):\n    try:\n        v = a[0]\n    except IndexError:\n        return -1\n    else:\n        return v\n", target="f").status == PROVED   # else clause
+    assert check("def f(a: list, b: list):\n    try:\n        return a[0]\n    except IndexError:\n        return b[0]\n", target="f").status != PROVED   # the handler's own trap still counts
     # ordering (< <= > >=) two incompatible types is a TypeError; == / != and same-family ordering are fine.
     assert check("def f(a: str, b: bytes):\n    return a < b\n", target="f").status != PROVED           # str < bytes
     assert check("def f(a: list, b: str):\n    return a > b\n", target="f").status != PROVED           # list > str
@@ -7663,6 +7749,7 @@ __all__ = [
     'math_pow_axiom_audit',
     'math_domain_audit',
     'stdlib_trapfree_audit',
+    'tryexcept_differential_audit',
     'string_method_axiom_audit',
     'format_spec_audit',
     'string_fragile_op_audit',
