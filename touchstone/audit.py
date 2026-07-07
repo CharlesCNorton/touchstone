@@ -4692,12 +4692,15 @@ def run_self_tests(fast=False):
                  "result >= 0.0", target="f").status == PROVED                         # negative integral exponent
     assert prove("def f(x: float):\n    return x ** 0.5\n", "result >= 0.0", target="f").status == UNKNOWN     # complex boundary: abstains
     assert math_pow_axiom_audit() > 0                          # every math.pow / x ** n trap and axiom holds vs CPython
-    # OverflowError (math range error) for a magnitude-growing power: check must not prove an unbounded-base power trap-free (issue #3, every spelling routes math.pow / builtin pow / x ** n through the same range trap), while |x| <= 1, a constant, and x ** 0 stay trap-free; prove is unaffected since overflow raises.
+    # OverflowError (math range error) for a magnitude-growing power: check must not prove an unbounded-base power trap-free (issue #3, every spelling routes math.pow / builtin pow / x ** n through the same range trap); the trap fires at the exact DBL_MAX^(1/n) base boundary, so a bound below it proves and one that crosses it does not, while a constant and x ** 0 stay trap-free and prove is unaffected since overflow raises.
     assert check("import math\ndef f(x: float):\n    return math.pow(x, 3.0)\n", target="f").status != PROVED   # math.pow can overflow
     assert check("def f(x: float):\n    return x ** 3\n", target="f").status != PROVED                          # x ** 3 (float) can overflow
     assert check("from math import pow\ndef f(x: float):\n    return pow(x, 3)\n", target="f").status != PROVED  # bare pow -> ** overflow
     assert check("def f(x: float):\n    if x > 0.0:\n        return x ** -3\n    return 0.0\n", target="f").status != PROVED   # small-base overflow of a negative power
-    assert check("def f(x: float):\n    if -1.0 <= x <= 1.0:\n        return x ** 3\n    return 0.0\n", target="f").status == PROVED   # |x| <= 1: no overflow
+    assert check("def f(x: float):\n    if -1e100 <= x <= 1e100:\n        return x ** 3\n    return 0.0\n", target="f").status == PROVED   # 1e100 < DBL_MAX^(1/3): a large but safe bound proves
+    assert check("def f(x: float):\n    if -1e103 <= x <= 1e103:\n        return x ** 3\n    return 0.0\n", target="f").status != PROVED   # 1e103 crosses the boundary: 1e103**3 overflows, still caught
+    assert check("import math\ndef f(x: float):\n    if -1e100 <= x <= 1e100:\n        return math.pow(x, 3.0)\n    return 0.0\n", target="f").status == PROVED   # exact boundary for math.pow too
+    assert check("def f(x: float):\n    if x >= 1e-50:\n        return x ** -3\n    return 0.0\n", target="f").status == PROVED   # bounded away from 0 (> DBL_MAX^(1/3)-reciprocal): no small-base overflow
     assert check("def f():\n    return 2.0 ** 3\n", target="f").status == PROVED                                # a constant folds exactly (8.0)
     assert check("def f(x: float):\n    return x ** 0\n", target="f").status == PROVED                          # x ** 0 == 1: no overflow
     assert prove("def f(x: float):\n    return x ** 2\n", "result >= 0.0", requires="isfinite(x)", target="f").status == PROVED   # prove unaffected (partial correctness)

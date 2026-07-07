@@ -1349,10 +1349,19 @@ def _math_call(name, args, ctx):
                    z3.And(z3.fpIsZero(x), fin(y), z3.fpLT(y, Z))))            # zero base ** finite negative
         over()
         r = z3.Function("py_math_pow", F, F, F)(x, y)
-        if _TRAPFREE:                                        # OverflowError: the magnitude grows past a finite base
-            absx = z3.fpAbs(x)                               # (a trap-freedom concern; prove is sound without it)
-            trap(z3.Or(z3.And(fin(x), fin(y), z3.fpGT(y, one), z3.fpGT(absx, one), z3.fpIsInf(r)),   # y>1, |x|>1
-                       z3.And(fin(x), fin(y), z3.fpLT(y, Z), z3.fpGT(absx, Z), z3.fpLT(absx, one), z3.fpIsInf(r))))  # y<0, 0<|x|<1
+        if _TRAPFREE:                                        # OverflowError: the finite result exceeds DBL_MAX (a
+            absx = z3.fpAbs(x)                               # trap-freedom concern; prove is sound without it)
+            yv = _fp_to_py(z3.simplify(y))                   # a constant exponent gives the exact base boundary; only
+            if yv is not None and _math.isfinite(yv) and (yv > 1.0 or yv < 0.0):   # 0 <= y <= 1 provably cannot overflow
+                ev = int(yv) if yv == int(yv) else yv        # integral exponent shares _fp_pow's cache key
+                hi, lo = _fpow_overflow_threshold(ev)
+                if hi is not None:                           # y > 1: |x| > hi overflows
+                    trap(z3.And(fin(x), z3.fpGT(absx, z3.FPVal(hi, F))))
+                else:                                        # y < 0: 0 < |x| < lo overflows
+                    trap(z3.And(fin(x), z3.fpGT(absx, Z), z3.fpLT(absx, z3.FPVal(lo, F))))
+            elif yv is None:                                 # a symbolic exponent: the coarse |x| bound
+                trap(z3.Or(z3.And(fin(x), fin(y), z3.fpGT(y, one), z3.fpGT(absx, one), z3.fpIsInf(r)),   # y>1, |x|>1
+                           z3.And(fin(x), fin(y), z3.fpLT(y, Z), z3.fpGT(absx, Z), z3.fpLT(absx, one), z3.fpIsInf(r))))  # y<0, 0<|x|<1
         if ctx.facts is not None:
             ctx.facts.append(z3.Implies(z3.fpIsZero(y), z3.fpEQ(r, one)))                     # x ** 0 == 1
             ctx.facts.append(z3.Implies(z3.fpEQ(x, one), z3.fpEQ(r, one)))                    # 1 ** y == 1
@@ -1959,6 +1968,45 @@ def _const_num(node):
     return None
 
 
+_DBL_MAX = 1.7976931348623157e308
+_FPOW_OVF_CACHE = {}
+
+
+def _fpow_overflow_threshold(n):
+    """The exact double base-magnitude boundary at which x ** n (== math.pow(x, n), which overflow together)
+    raises OverflowError, for a constant integral exponent |n| >= 2. Returns (hi, lo): |x| > hi overflows for
+    n > 0, 0 < |x| < lo overflows for n < 0; the unused side is None. hi / lo is the largest / smallest base
+    whose n-th power is still finite, so a magnitude the bound rules out is provably trap-free. Cached per n."""
+    cached = _FPOW_OVF_CACHE.get(n)
+    if cached is not None:
+        return cached
+    def powfin(x):
+        try:
+            v = x ** n
+        except OverflowError:
+            return None
+        return v if _math.isfinite(v) else None
+    if n > 0:
+        t = _DBL_MAX ** (1.0 / n)
+        while powfin(t) is None:                              # too big: step down to the largest safe base
+            t = _math.nextafter(t, 0.0)
+        while powfin(_math.nextafter(t, _math.inf)) is not None:   # step up while the next base is still safe
+            t = _math.nextafter(t, _math.inf)
+        res = (t, None)
+    else:
+        t = _DBL_MAX ** (1.0 / n)
+        while powfin(t) is None:                              # too small: step up to a safe base
+            t = _math.nextafter(t, _math.inf)
+        while True:                                           # step down to the smallest safe base
+            d = _math.nextafter(t, 0.0)
+            if d <= 0.0 or powfin(d) is None:
+                break
+            t = d
+        res = (None, t)
+    _FPOW_OVF_CACHE[n] = res
+    return res
+
+
 def _fp_pow(base, expnode, ctx):
     """Float x ** n for a constant integral exponent n (int or integral-valued float). x ** 0 / x ** 1 exact;
     |n| >= 2 an uninterpreted Float64 pow with sign/anchor axioms (nonneg base -> nonneg, even power -> nonneg,
@@ -1992,15 +2040,16 @@ def _fp_pow(base, expnode, ctx):
             if _math.isfinite(val):
                 return z3.FPVal(float(val), _F64)        # exact, never raises
 
-    def _overflow_trap(result):                          # OverflowError when the finite result exceeds DBL_MAX;
-        if ctx.traps is None or not _TRAPFREE:           # a trap-freedom concern only (prove is a sound PROVED-only
-            return                                       # over-approximation without it, as float overflow raises)
+    def _overflow_trap(result):                          # OverflowError at the exact base magnitude where x ** n
+        if ctx.traps is None or not _TRAPFREE:           # exceeds DBL_MAX -- a trap-freedom concern only (prove is a
+            return                                       # sound PROVED-only over-approximation, as overflow raises)
+        hi, lo = _fpow_overflow_threshold(n)
         fb = z3.And(z3.Not(z3.fpIsNaN(base)), z3.Not(z3.fpIsInf(base)))
-        ab, z0, o0 = z3.fpAbs(base), z3.FPVal(0.0, _F64), z3.FPVal(1.0, _F64)
-        if n >= 2:                                       # the magnitude grows for a base of |x| > 1
-            ctx.traps.append(z3.And(ctx.pc, fb, z3.fpGT(ab, o0), z3.fpIsInf(result)))
-        else:                                            # n <= -2: 1 / |x|^|n| grows for a base of 0 < |x| < 1
-            ctx.traps.append(z3.And(ctx.pc, fb, z3.fpGT(ab, z0), z3.fpLT(ab, o0), z3.fpIsInf(result)))
+        ab = z3.fpAbs(base)
+        if hi is not None:                               # n > 0: |x| > hi overflows
+            ctx.traps.append(z3.And(ctx.pc, fb, z3.fpGT(ab, z3.FPVal(hi, _F64))))
+        else:                                            # n < 0: 0 < |x| < lo overflows
+            ctx.traps.append(z3.And(ctx.pc, fb, z3.fpGT(ab, z3.FPVal(0.0, _F64)), z3.fpLT(ab, z3.FPVal(lo, _F64))))
     if ctx.facts is None:
         if n < 0 and ctx.traps is not None:
             ctx.traps.append(z3.And(ctx.pc, z3.fpIsZero(base)))   # 0.0 ** (negative integer) -> ZeroDivisionError
