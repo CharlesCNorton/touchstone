@@ -1325,20 +1325,35 @@ def _math_call(name, args, ctx):
         return r
     if name == "pow":
         # math.pow(x, y): always a float (never complex). ValueError iff a negative finite base with a non-integral
-        # finite exponent, or zero base with a finite negative exponent (validated by math_pow_axiom_audit). The
-        # value is an uninterpreted Float64 pow with the libm anchors x ** 0 == 1, 1 ** y == 1, nonneg base ->
-        # nonneg, 0 ** y == 0 (y > 0).
+        # finite exponent, or zero base with a finite negative exponent; OverflowError when the finite result
+        # exceeds DBL_MAX. Both traps validated by math_pow_axiom_audit. The value is an uninterpreted Float64 pow
+        # with the libm anchors x ** 0 == 1, 1 ** y == 1, nonneg base -> nonneg, 0 ** y == 0 (y > 0).
         if len(args) < 2 or not isfloat(a0) or not isfloat(args[1]):
             return None                                      # a non-numeric argument: abstain (its own TypeError)
         x, y = _to_fp(a0), _to_fp(args[1])
+        one = z3.FPVal(1.0, F)
+        mx, my = z3.simplify(x), z3.simplify(y)
+        if z3.is_fp_value(mx) and z3.is_fp_value(my):        # both constant: fold to CPython's exact result / trap
+            px, py = _fp_to_py(mx), _fp_to_py(my)
+            if px is not None and py is not None:
+                try:
+                    val = _math.pow(px, py)
+                except (ValueError, OverflowError):
+                    trap(z3.BoolVal(True)); over()           # the constant call always raises
+                    return z3.FreshConst(F, "m_pow")
+                if not (_math.isinf(val) or _math.isnan(val)):
+                    return z3.FPVal(val, F)                  # exact, never raises
         fin = lambda v: z3.And(z3.Not(z3.fpIsInf(v)), z3.Not(z3.fpIsNaN(v)))
         integral = z3.fpEQ(y, z3.fpRoundToIntegral(z3.RNE(), y))   # y is a whole number (finite y)
         trap(z3.Or(z3.And(fin(x), z3.fpLT(x, Z), fin(y), z3.Not(integral)),   # negative finite base ** fractional
                    z3.And(z3.fpIsZero(x), fin(y), z3.fpLT(y, Z))))            # zero base ** finite negative
         over()
         r = z3.Function("py_math_pow", F, F, F)(x, y)
+        if _TRAPFREE:                                        # OverflowError: the magnitude grows past a finite base
+            absx = z3.fpAbs(x)                               # (a trap-freedom concern; prove is sound without it)
+            trap(z3.Or(z3.And(fin(x), fin(y), z3.fpGT(y, one), z3.fpGT(absx, one), z3.fpIsInf(r)),   # y>1, |x|>1
+                       z3.And(fin(x), fin(y), z3.fpLT(y, Z), z3.fpGT(absx, Z), z3.fpLT(absx, one), z3.fpIsInf(r))))  # y<0, 0<|x|<1
         if ctx.facts is not None:
-            one = z3.FPVal(1.0, F)
             ctx.facts.append(z3.Implies(z3.fpIsZero(y), z3.fpEQ(r, one)))                     # x ** 0 == 1
             ctx.facts.append(z3.Implies(z3.fpEQ(x, one), z3.fpEQ(r, one)))                    # 1 ** y == 1
             ctx.facts.append(z3.Implies(z3.And(z3.Not(z3.fpIsNaN(x)), z3.Not(z3.fpIsNaN(y)),
@@ -1962,17 +1977,44 @@ def _fp_pow(base, expnode, ctx):
         return z3.FPVal(1.0, _F64)                       # x ** 0 == 1.0 for every double, NaN and Inf included
     if n == 1:
         return base                                       # x ** 1 == x (bit-exact)
+    mb = z3.simplify(base)
+    if z3.is_fp_value(mb):                               # a constant base folds to CPython's exact result / trap
+        pb = _fp_to_py(mb)
+        if pb is not None:
+            try:
+                val = pb ** n
+            except (OverflowError, ZeroDivisionError):
+                if ctx.traps is not None:
+                    ctx.traps.append(z3.And(ctx.pc, z3.BoolVal(True)))   # the constant power always raises
+                if _TRAPFREE or ctx.facts is not None:
+                    return z3.FreshConst(_F64, "fpow")
+                raise Unsupported("float ** to a power |n| >= 2 needs the over-approximation channel (use prove / verify_predicate)")
+            if _math.isfinite(val):
+                return z3.FPVal(float(val), _F64)        # exact, never raises
+
+    def _overflow_trap(result):                          # OverflowError when the finite result exceeds DBL_MAX;
+        if ctx.traps is None or not _TRAPFREE:           # a trap-freedom concern only (prove is a sound PROVED-only
+            return                                       # over-approximation without it, as float overflow raises)
+        fb = z3.And(z3.Not(z3.fpIsNaN(base)), z3.Not(z3.fpIsInf(base)))
+        ab, z0, o0 = z3.fpAbs(base), z3.FPVal(0.0, _F64), z3.FPVal(1.0, _F64)
+        if n >= 2:                                       # the magnitude grows for a base of |x| > 1
+            ctx.traps.append(z3.And(ctx.pc, fb, z3.fpGT(ab, o0), z3.fpIsInf(result)))
+        else:                                            # n <= -2: 1 / |x|^|n| grows for a base of 0 < |x| < 1
+            ctx.traps.append(z3.And(ctx.pc, fb, z3.fpGT(ab, z0), z3.fpLT(ab, o0), z3.fpIsInf(result)))
     if ctx.facts is None:
         if n < 0 and ctx.traps is not None:
             ctx.traps.append(z3.And(ctx.pc, z3.fpIsZero(base)))   # 0.0 ** (negative integer) -> ZeroDivisionError
-        if _TRAPFREE:                                    # trap freedom: a power |n| >= 2 raises only at base 0 (n < 0)
-            return z3.FreshConst(_F64, "fpow")           # the value is opaque, but the trap channel is exact
+        if _TRAPFREE:                                    # trap freedom: a power |n| >= 2 raises at base 0 (n < 0) or on overflow
+            r0 = z3.FreshConst(_F64, "fpow")             # the value is opaque, but the trap channel is exact
+            _overflow_trap(r0)
+            return r0
         raise Unsupported("float ** to a power |n| >= 2 needs the over-approximation channel (use prove / verify_predicate)")
     _note_overapprox(ctx, "float ** (a constant integral power)")
     z, one = z3.FPVal(0.0, _F64), z3.FPVal(1.0, _F64)
     if n < 0 and ctx.traps is not None:
         ctx.traps.append(z3.And(ctx.pc, z3.fpIsZero(base)))   # 0.0 ** (negative integer) -> ZeroDivisionError
     r = z3.Function("py_fpow_%s%d" % ("m" if n < 0 else "", abs(n)), _F64, _F64)(base)
+    _overflow_trap(r)
     finite = z3.And(z3.Not(z3.fpIsNaN(base)), z3.Not(z3.fpIsInf(base)))
     if n > 0:
         ctx.facts.append(z3.Implies(z3.And(finite, z3.fpGEQ(base, z)), z3.fpGEQ(r, z)))   # nonneg finite base -> nonneg
