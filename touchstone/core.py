@@ -239,8 +239,14 @@ class _Desugar(ast.NodeTransformer):
             store = ast.Attribute(value=tgt.value, attr=tgt.attr, ctx=ast.Store())
         else:
             return node
-        return ast.Assign(targets=[store],
-                          value=ast.BinOp(left=load, op=node.op, right=node.value))
+        new = ast.Assign(targets=[store],
+                         value=ast.BinOp(left=load, op=node.op, right=node.value))
+        if isinstance(tgt, ast.Name):
+            # a name op= is a REBIND only for an immutable value: list.__iadd__ / __imul__ (and the set/dict
+            # in-place operators) mutate the object, observed through every alias. The flag lets an engine
+            # that models containers by value distinguish `a += e` from a genuine `a = a + e` rebinding.
+            new._inplace_aug = True
+        return new
 
     def visit_AnnAssign(self, node):
         self.generic_visit(node)
@@ -620,6 +626,8 @@ def _clone_ast(node):
         for attr in node._attributes:
             if hasattr(node, attr):
                 setattr(new, attr, getattr(node, attr))
+        if getattr(node, "_inplace_aug", False):
+            new._inplace_aug = True                          # the desugarer's aug-assign marker (not an ast attribute)
         return new
     if type(node) is list:
         return [_clone_ast(x) for x in node]
@@ -957,6 +965,14 @@ class _ListLit(tuple):
     concatenation, sum, len) applies unchanged, but distinguished from a genuine tuple literal so that in-place item
     assignment a[i] = v is a bounds-checked mutation rather than a TypeError. (A tuple literal stays a plain tuple,
     whose item assignment is the TypeError it is in CPython.)"""
+    __slots__ = ()
+
+
+class _PowVal(_Opaque):
+    """An integer-base power whose exponent the path condition does not prove nonnegative: b ** e is an int
+    for e >= 0 but a float for e < 0 (2 ** -1 == 0.5), so the result is carried opaque -- trap-free to
+    return or assign, while an int-only consumer (a & 1 mask, a shift, an index) declines rather than
+    assume the int it may not be (float & int is a TypeError CPython raises and the int model would hide)."""
     __slots__ = ()
 
 
@@ -2075,6 +2091,35 @@ def _pow_axioms(b, e, r):
             z3.Implies(e == 0, r == 1),
             z3.Implies(b == 1, r == 1),
             z3.Implies(z3.And(b == 0, e > 0), r == 0)]
+
+
+def _provably_nonneg(pc, e):
+    """True when the path condition structurally forces e >= 0 -- a constant, or a conjunct of the branch
+    guard bounding e below by a nonnegative constant (`if y >= 0:`, `e >= 0 and m != 0`, `y > -1`) -- so
+    the guarded power keeps its exact integer result while an unguarded exponent, which CPython would turn
+    into a float for e < 0, does not. Purely syntactic over the path terms: no solver call, so the check
+    adds nothing to the deterministic resource budget of the enclosing query."""
+    if z3.is_int_value(e):
+        return e.as_long() >= 0
+    def bound(c):
+        if z3.is_and(c):
+            return any(bound(a) for a in c.children())
+        if not z3.is_app(c) or c.num_args() != 2:
+            return False
+        a, b = c.arg(0), c.arg(1)
+        if z3.is_ge(c) and a.eq(e) and z3.is_int_value(b):     # e >= K
+            return b.as_long() >= 0
+        if z3.is_gt(c) and a.eq(e) and z3.is_int_value(b):     # e > K
+            return b.as_long() >= -1
+        if z3.is_le(c) and b.eq(e) and z3.is_int_value(a):     # K <= e
+            return a.as_long() >= 0
+        if z3.is_lt(c) and b.eq(e) and z3.is_int_value(a):     # K < e
+            return a.as_long() >= -1
+        return False
+    try:
+        return bound(pc)
+    except z3.Z3Exception:
+        return False
 
 
 def _const_num(node):
@@ -3422,7 +3467,13 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         if isinstance(l, tuple) or isinstance(r, tuple):
             if op is ast.Add:
                 if isinstance(l, tuple) and isinstance(r, tuple):
-                    return l + r                             # list / tuple concatenation
+                    if isinstance(l, _ListLit) and isinstance(r, _ListLit):
+                        return _ListLit(l + r)               # list concatenation keeps the mutable-list tag
+                    if isinstance(l, _ListLit) != isinstance(r, _ListLit):
+                        if ctx.traps is not None:            # list + tuple (either order): TypeError in CPython
+                            _trap_add(ctx, ctx.pc, ("TypeError",))
+                        return _Opaque("seqop")
+                    return l + r                             # tuple concatenation
                 other = r if isinstance(l, tuple) else l     # the operand added to a sequence literal
                 if isinstance(other, _Opaque) and not (isinstance(other, _SafeContainer)
                                                        and (other.byteslike or other.unindexable)):
@@ -3436,7 +3487,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if op is ast.Mult:
                 tv, kv = (l, r) if isinstance(l, tuple) else (r, l)
                 if z3.is_int_value(kv):
-                    return tv * kv.as_long()                 # tuple repetition by a constant
+                    rep = tv * kv.as_long()                  # list / tuple repetition by a constant, the
+                    return _ListLit(rep) if isinstance(tv, _ListLit) else rep   # mutable-list tag kept
                 if z3.is_expr(kv) and (z3.is_int(kv) or z3.is_bool(kv)):   # seq * a symbolic int / bool (True == 1):
                     if _TRAPFREE:                            # trap free; the length is the count times the repeated
                         k = z3.If(kv, z3.IntVal(1), z3.IntVal(0)) if z3.is_bool(kv) else kv   # width, clamped at 0 for a
@@ -3526,14 +3578,22 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         if op is ast.Pow:
             if _is_fp(l):
                 return _fp_pow(l, node.right, ctx)        # x ** 0 / x ** 1 exact; x ** n (n>=2) over-approximated
+            if isinstance(l, _PowVal):
+                # a chained power (a ** b) ** n: no 0 ** (negative) trap is expressible against the opaque
+                # base, so only an exponent the path proves nonnegative keeps it decided (trap-free, opaque).
+                if (z3.is_expr(r) and (z3.is_int(r) or z3.is_bool(r))
+                        and _provably_nonneg(ctx.pc, _as_int(r))):
+                    _note_overapprox(ctx, "** with a variable exponent")
+                    return _PowVal("pow")
+                raise Unsupported("** of an over-approximated base with a possibly negative exponent")
             try:
                 return _pow_expand(l, node.right)         # integer base ** constant 0..64: exact
             except Unsupported:
                 int_ops = (z3.is_expr(l) and z3.is_expr(r)
                            and (z3.is_int(l) or z3.is_bool(l)) and (z3.is_int(r) or z3.is_bool(r)))
                 if int_ops and (_TRAPFREE or ctx.facts is not None):
-                    # integer base ** variable exponent: 0 ** (negative) traps; the value is a fresh int
-                    # over-approximated by the power axioms.
+                    # integer base ** variable exponent: 0 ** (negative) traps; the value is over-approximated
+                    # by the power axioms.
                     base_i, exp_i = _as_int(l), _as_int(r)
                     if ctx.traps is not None:
                         trap = z3.And(ctx.pc, base_i == 0, exp_i < 0)   # 0 ** (negative): ZeroDivisionError
@@ -3549,7 +3609,18 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                                 and not isinstance(node.right.value, bool) and node.right.value > 64)
                     _note_overapprox(ctx, "** with a constant exponent over the unroll cap (64)" if over_cap
                                      else "** with a variable exponent")
-                    r2 = z3.FreshInt("pow")
+                    # CPython typing: b ** e is an int for e >= 0 but a FLOAT for e < 0 (2 ** -1 == 0.5), so a
+                    # fresh Int result is faithful only when the path proves the exponent nonnegative. Otherwise
+                    # the trap-freedom engine carries the result opaque (an int-only consumer -- a & 1, a shift --
+                    # declines instead of hiding the TypeError a float operand raises), and the facts engine a
+                    # fresh Real, the sort containing both outcomes, so an integer-only conclusion
+                    # ((x ** y) * 2 != 1 has the float witness x = 2, y = -1) is no longer provable.
+                    if _provably_nonneg(ctx.pc, exp_i):
+                        r2 = z3.FreshInt("pow")
+                    elif _TRAPFREE:
+                        return _PowVal("pow")
+                    else:
+                        r2 = z3.FreshReal("pow")
                     if ctx.facts is not None:
                         ctx.facts.extend(_pow_axioms(base_i, exp_i, r2))
                     return r2
@@ -4184,21 +4255,33 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 acc = z3.If(x < acc, x, acc) if name == "min" else z3.If(x > acc, x, acc)
             return acc
         if name == "round" and 1 <= len(node.args) <= 2:
+            cv = _const_num(node.args[0])                # a constant argument folds to CPython's own result,
+            nd = _const_num(node.args[1]) if len(node.args) == 2 else None   # so half-to-even (round(0.5) == 0,
+            if cv is not None and (len(node.args) == 1 or (isinstance(nd, int) and not isinstance(nd, bool))):
+                try:                                     # round(2.5) == 2) is exact rather than over-approximated
+                    folded = round(cv, nd) if len(node.args) == 2 else round(cv)
+                    return z3.FPVal(folded, _F64) if isinstance(folded, float) else z3.IntVal(folded)
+                except (OverflowError, ValueError):
+                    pass
             x = ev(node.args[0], env, ctx)
             if len(node.args) == 2:
                 ev(node.args[1], env, ctx)               # the ndigits argument (trap-checked)
             if isinstance(x, (_Opaque, _Closure, _Lambda, _FuncRef, _Complex)) or isinstance(x, tuple):
                 if _TRAPFREE and not isinstance(x, tuple):
-                    return z3.FreshInt("round")          # round of an opaque number raises no trap
+                    _note_overapprox(ctx, "round")       # round of an opaque number raises no trap
+                    return z3.FreshInt("round")
                 raise Unsupported("round of an unmodeled value")
             if not _is_fp(x):
                 return _as_int(x)                        # round(int) and round(int, n) are the integer itself
             # round(float): the nearest integer (ties to even); round(float, n): a float. The exact value is
-            # CPython's correctly-rounded result, left as a fresh term of the right type (an over-approximation).
+            # CPython's correctly-rounded result, left as a fresh term of the right type -- an over-approximation,
+            # recorded as one so an exact-value claim abstains instead of refuting the true equality.
             if len(node.args) == 2:
+                _note_overapprox(ctx, "round")
                 return z3.FreshConst(_F64, "round")          # round(float, n) returns a float; inf/nan pass through
             if _TRAPFREE and ctx.traps is not None:          # round(inf) OverflowError, round(nan) ValueError (int result)
                 _trap_add(ctx, z3.And(ctx.pc, z3.Or(z3.fpIsInf(x), z3.fpIsNaN(x))), ("OverflowError", "ValueError"))
+            _note_overapprox(ctx, "round")
             return z3.FreshInt("round")
         if name == "divmod" and len(node.args) == 2:         # divmod(a, b) == (a // b, a % b), same zero-divisor trap
             fd = ast.copy_location(ast.BinOp(left=node.args[0], op=ast.FloorDiv(), right=node.args[1]), node)
@@ -5982,6 +6065,29 @@ def _readonly_dict_names(fn):
     return frozenset(params - bad)
 
 
+def _forget_inplace_aliases(name, obj, env, args=()):
+    """After an in-place mutation through `name` -- a += e / a *= k (list.__iadd__ / __imul__) or a[i] = v on
+    a list literal -- forget (rebind to a fresh _Opaque) every OTHER name that aliases or transitively
+    contains the mutated object (b = a, a shared row), and, when the object denotes a parameter, every other
+    mutable container parameter (the caller may pass the same object twice). The value engine models
+    containers by value with no shared identity, so the mutation is otherwise invisible through the alias,
+    whose stale value would decide falsely; an opaque read abstains instead. Mirrors the mutating-method
+    (append / pop) forgetting in the walk's Expr handling."""
+    if obj is None or not (isinstance(obj, _ListLit) or isinstance(obj, _MapVal)
+                           or (isinstance(obj, _SafeContainer) and not obj.immutable)):
+        return
+    for nm in list(env):
+        if nm != name and _holds_identity(env[nm], obj):
+            env[nm] = _Opaque(nm)
+    mname = getattr(obj, "name", None)
+    if mname in args:
+        for pn in args:
+            pv = env.get(pn)
+            if (pn != mname and isinstance(pv, _Opaque)
+                    and not (isinstance(pv, _SafeContainer) and pv.immutable)):
+                env[pn] = _Opaque(pn)
+
+
 def _assign_target(tgt, val, env, ctx):
     """Assign an already-evaluated value to one target -- a name, an attribute, or a (bounds-checked)
     subscript -- so a tuple unpacking with mixed targets (the in-place swap a[i], a[j] = a[j], a[i]) reuses
@@ -6200,8 +6306,11 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         raise Unsupported("multiple assignment targets")
                     tgt = s.targets[0]
                     if isinstance(tgt, ast.Name):
+                        _aug_old = e.get(tgt.id) if getattr(s, "_inplace_aug", False) else None
                         e2 = dict(e)
                         e2[tgt.id] = ev(s.value, e2, ctx)
+                        if _aug_old is not None:              # a += e mutates the ONE object: an alias (b = a)
+                            _forget_inplace_aliases(tgt.id, _aug_old, e2, args)   # would read stale -- forget it
                         nxt.append((e2, p))
                     elif isinstance(tgt, (ast.Tuple, ast.List)) and all(
                             isinstance(t, (ast.Name, ast.Starred, ast.Tuple, ast.List)) for t in tgt.elts):
@@ -6289,7 +6398,8 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                                 e2[tgt.value.id] = _ListLit(items)            # exact element update at a constant index
                             else:
                                 e2[tgt.value.id] = _SafeContainer("listmut", length=z3.IntVal(n))
-                            nxt.append((e2, p)); continue
+                            _forget_inplace_aliases(tgt.value.id, base, e2, args)   # the store mutates the ONE
+                            nxt.append((e2, p)); continue                     # object: an alias would read stale
                         if not isinstance(base, _Opaque):    # a scalar -> UNKNOWN; a sequence parameter is bounds-
                             raise Unsupported("item assignment to a possibly non-container")   # checked like a load
                         if isinstance(base, _NdArray):
@@ -7387,6 +7497,18 @@ def _heap_walk(stmts, env, heap, pc, ctr, traps, rets, kinds):
                     e2 = dict(e); e2[tgt.id] = z3.IntVal(ctr[0])     # the class object's identity
                     nxt.append((e2, h2, dict(kd), p)); continue
                 if isinstance(tgt, ast.Name):
+                    if (getattr(s, "_inplace_aug", False) and kd.get(tgt.id) == "list" and tgt.id in e
+                            and _kind_of(s.value, kd) == "list"):
+                        # a += e / a *= k on a heap list mutates THE OBJECT (list.__iadd__ / __imul__), so every
+                        # alias observes it: build the concatenation / repetition as a fresh list, then move its
+                        # payload onto a's existing address instead of rebinding a to the fresh copy.
+                        e2 = dict(e); h2 = dict(h)
+                        v = _heap_eval(s.value, e2, h2, ctr, traps, p, kd)
+                        addr = e[tgt.id]
+                        arr, ln = _heap_arr(h2), _heap_len(h2)
+                        h2["@arr"] = z3.Store(arr, addr, z3.Select(arr, v))
+                        h2["@len"] = z3.Store(ln, addr, z3.Select(ln, v))
+                        nxt.append((e2, h2, dict(kd), p)); continue
                     e2 = dict(e); h2 = dict(h); kd2 = dict(kd)
                     e2[tgt.id] = _heap_eval(s.value, e2, h2, ctr, traps, p, kd)
                     k = _kind_of(s.value, kd)

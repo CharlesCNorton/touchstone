@@ -1070,7 +1070,7 @@ def differential_method_audit():
 
 
 def _grammar_program(rng):
-    """A random loop-free program over the container grammar (list literals, [x] * n repetition, b = a aliasing, indexing, append/item-store mutation, one nesting level) returning an int. It composes aliasing x mutation x repetition -- the interaction a single-construct corpus misses (the [[0]] * 2 shared-row trap) -- over literal seeds, so CPython gives one deterministic answer to check the verdict against."""
+    """A random loop-free program over the container grammar (list literals, [x] * n repetition, b = a aliasing, indexing, append/item-store/aug-assign mutation -- a += [x] and a *= 2 are in-place, observed through every alias -- one nesting level) returning an int. It composes aliasing x mutation x repetition -- the interaction a single-construct corpus misses (the [[0]] * 2 shared-row trap, the aliased += stale rebind) -- over literal seeds, so CPython gives one deterministic answer to check the verdict against."""
     sm = lambda: str(rng.randint(0, 3))
     lst = lambda: "[" + ", ".join(sm() for _ in range(rng.randint(1, 3))) + "]"
     seed = rng.choice([
@@ -1084,11 +1084,15 @@ def _grammar_program(rng):
         k = rng.random()
         if k < 0.2 and not aliased:
             lines.append("b = a"); aliased = True                # alias, so a later mutation is seen through b too
-        elif k < 0.45:
+        elif k < 0.4:
             lines.append("a.append(%s)" % sm())                  # mutate a directly
-        elif k < 0.7:
-            lines.append("a[0].append(%s)" % sm())               # mutate THROUGH a subscript (the [[0]]*2 shape)
-        elif k < 0.85:
+        elif k < 0.52:
+            lines.append("a += [%s]" % sm())                     # in-place extend (list.__iadd__): seen through b
+        elif k < 0.6:
+            lines.append("a *= 2")                               # in-place repetition (list.__imul__)
+        elif k < 0.75:
+            lines.append("a[0].append(%s)" % sm())               # mutate THROUGH a subscript (the [[0]]*2 case)
+        elif k < 0.88:
             lines.append("a[%d] = %s" % (rng.randint(0, 1), sm()))   # item store
         elif aliased:
             lines.append("b.append(%s)" % sm())                  # mutate through the alias
@@ -7471,6 +7475,49 @@ def run_self_tests(fast=False):
     except SystemExit:
         pass
     assert check(_ms, target="m").status == PROVED
+
+    # in-place mutation through an alias: a += e / a *= k (list.__iadd__ / __imul__) and a[i] = v on a list
+    # literal mutate the ONE object, observed through every alias (b = a), so the immutable-list rebinding
+    # model must not decide the aliased case -- neither proving the stale pre-mutation value nor refuting
+    # the post-mutation truth -- while the single-observer forms (an accumulator, a plain a = a + e rebind)
+    # keep deciding exactly.
+    _alsrc = "def f():\n    a = [1]\n    b = a\n    a += [2]\n    return len(b)\n"
+    assert prove(_alsrc, "result == 1", target="f").status != PROVED             # CPython: len(b) == 2
+    assert prove(_alsrc, "result == 2", target="f").status != REFUTED
+    assert check("def f(x):\n    a = [1]\n    b = a\n    a += [2]\n    return b[1]\n",
+                 target="f").status != REFUTED                                   # b[1] == 2 exists: no IndexError
+    assert prove("def f():\n    a = [1]\n    b = a\n    a *= 2\n    return len(b)\n",
+                 "result == 1", target="f").status != PROVED                     # CPython: len(b) == 2
+    assert prove("def f():\n    a = [1]\n    b = a\n    a[0] = 7\n    return b[0]\n",
+                 "result == 1", target="f").status != PROVED                     # the store is seen through b
+    assert check("def f():\n    a = [1]\n    b = a\n    a[0] = 0\n    return 10 // b[0]\n",
+                 target="f").status != PROVED                                    # b[0] == 0: a genuine trap
+    assert check("def f():\n    out = [1]\n    out += [2]\n    return out[1]\n", target="f").status == PROVED
+    assert prove("def f():\n    a = [1]\n    b = a\n    a = a + [2]\n    return len(b)\n",
+                 "result == 1", target="f").status == PROVED                     # a genuine rebind: b unchanged
+    # a possibly-negative exponent makes an integer power a float (2 ** -1 == 0.5), so an int-only
+    # conclusion must not rest on it: (x ** -1) & 1 is a TypeError in CPython for every x > 0 (float & int),
+    # and (x ** y) * 2 == 1 has the float witness x = 2, y = -1. A branch proving the exponent nonnegative
+    # keeps the exact integer result, and returning the possibly-float power stays trap-free.
+    assert check("def f(x: int):\n    if x > 0:\n        return (x ** (0 - 1)) & 1\n    return 0\n",
+                 target="f").status != PROVED
+    assert check("def f(x: int, y: int):\n    if x != 0 and y < 0:\n        return (x ** y) & 1\n    return 0\n",
+                 target="f").status != PROVED
+    assert prove("def f(x, y):\n    return (x ** y) * 2\n", "result != 1", requires="x >= 2",
+                 target="f").status != PROVED
+    assert check("def f(x: int, y: int):\n    if x != 0:\n        return x ** y\n    return 0\n",
+                 target="f").status == PROVED                                    # the float result itself is trap-free
+    # round() follows CPython: a constant folds to the half-to-even result (round(0.5) == 0, round(2.5) == 2,
+    # round(2.675, 2) == 2.67 -- the double below 2.675), and a symbolic round is an over-approximated value,
+    # so an exact-value claim abstains rather than refute the truth.
+    assert prove("def f():\n    return round(0.5)\n", "result == 0", target="f").status == PROVED
+    assert prove("def f():\n    return round(0.5)\n", "result == 1", target="f").status == REFUTED
+    assert prove("def f():\n    return round(2.5)\n", "result == 2", target="f").status == PROVED
+    assert prove("def f():\n    return round(1.5)\n", "result == 2", target="f").status == PROVED
+    assert prove("def f():\n    return round(2.675, 2)\n", "result == 2.67", target="f").status == PROVED
+    assert prove("def f(x: float):\n    return round(x)\n", "result == 0", target="f").status == UNKNOWN
+    assert prove("def f(x: float):\n    return round(x)\n", "result != 0", target="f").status == UNKNOWN
+    assert prove("def f(n: int):\n    return round(n)\n", "result == n", target="f").status == PROVED
 
     # count the asserts by parsing the whole file and walking run_self_tests. inspect.getsource's block detection can under-read the function on some platforms, so the full-file parse is primary, inspect the fallback for a frozen or source-less install.
     try:
