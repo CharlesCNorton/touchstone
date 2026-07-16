@@ -1070,7 +1070,12 @@ def differential_method_audit():
 
 
 def _grammar_program(rng):
-    """A random loop-free program over the container grammar (list literals, [x] * n repetition, b = a aliasing, indexing, append/item-store/aug-assign mutation -- a += [x] and a *= 2 are in-place, observed through every alias -- one nesting level) returning an int. It composes aliasing x mutation x repetition -- the interaction a single-construct corpus misses (the [[0]] * 2 shared-row trap, the aliased += stale rebind) -- over literal seeds, so CPython gives one deterministic answer to check the verdict against."""
+    """A random loop-free program over the container grammar (list literals, [x] * n repetition, b = a aliasing
+    with a second level c = b and a d = a[:] slice-copy negative control, indexing, and mutation by
+    append/extend/insert/del/item-store/aug-assign -- a += [x] and a *= 2 are in-place, observed through every
+    alias -- one nesting level) returning an int. It composes aliasing x mutation x repetition -- the interaction
+    a single-construct corpus misses (the [[0]] * 2 shared-row trap, the aliased += stale rebind) -- over literal
+    seeds, so CPython gives one deterministic answer to check the verdict against."""
     sm = lambda: str(rng.randint(0, 3))
     lst = lambda: "[" + ", ".join(sm() for _ in range(rng.randint(1, 3))) + "]"
     seed = rng.choice([
@@ -1079,20 +1084,30 @@ def _grammar_program(rng):
         lambda: "a = [%s, %s]" % (lst(), lst()),                 # separately-written rows
         lambda: "a = [%s] * %d" % (sm(), rng.randint(2, 4)),     # flat repetition of an int (immutable: safe)
     ])
-    lines, aliased = [seed()], False
-    for _ in range(rng.randint(1, 4)):
+    lines, aliased, chained, copied = [seed()], False, False, False
+    for _ in range(rng.randint(1, 5)):
         k = rng.random()
-        if k < 0.2 and not aliased:
+        if k < 0.16 and not aliased:
             lines.append("b = a"); aliased = True                # alias, so a later mutation is seen through b too
-        elif k < 0.4:
+        elif k < 0.22 and aliased and not chained:
+            lines.append("c = b"); chained = True                # a second-level alias: c IS a too
+        elif k < 0.28 and not copied:
+            lines.append("d = a[:]"); copied = True              # a slice COPY: a later mutation of a must NOT
+        elif k < 0.42:                                           # appear in d (its rows still shared when nested)
             lines.append("a.append(%s)" % sm())                  # mutate a directly
         elif k < 0.52:
             lines.append("a += [%s]" % sm())                     # in-place extend (list.__iadd__): seen through b
-        elif k < 0.6:
+        elif k < 0.58:
             lines.append("a *= 2")                               # in-place repetition (list.__imul__)
+        elif k < 0.64:
+            lines.append("a.extend([%s, %s])" % (sm(), sm()))    # method extend
+        elif k < 0.7:
+            lines.append("a.insert(0, %s)" % sm())               # a front insert shifts every index
         elif k < 0.75:
+            lines.append("del a[0]")                             # deletion shrinks (and traps once empty)
+        elif k < 0.83:
             lines.append("a[0].append(%s)" % sm())               # mutate THROUGH a subscript (the [[0]]*2 case)
-        elif k < 0.88:
+        elif k < 0.92:
             lines.append("a[%d] = %s" % (rng.randint(0, 1), sm()))   # item store
         elif aliased:
             lines.append("b.append(%s)" % sm())                  # mutate through the alias
@@ -1101,6 +1116,10 @@ def _grammar_program(rng):
     reads = ["return len(a)", "return len(a[0])", "return a[0]", "return a[1]"]
     if aliased:
         reads += ["return len(b)", "return b[0]", "return len(b[0])"]
+    if chained:
+        reads += ["return len(c)", "return c[0]"]
+    if copied:
+        reads += ["return len(d)", "return d[0]"]
     lines.append(rng.choice(reads))
     return "def f():\n" + "".join("    " + s + "\n" for s in lines)
 
@@ -7518,6 +7537,63 @@ def run_self_tests(fast=False):
     assert prove("def f(x: float):\n    return round(x)\n", "result == 0", target="f").status == UNKNOWN
     assert prove("def f(x: float):\n    return round(x)\n", "result != 0", target="f").status == UNKNOWN
     assert prove("def f(n: int):\n    return round(n)\n", "result == n", target="f").status == PROVED
+
+    # CPython semantic corners, pinned as a standing battery: each fact below is a ground truth of the
+    # interpreter (not of any engine), asserted so no model may ever contradict it -- decided exactly where
+    # an engine decides today, and held to at-worst-abstention where one does not, so a precision gain can
+    # only tighten these, never a regression loosen them.
+    # -- control flow: finally overrides a try return; else runs only after a non-returning try; break skips for-else.
+    _fin = "def f():\n    try:\n        return 1\n    finally:\n        return 2\n"
+    assert prove(_fin, "result == 2", target="f").status != REFUTED               # CPython: f() == 2
+    assert prove(_fin, "result == 1", target="f").status != PROVED
+    _tre = "def f():\n    try:\n        return 1\n    except ValueError:\n        return 2\n    else:\n        return 3\n"
+    assert prove(_tre, "result == 1", target="f").status == PROVED                # the try returned: else is skipped
+    assert prove(_tre, "result == 3", target="f").status != PROVED
+    _feb = "def f(n: int):\n    for i in range(n):\n        if i == 0:\n            break\n    else:\n        return 100\n    return 1\n"
+    assert prove(_feb, "result == 1", requires="n >= 1", target="f").status == PROVED   # break skips the else
+    assert prove(_feb, "result == 100", requires="n >= 1", target="f").status == REFUTED
+    # -- negative indexing is legal Python, not a bounds trap; unguarded it still traps on the empty list.
+    assert check("def f(a: list):\n    if len(a) > 0:\n        return a[-1]\n    return 0\n", target="f").status == PROVED
+    assert check("def f(a: list):\n    return a[-1]\n", target="f").status == REFUTED
+    # -- bool is an int: a True key reads the 1 entry, isinstance(bool, int) holds, 1 == 1.0 across sorts.
+    assert prove("def f():\n    d = {1: 10}\n    return d[True]\n", "result == 10", target="f").status == PROVED
+    _bii = "def f(x: bool):\n    if isinstance(x, int):\n        return 1\n    return 0\n"
+    assert prove(_bii, "result == 1", target="f").status == PROVED
+    assert prove(_bii, "result == 0", target="f").status == REFUTED
+    assert prove("def f():\n    return 1 == 1.0\n", "result == True", target="f").status == PROVED
+    assert prove("def f():\n    return 1 == 1.0\n", "result == False", target="f").status == REFUTED
+    _s1t = "def f():\n    s = {1, True}\n    return len(s)\n"                     # {1, True} == {1}: len is 1
+    assert prove(_s1t, "result == 2", target="f").status != PROVED
+    assert prove(_s1t, "result == 1", target="f").status != REFUTED
+    # -- expression semantics: chained comparison, short-circuit protection, vacuous all, string ordering/membership.
+    assert prove("def f(a, b, c):\n    return a < b < c\n", "result == (a < b and b < c)", target="f").status == PROVED
+    assert check("def f(x: int):\n    return x == 0 or 10 // x > 0\n", target="f").status == PROVED
+    assert prove("def f():\n    return all(())\n", "result == True", target="f").status == PROVED
+    assert prove("def f():\n    return '' in 'abc'\n", "result == True", target="f").status == PROVED
+    assert prove("def f():\n    return 'apple' < 'banana'\n", "result == True", target="f").status == PROVED
+    assert check("def f():\n    return 'ab' * (0 - 1)\n", target="f").status == PROVED   # negative repetition: '', no trap
+    # -- IEEE and math edges: the exact double sum, and sqrt(-0.0) == -0.0 raising nothing (-0.0 is not < 0).
+    assert prove("def f():\n    return 0.1 + 0.2\n", "result == 0.3", target="f").status == REFUTED
+    assert prove("def f():\n    return 0.1 + 0.2\n", "result == 0.30000000000000004", target="f").status == PROVED
+    assert check("import math\ndef f():\n    return math.sqrt(-0.0)\n", target="f").status == PROVED
+    # -- containers: an empty descending range, total dict.get, max of a possibly-empty list.
+    assert prove("def f():\n    s = 0\n    for i in range(5, 0):\n        s = s + i\n    return s\n",
+                 "result == 0", target="f").status == PROVED                      # range(5, 0) is empty
+    assert check("def f():\n    return range(5, 0)[0]\n", target="f").status == REFUTED
+    assert check("def f(d: dict, k):\n    return d.get(k)\n", target="f").status == PROVED
+    assert check("def f(a: list):\n    return max(a)\n", target="f").status == REFUTED
+    assert check("def f(a: list):\n    if len(a) > 0:\n        return max(a)\n    return 0\n", target="f").status == PROVED
+    # -- Unicode case mapping changes length ('ss'), so a length-preservation claim must never prove.
+    assert prove("def f(s: str):\n    return s.upper()\n", "len(result) == len(s)", target="f").status != PROVED
+    # -- aliased mutation, the compositions the grammar fuzzer surfaced: del is seen through the alias, a
+    # forgotten alias can still mutate the shared object (so no name keeps a precise copy), and a slice COPY
+    # is not an alias (mutating the source must not refute a read of the copy).
+    assert prove("def f():\n    a = [[1], [2]]\n    b = a\n    del a[0]\n    return len(b)\n",
+                 "result == 2", target="f").status != PROVED                      # CPython: len(b) == 1
+    assert prove("def f():\n    a = [1, 1]\n    b = a\n    a[0] = 1\n    b.append(0)\n    return len(a)\n",
+                 "result == 2", target="f").status != PROVED                      # CPython: len(a) == 3
+    assert check("def f():\n    a = [2, 0]\n    d = a[:]\n    a.insert(0, 2)\n    a += [0]\n    return len(d)\n",
+                 target="f").status != REFUTED                                    # a clean function: d is a copy
 
     # count the asserts by parsing the whole file and walking run_self_tests. inspect.getsource's block detection can under-read the function on some platforms, so the full-file parse is primary, inspect the fallback for a frozen or source-less install.
     try:

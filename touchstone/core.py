@@ -976,6 +976,15 @@ class _PowVal(_Opaque):
     __slots__ = ()
 
 
+class _ForgottenVal(_Opaque):
+    """A name forgotten after an in-place mutation elsewhere (b after b = a; a += [x] / a.append(x)): its
+    true state is the mutated object's, which the by-value engine no longer tracks. Unlike a parameter
+    opaque -- where a bounds refutation is sound because some CALLER value realizes it -- this ignorance is
+    the engine's own, so a subscript, slice, or item store through it declines (Unsupported) rather than
+    refute a trap no input controls or prove one absent it cannot see."""
+    __slots__ = ()
+
+
 class _SafeContainer(_Opaque):
     """A parameter inferred or annotated as a sequence: iteration and len on it raise no trap and its
     elements are arbitrary integers. An integer index c[i] is bounds-checked against c's symbolic length
@@ -5237,6 +5246,11 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 for b in (node.slice.lower, node.slice.upper, node.slice.step):   # but a bound expression can (10 // k)
                     if b is not None:
                         ev(b, env, ctx)
+                if isinstance(base, _ForgottenVal):
+                    # a slice of a FORGOTTEN container must not become a fresh-length sequence whose later
+                    # index refutes: the length uncertainty is the engine's own (post-mutation), not an
+                    # input's, so no counterexample realizes it -- decline instead.
+                    raise Unsupported("a slice of a container forgotten after an in-place mutation")
                 # a slice is a sub-sequence, never a scalar -- model it as an opaque sequence, not a fresh int,
                 # so a later arithmetic op on it abstains (Unsupported -> UNKNOWN) rather than fabricating a
                 # scalar trap: an opaque ndarray's a[1:] / a[:-1] (diffusers VQ-diffusion alpha_schedules) must
@@ -6076,16 +6090,22 @@ def _forget_inplace_aliases(name, obj, env, args=()):
     if obj is None or not (isinstance(obj, _ListLit) or isinstance(obj, _MapVal)
                            or (isinstance(obj, _SafeContainer) and not obj.immutable)):
         return
+    forgot = False
     for nm in list(env):
         if nm != name and _holds_identity(env[nm], obj):
-            env[nm] = _Opaque(nm)
+            env[nm] = _ForgottenVal(nm); forgot = True
     mname = getattr(obj, "name", None)
     if mname in args:
         for pn in args:
             pv = env.get(pn)
             if (pn != mname and isinstance(pv, _Opaque)
                     and not (isinstance(pv, _SafeContainer) and pv.immutable)):
-                env[pn] = _Opaque(pn)
+                env[pn] = _ForgottenVal(pn); forgot = True
+    if forgot:
+        # the object stays reachable through the forgotten aliases, and a duck-typed method through one
+        # (b.append(x)) still mutates it -- so the target's own precise post-state would go stale next; an
+        # aliased object, once mutated, is tracked through NO name. A single-observer mutation stays exact.
+        env[name] = _ForgottenVal(name)
 
 
 def _assign_target(tgt, val, env, ctx):
@@ -6102,6 +6122,8 @@ def _assign_target(tgt, val, env, ctx):
         base = ev(tgt.value, env, ctx)
         if not isinstance(base, _Opaque):
             raise Unsupported("item assignment to a possibly non-container")
+        if isinstance(base, _ForgottenVal):
+            raise Unsupported("an item store through a container forgotten after an in-place mutation")
         if isinstance(base, _NdArray):
             _nd_store_traps(base, tgt.slice, env, ctx)       # ndarray a[i] = v: bounds-check each axis
         else:
@@ -6402,6 +6424,8 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                             nxt.append((e2, p)); continue                     # object: an alias would read stale
                         if not isinstance(base, _Opaque):    # a scalar -> UNKNOWN; a sequence parameter is bounds-
                             raise Unsupported("item assignment to a possibly non-container")   # checked like a load
+                        if isinstance(base, _ForgottenVal):
+                            raise Unsupported("an item store through a container forgotten after an in-place mutation")
                         if isinstance(base, _NdArray):
                             _nd_store_traps(base, tgt.slice, e, ctx)   # ndarray a[i] = v: bounds-check each axis
                         else:
@@ -6423,15 +6447,15 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                             # a list literal, a defaultdict) is not aliasable across the call and keeps its precise model.
                             _rn2 = _recv_root_name(tgt.value)
                             if _rn2 is not None and _rn2 in e2:
-                                e2[_rn2] = _Opaque(_rn2)
+                                e2[_rn2] = _ForgottenVal(_rn2)
                             for _nm in list(e2):
                                 if _nm != _rn2 and _holds_identity(e2[_nm], base):
-                                    e2[_nm] = _Opaque(_nm)
+                                    e2[_nm] = _ForgottenVal(_nm)
                             for _pn in args:
                                 _pv = e2.get(_pn)
                                 if (_pn != _bn and isinstance(_pv, _Opaque)
                                         and not (isinstance(_pv, _SafeContainer) and _pv.immutable)):
-                                    e2[_pn] = _Opaque(_pn)
+                                    e2[_pn] = _ForgottenVal(_pn)
                         nxt.append((e2, p))
                     else:
                         raise Unsupported("complex assignment target")
@@ -6454,7 +6478,9 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                             load = ast.copy_location(ast.Subscript(value=tg.value, slice=tg.slice, ctx=ast.Load()), tg)
                             ev(load, e2, ctx)                 # del c[i]: the IndexError / KeyError a read would raise
                             if isinstance(tg.value, ast.Name):
-                                e2[tg.value.id] = _Opaque(tg.value.id)   # the container's contents change: opaque afterward
+                                _old = e2.get(tg.value.id)    # del mutates the ONE object: every alias (b = a) sees
+                                e2[tg.value.id] = _ForgottenVal(tg.value.id)   # the shrunk list, so the stale copies
+                                _forget_inplace_aliases(tg.value.id, _old, e2, args)   # are forgotten with the root
                         else:
                             raise Unsupported("del of a non-name target")
                     nxt.append((e2, p))
@@ -6508,7 +6534,7 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                     rn = (_recv_root_name(c.func.value)       # attribute of one (a[0].append(x), self.xs.pop())
                           if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) else None)
                     if rn is not None and rn in e:            # -- may mutate the container, so forget the ROOT
-                        e2 = dict(e); e2[rn] = _Opaque(rn)    # name: a later read is opaque, not a stale value.
+                        e2 = dict(e); e2[rn] = _ForgottenVal(rn)   # name: a later read abstains, not a stale value.
                         if c.func.attr in _MUTATING_METHODS:  # a mutator (append/pop/...) changes the object in
                             try:                              # place; the value engine has no shared identity, so an
                                 _obj = ev(c.func.value, e, ctx)   # alias (b = a) or a shared row ([[0]]*2) would read
@@ -6517,7 +6543,7 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                             if _obj is not None:
                                 for _nm in list(e2):
                                     if _nm != rn and _holds_identity(e2[_nm], _obj):
-                                        e2[_nm] = _Opaque(_nm)
+                                        e2[_nm] = _ForgottenVal(_nm)
                                 # inter-parameter aliasing: the caller may pass the same object as two parameters
                                 # (f(l, l)), and the value engine cannot prove two object/container parameters
                                 # distinct. If the mutated object denotes a parameter, forget every OTHER mutable
@@ -6529,7 +6555,7 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                                         _pv = e2.get(_pn)
                                         if (_pn != _mname and isinstance(_pv, _Opaque)
                                                 and not (isinstance(_pv, _SafeContainer) and _pv.immutable)):
-                                            e2[_pn] = _Opaque(_pn)
+                                            e2[_pn] = _ForgottenVal(_pn)
                         nxt.append((e2, p))
                     else:
                         nxt.append((e, p))
@@ -7834,6 +7860,16 @@ def _spawn_worker(worker, args, timeout, extract, fallback):
     mainfile = getattr(sys.modules.get("__main__"), "__file__", None)
     if mainfile is None or mainfile.startswith("<"):             # REPL / stdin / -c: spawn cannot re-import
         return fallback()
+    # spawn RE-IMPORTS __main__ in the child: idempotent for touchstone's own entry points (python -m
+    # touchstone.ci / .cli), but a user script calling check()/scan() at its top level would re-execute
+    # itself -- side effects included -- once per sandbox call. Any foreign __main__ routes to the
+    # standalone child, which runs the subject from a pickled job and never imports the caller.
+    try:
+        _pkg = os.path.normcase(os.path.dirname(os.path.abspath(__file__)))
+        if not os.path.normcase(os.path.abspath(mainfile)).startswith(_pkg):
+            return fallback()
+    except Exception:
+        return fallback()
     try:
         ctx = mp.get_context("spawn")                            # uniform across platforms; no fork inheritance
         q = ctx.Queue()
@@ -8164,7 +8200,11 @@ def _apply_assigns(stmts, state, ctx, raise_is_trap=False):
             rn = (_recv_root_name(c.func.value)              # of one -- may mutate the container, so forget the
                   if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) else None)   # ROOT name (a fresh
             if rn is not None and rn in st:                  # value) so a later read is not a stale pre-mutation one
-                st = dict(st); st[rn] = z3.FreshInt("mut_" + rn)
+                st = dict(st)
+                _prev = st[rn]                               # a mutated CONTAINER havocs to a forgotten value (an int
+                st[rn] = (z3.FreshInt("mut_" + rn)           # havoc would make a later a + [x] / a[i] read as a scalar
+                          if z3.is_expr(_prev) and (z3.is_int(_prev) or z3.is_bool(_prev))   # op and fabricate its
+                          else _ForgottenVal(rn))            # TypeError); a numeric receiver havocs numeric as before
         elif BEST_EFFORT:                                    # an unmodeled statement: havoc the names it assigns (lower trust)
             _best_effort_assume()
             st = dict(st)
@@ -8518,6 +8558,9 @@ def _cvc5_run_smt(smt, nonlinear, timeout_s=8):
     try:
         import cvc5
         solver = cvc5.Solver()
+        solver.setOption("fresh-binders", "true")            # z3 serializes let-bound k!N symbols; without this the
+        #                                                      parser warns "Constructing a fresh variable for k!N"
+        #                                                      to stderr on every query while doing the same thing
         if nonlinear:                                        # CAD nonlinear extension, deterministically rlimit-bounded
             solver.setOption("nl-ext", "full")
             solver.setOption("nl-cov", "true")

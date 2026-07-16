@@ -288,7 +288,10 @@ Every construct is encoded soundly or returned as UNKNOWN with a reason; an unsu
 silently skipped. A PROVED is confirmed by a second, independent procedure -- cvc5 where the fragment
 round-trips, otherwise a checked SOS certificate or the real-relaxation nlsat lane, with the certificate naming
 which backed it; a verdict the second procedure refutes is reported as a prover bug, and when cvc5 is absent the
-PROVED degrades to a labeled single-solver result. Verification runs under a deterministic resource bound, so
+PROVED degrades to a labeled single-solver result. The certificate attests that two independent solvers agreed
+on the encoded query under a deterministic budget -- it cannot attest that the encoding is CPython, which is
+what the machine-checked core (for its fragment) and the differential audits below (for the modeled remainder)
+enforce. Verification runs under a deterministic resource bound, so
 identical input yields an identical verdict on every machine; `proof_bundle` exports a re-checkable bundle (the
 discharged SMT-LIB queries, solver versions, configuration, and a content hash) that `recheck_bundle` or any SMT
 solver re-verifies. `prove` / `verify` / `check` establish partial correctness (no trap and the postcondition

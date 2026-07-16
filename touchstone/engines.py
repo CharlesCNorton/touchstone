@@ -5370,7 +5370,15 @@ def verify_chc(prop, target, src, pre, post, repo=None) -> Verdict:
     if li.status == PROVED:                                                  # escalating the polynomial degree
         return li                                                            # (degree 3 sum-of-squares, 4 cubes)
     if args:                                                        # symbolic witness within k unrollings
-        bm = bmc_check(prop, target, src, pre, post, k=20, repo=repo)
+        # a refutation-only fallback: a genuine bounded counterexample is found cheaply (SAT comes fast),
+        # while a no-witness nonlinear query (twenty unrolled modulos, the Euclid loop) would grind the
+        # FULL proof budget for nothing -- so the BMC solve runs at an eighth of it, still deterministic,
+        # still ample for every witness, and proportional under budget escalation.
+        _prior = core.configure(solve_rlimit=max(1, core.SOLVE_RLIMIT // 8))
+        try:
+            bm = bmc_check(prop, target, src, pre, post, k=20, repo=repo)
+        finally:
+            core.configure(**_prior)
         if bm.status == REFUTED:
             return bm
     return v

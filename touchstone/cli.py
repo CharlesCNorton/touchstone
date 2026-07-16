@@ -270,6 +270,8 @@ def _report(v, src=None, repo=None, json_out=False, quiet=False, repro=None):
                 print("  counterexample: %s" % v.counterexample)
             elif v.counterexample_inputs:
                 print("  counterexample: %s" % ", ".join("%s=%s" % kv for kv in sorted(v.counterexample_inputs.items())))
+            if v.reason:
+                print("  reason: %s" % v.reason)     # the trap kind and line, and the bug-vs-validation reading
             if v.trace:
                 print("  trace:")
                 for line in v.trace.splitlines():
@@ -1160,7 +1162,7 @@ def build_parser():
     it.add_argument("--no-baseline", action="store_true", help="do not run a scan to establish a baseline")
     it.set_defaults(fn=_cmd_init)
 
-    sp = sub.add_parser("spec",
+    sp = sub.add_parser("spec", aliases=["synth"],
                         help="synthesize a contract (@require / @ensure) a function provably satisfies")
     sp.add_argument("file")
     sp.add_argument("--func", default=None, help="function to synthesize for (default: the first)")
@@ -1234,7 +1236,7 @@ def build_parser():
                     help="function to check -- a top-level name or a Class.method (default: the one in the file)")
     lc.set_defaults(fn=_cmd_lock)
 
-    tm = sub.add_parser("termination", parents=[verdict],
+    tm = sub.add_parser("termination", aliases=["terminates"], parents=[verdict],
                         help="prove a loop or recursion halts on every input (or exhibit a diverging one)")
     tm.add_argument("file")
     tm.add_argument("--func", default=None,
