@@ -1,6 +1,7 @@
 (* Trust base, part X: the tensor (numpy / torch) shape algebra in core.py -- broadcasting, concatenation,
-   matrix multiply, reshape, unsqueeze, and transpose -- over shapes as lists of natural dimensions.
-   Axiom-clean (no axioms, no Admitted), gated by verify_coq.sh. *)
+   matrix multiply, reshape, unsqueeze, transpose, the convolution / pooling output formula (floor and
+   ceil modes), flatten / unflatten, and the chunk / split partition -- over shapes as lists of natural
+   dimensions. Axiom-clean (no axioms, no Admitted), gated by verify_coq.sh. *)
 
 From Stdlib Require Import List Arith Lia.
 Import ListNotations.
@@ -87,8 +88,94 @@ Definition reshape_ok (s s' : shape) : bool := Nat.eqb (numel s) (numel s').
 Theorem reshape_ok_iff : forall s s', reshape_ok s s' = true <-> numel s = numel s'.
 Proof. intros; unfold reshape_ok; apply Nat.eqb_eq. Qed.
 
+(* Flatten folds a contiguous axis segment into one axis of its product; unflatten is the same identity read
+   the other way (_nd_method flatten(start, end) / unflatten, nn.Flatten). Both preserve the element count. *)
+Theorem flatten_numel : forall pre seg post,
+  numel (pre ++ numel seg :: post) = numel (pre ++ seg ++ post).
+Proof. intros; rewrite numel_middle, !numel_app; lia. Qed.
+
+Theorem unflatten_numel : forall pre sizes post,
+  numel (pre ++ numel sizes :: post) = numel (pre ++ sizes ++ post).
+Proof. exact flatten_numel. Qed.
+
+(* A dimension bound moves through the element count monotonically (_nd_method topk / narrow / select:
+   shrinking one axis to k <= size(dim) keeps the result no larger than the input). *)
+Theorem numel_dim_mono : forall pre a b post,
+  a <= b -> numel (pre ++ a :: post) <= numel (pre ++ b :: post).
+Proof.
+  intros pre a b post H; rewrite !numel_middle.
+  apply Nat.mul_le_mono_l, Nat.mul_le_mono_r; exact H.
+Qed.
+
+(* The convolution / pooling output dimension (_f_conv_out): out = (S + 2p - d(k-1) - 1) / s + 1 in floor
+   mode. It is monotone nondecreasing in the input dimension S, so a per-axis output bound is sound. *)
+Definition conv_out (S k s p d : nat) : nat := (S + 2 * p - d * (k - 1) - 1) / s + 1.
+
+Theorem conv_out_mono : forall S1 S2 k s p d,
+  0 < s -> S1 <= S2 -> conv_out S1 k s p d <= conv_out S2 k s p d.
+Proof.
+  intros S1 S2 k s p d Hs Hle; unfold conv_out.
+  apply Nat.add_le_mono_r, Nat.Div0.div_le_mono; lia.
+Qed.
+
+(* The output is exactly 1 when the dilated kernel spans the whole padded input -- the lower boundary the
+   model traps below (out < 1 is a RuntimeError). *)
+Theorem conv_out_exact_kernel : forall S k s p d,
+  0 < s -> S + 2 * p = d * (k - 1) + 1 -> conv_out S k s p d = 1.
+Proof.
+  intros S k s p d Hs Heq; unfold conv_out.
+  replace (S + 2 * p - d * (k - 1) - 1) with 0 by lia.
+  rewrite Nat.Div0.div_0_l; reflexivity.
+Qed.
+
+(* The ceil-mode output dominates the floor output but by at most one, so the model's ceil formula is a
+   sound (never under-counting) over-approximation of the floor size (_f_conv_out with ceil_mode). *)
+Definition conv_out_ceil (S k s p d : nat) : nat := (S + 2 * p - d * (k - 1) - 1 + (s - 1)) / s + 1.
+
+Theorem conv_out_ceil_ge_floor : forall S k s p d,
+  0 < s -> conv_out S k s p d <= conv_out_ceil S k s p d.
+Proof.
+  intros S k s p d Hs; unfold conv_out, conv_out_ceil.
+  apply Nat.add_le_mono_r, Nat.Div0.div_le_mono; lia.
+Qed.
+
+Theorem conv_out_ceil_le_succ : forall Sdim k s p d,
+  0 < s -> conv_out_ceil Sdim k s p d <= 1 + conv_out Sdim k s p d.
+Proof.
+  intros Sdim k s p d Hs; unfold conv_out, conv_out_ceil.
+  set (num := Sdim + 2 * p - d * (k - 1) - 1).
+  assert (Hlt : (num + (s - 1)) / s < num / s + 2).
+  { apply Nat.Div0.div_lt_upper_bound.
+    assert (Hmod : num mod s < s) by (apply Nat.mod_upper_bound; lia).
+    assert (Hdm : num = s * (num / s) + num mod s) by (apply Nat.div_mod_eq).
+    lia. }
+  lia.
+Qed.
+
+(* Chunk / split partition an axis of size n into pieces of size at most `per` whose sizes SUM to n, so the
+   concatenation of the pieces recovers the original axis (the model's per-piece _nd_like shapes). *)
+Fixpoint pieces (n per : nat) (fuel : nat) : list nat :=
+  match fuel with
+  | 0 => []
+  | S f => if Nat.leb n per then [n] else per :: pieces (n - per) per f
+  end.
+
+Theorem pieces_sum : forall fuel n per, 0 < per -> n <= per * fuel ->
+  fold_right Nat.add 0 (pieces n per fuel) = n.
+Proof.
+  induction fuel as [|f IH]; intros n per Hper Hfuel; simpl in *.
+  - lia.
+  - destruct (Nat.leb_spec n per) as [Hle|Hgt]; simpl.
+    + lia.
+    + rewrite IH by lia. lia.
+Qed.
+
 Print Assumptions cat_numel.
 Print Assumptions bcast_dim_max.
 Print Assumptions matmul_out_numel.
 Print Assumptions transpose_numel.
 Print Assumptions reshape_ok_iff.
+Print Assumptions flatten_numel.
+Print Assumptions conv_out_mono.
+Print Assumptions conv_out_ceil_le_succ.
+Print Assumptions pieces_sum.

@@ -1055,11 +1055,25 @@ class _NdArray(_Opaque):
     yields the lower-rank subarray (a scalar at full depth); reshape adjusts the shape with a total-size-mismatch
     trap; element-wise arithmetic broadcasts (a non-broadcastable pair is a ValueError); a min / max reduction
     of a zero-size array is a ValueError; a negative constructed dimension is a ValueError. Constructed only for
-    an N-d (tuple) shape or a nested-list array; a 1-D scalar-shape array stays a _SafeContainer."""
-    __slots__ = ("shape",)
-    def __init__(self, shape):
+    an N-d (tuple) shape or a nested-list array; a 1-D scalar-shape array stays a _SafeContainer.
+    `origin` records the constructing library ('torch' / 'np' / None) so the methods whose semantics diverge
+    (torch .t() raises above rank 2, numpy .repeat interleaves where torch's tiles) decide per library and
+    abstain when the origin is unknown. `dtype` is the element KIND where provable ('int' / 'float' / 'bool' /
+    None) -- set by constructors and casts, cleared by arithmetic -- consulted only where torch requires an
+    integer tensor (embedding / one_hot indices), never to prove a dtype error absent."""
+    __slots__ = ("shape", "origin", "dtype")
+    def __init__(self, shape, origin=None, dtype=None):
         super().__init__("ndarray")
         self.shape = tuple(shape)
+        self.origin = origin
+        self.dtype = dtype
+
+
+def _nd_like(src, shape, dtype="keep"):
+    """A derived array carrying the source's origin (and, unless overridden, dtype kind), so a chained
+    method (torch.zeros(2, 3).float().t()) keeps the library-specific semantics decidable."""
+    return _NdArray(shape, origin=getattr(src, "origin", None),
+                    dtype=(getattr(src, "dtype", None) if dtype == "keep" else dtype))
 
 
 class _Column(_NdArray):
@@ -2483,6 +2497,7 @@ class Ctx:
         #                  inliner cannot unfold them, so a call is modeled as a fresh result with no imported trap
         #                  (the orchestration sets this only after proving each callee trap free, so it is sound)
         self.func_aliases: frozenset = frozenset()           # names the module binds to torch.nn.functional (per symexec)
+        self.nn_aliases: frozenset = frozenset()             # names the module binds to torch.nn (per symexec)
 
     def summary(self, name: str):
         if name in self._summary:
@@ -2643,17 +2658,17 @@ def _np_array_ctor(name, node, env, ctx):
         if isinstance(a0, (ast.List, ast.Tuple)) and not any(isinstance(e, ast.Starred) for e in a0.elts):
             shp = _nested_list_shape(a0)
             if shp is not None and len(shp) > 1:
-                return _NdArray(tuple(z3.IntVal(d) for d in shp))                  # array([[..], [..]]) -> an N-d ndarray
-            return _NdArray((z3.IntVal(len(a0.elts)),))                            # array([...]) -> a 1-D ndarray
+                return _NdArray(origin='np', shape=tuple(z3.IntVal(d) for d in shp))                  # array([[..], [..]]) -> an N-d ndarray
+            return _NdArray(origin='np', shape=(z3.IntVal(len(a0.elts)),))                            # array([...]) -> a 1-D ndarray
         if args and isinstance(args[0], _SafeContainer) and not args[0].unindexable:
-            return _NdArray((_container_len(args[0], ctx),))                       # array(seq) -> a 1-D ndarray of seq's length
+            return _NdArray(origin='np', shape=(_container_len(args[0], ctx),))                       # array(seq) -> a 1-D ndarray of seq's length
         return _abstain()
 
     if name == "arange":
         if not args or len(args) > 2 or any(not (z3.is_expr(x) and z3.is_int(x)) for x in args):
             return _abstain()                                 # float range, 3-arg step, or opaque -> abstain
         n = args[0] if len(args) == 1 else args[1] - args[0]
-        return _NdArray((z3.If(n < 0, z3.IntVal(0), n),))     # a 1-D ndarray, empty for a nonpositive count
+        return _NdArray(origin='np', shape=(z3.If(n < 0, z3.IntVal(0), n),))     # a 1-D ndarray, empty for a nonpositive count
 
     if args and isinstance(args[0], tuple):                   # zeros / ones / empty / full((m, n, ...)): an N-d ndarray
         dims = list(args[0])
@@ -2661,14 +2676,14 @@ def _np_array_ctor(name, node, env, ctx):
             if ctx.traps is not None:
                 for d in dims:
                     ctx.traps.append(z3.And(ctx.pc, d < 0))   # ValueError: negative dimensions are not allowed
-            return _NdArray(tuple(z3.If(d < 0, z3.IntVal(0), d) for d in dims))
+            return _NdArray(origin='np', shape=tuple(z3.If(d < 0, z3.IntVal(0), d) for d in dims))
         return _abstain()                                     # a float / opaque dimension in the shape tuple
     if not args or not (z3.is_expr(args[0]) and z3.is_int(args[0])):   # zeros / ones / empty / full: arg 0 is shape
         return _abstain()                                     # a float or an opaque size
     n = args[0]
     if ctx.traps is not None:
         _trap_add(ctx, z3.And(ctx.pc, n < 0), ("ValueError",))   # ValueError: negative dimensions are not allowed
-    return _NdArray((z3.If(n < 0, z3.IntVal(0), n),))         # a 1-D ndarray
+    return _NdArray(origin='np', shape=(z3.If(n < 0, z3.IntVal(0), n),))         # a 1-D ndarray
 
 
 def _nd_size(shape):
@@ -2712,11 +2727,11 @@ def _nd_binop(l, r, ctx):
             out.append(z3.If(dl == 1, dr, dl))
         if ctx.traps is not None:
             ctx.traps.append(z3.And(ctx.pc, z3.Not(ok)))     # operands could not be broadcast together: ValueError
-        return cls(tuple(reversed(out)))
+        return cls(tuple(reversed(out)), origin=l.origin if l.origin == r.origin else None)
     nd = l if isinstance(l, _NdArray) else r
     other = r if isinstance(l, _NdArray) else l
     if z3.is_expr(other) and (z3.is_int(other) or z3.is_bool(other) or _is_fp(other)):
-        return cls(nd.shape)                                 # ndarray / column OP scalar: same shape, opaque elements
+        return cls(nd.shape, origin=nd.origin)               # ndarray / column OP scalar: same shape, opaque elements
     raise Unsupported("ndarray operation with a non-scalar operand")
 
 
@@ -2733,6 +2748,33 @@ def _broadcast_shapes(shapes):
             dim = z3.If(dim == 1, d, dim)
         out.append(dim)
     return tuple(reversed(out)), ok
+
+
+def _cint(v):
+    """The python int a term provably denotes (folding a unary minus / bool), else None. The axis and
+    dimension arguments arrive as unsimplified z3 terms (-1 parses as 0 - 1), so every constant-argument
+    branch resolves them through one place."""
+    if z3.is_expr(v) and (z3.is_int(v) or z3.is_bool(v)):
+        s = z3.simplify(_as_int(v))
+        if z3.is_int_value(s):
+            return s.as_long()
+    return None
+
+
+def _dim_trap(arr, d, ctx, extra=0):
+    """The IndexError torch raises for a dim argument outside [-(rank+extra), rank+extra) -- extra=1 for the
+    inserting ops (unsqueeze / stack), whose valid range is one wider. d may be symbolic; the rank is static."""
+    rank = len(arr.shape) + extra
+    if ctx.traps is not None and z3.is_expr(d):
+        _trap_add(ctx, z3.And(ctx.pc, z3.Or(_as_int(d) < -rank, _as_int(d) >= rank)), ("IndexError",))
+
+
+def _kwval(node, env, ctx, *names):
+    """The evaluated value of the first keyword argument named in `names`, else None."""
+    for k in node.keywords:
+        if k.arg in names:
+            return ev(k.value, env, ctx)
+    return None
 
 
 def _matmul(l, r, ctx):
@@ -2759,7 +2801,7 @@ def _matmul(l, r, ctx):
         ok, out = z3.And(sl[-1] == sr[-2], bok), batch + (sl[-2], sr[-1])
     if ctx.traps is not None:
         ctx.traps.append(z3.And(ctx.pc, z3.Not(ok)))
-    return cls(out) if out else _Opaque("matmul")
+    return cls(out, origin=l.origin if l.origin == r.origin else None) if out else _Opaque("matmul")
 
 
 def _cat_shape(tensors, dim, ctx):
@@ -2783,7 +2825,7 @@ def _cat_shape(tensors, dim, ctx):
                 if k != d:
                     ctx.traps.append(z3.And(ctx.pc, base[k] != t.shape[k]))   # a mismatched non-cat axis
         total = total + t.shape[d]
-    return _NdArray(base[:d] + (total,) + base[d + 1:])
+    return _nd_like(nds[0], base[:d] + (total,) + base[d + 1:])
 
 
 def _stack_shape(tensors, dim, ctx):
@@ -2802,7 +2844,7 @@ def _stack_shape(tensors, dim, ctx):
     rank = len(s0)
     d = dim if dim >= 0 else rank + 1 + dim
     d = max(0, min(d, rank))
-    return _NdArray(s0[:d] + (z3.IntVal(len(nds)),) + s0[d:])
+    return _nd_like(nds[0], s0[:d] + (z3.IntVal(len(nds)),) + s0[d:])
 
 
 def _nd_method(arr, meth, a, node, env, ctx):
@@ -2850,14 +2892,13 @@ def _nd_method(arr, meth, a, node, env, ctx):
             ctx.traps.append(z3.And(ctx.pc, _nd_size(arr.shape) == 0))      # ValueError: zero-size reduction
         keepdim = any(k.arg in ("keepdim", "keepdims") and isinstance(k.value, ast.Constant)
                       and bool(k.value.value) for k in node.keywords)
-        cand = a[0] if a else next((ev(k.value, env, ctx) for k in node.keywords
-                                    if k.arg in ("axis", "dim")), None)
+        cand = a[0] if a else _kwval(node, env, ctx, "axis", "dim")
         axes = None
         if isinstance(cand, tuple):                          # a tuple of axes: reduce each
-            ix = [v.as_long() for v in cand if z3.is_expr(v) and z3.is_int_value(v)]
-            axes = ix if len(ix) == len(cand) else None
-        elif z3.is_expr(cand) and z3.is_int_value(cand):
-            axes = [cand.as_long()]
+            ix = [_cint(v) for v in cand]
+            axes = ix if all(x is not None for x in ix) else None
+        elif _cint(cand) is not None:
+            axes = [_cint(cand)]
         if meth in ("all", "any") and axes is None:
             return z3.FreshConst(z3.BoolSort(), "ndall")     # a.all() / a.any() with no axis: a scalar bool
         if axes is None:
@@ -2870,23 +2911,84 @@ def _nd_method(arr, meth, a, node, env, ctx):
         rest = (tuple(z3.IntVal(1) if k in norm else d for k, d in enumerate(arr.shape)) if keepdim
                 else tuple(d for k, d in enumerate(arr.shape) if k not in norm))
         if meth in ("all", "any"):
-            return _NdArray(rest) if rest else z3.FreshConst(z3.BoolSort(), "ndall")
-        return _NdArray(rest) if rest else _Opaque("ndreduce")
+            return _nd_like(arr, rest, dtype="bool") if rest else z3.FreshConst(z3.BoolSort(), "ndall")
+        return _nd_like(arr, rest) if rest else _Opaque("ndreduce")
     if meth in ("ravel", "flatten"):
-        return _NdArray((_nd_size(arr.shape),)) if not a else _Opaque("flatten")   # full flatten -> 1-D; partial -> opaque
-    if meth == "unsqueeze" and a and z3.is_expr(a[0]) and z3.is_int_value(a[0]):
-        d, rank = a[0].as_long(), len(arr.shape)
+        if not a and not node.keywords:
+            return _nd_like(arr, (_nd_size(arr.shape),))                           # full flatten -> 1-D
+        if meth == "flatten":                                                      # flatten(start_dim, end_dim):
+            rank = len(arr.shape)                                                  # fold the [start, end] segment
+            s = _cint(a[0]) if a else _cint(_kwval(node, env, ctx, "start_dim"))
+            e = _cint(a[1]) if len(a) > 1 else _cint(_kwval(node, env, ctx, "end_dim"))
+            if s is None and not a and not any(k.arg == "start_dim" for k in node.keywords):
+                s = 0                                                              # only end_dim given: start defaults
+            if e is None and len(a) <= 1 and not any(k.arg == "end_dim" for k in node.keywords):
+                e = -1                                                             # only start_dim given: end defaults
+            if s is not None and e is not None and rank:
+                sn, en = (s if s >= 0 else rank + s), (e if e >= 0 else rank + e)
+                if not (0 <= sn < rank and 0 <= en < rank) or sn > en:
+                    if ctx.traps is not None:
+                        _trap_add(ctx, ctx.pc, ("IndexError",))                    # dim out of range
+                    return _Opaque("flatten")
+                folded = z3.IntVal(1)
+                for d in arr.shape[sn:en + 1]:
+                    folded = folded * d
+                return _nd_like(arr, arr.shape[:sn] + (folded,) + arr.shape[en + 1:])
+        return _Opaque("flatten")
+    if meth == "unflatten" and len(a) == 2 and _cint(a[0]) is not None and isinstance(a[1], tuple):
+        rank = len(arr.shape)
+        dd = _cint(a[0]) % rank if rank else 0
+        sizes = [(_as_int(d) if z3.is_expr(d) else None) for d in a[1]]
+        if rank and all(sv is not None for sv in sizes):
+            infer = [k for k, sv in enumerate(sizes) if _cint(sv) == -1]
+            if len(infer) <= 1:
+                if ctx.traps is not None and not infer:
+                    prod = z3.IntVal(1)
+                    for sv in sizes:
+                        prod = prod * sv
+                    _trap_add(ctx, z3.And(ctx.pc, prod != arr.shape[dd]), ("RuntimeError",))   # sizes must multiply out
+                new = tuple(z3.FreshInt("uf") if _cint(sv) == -1 else sv for sv in sizes)
+                return _nd_like(arr, arr.shape[:dd] + new + arr.shape[dd + 1:])
+        return _Opaque("unflatten")
+    if meth == "squeeze" and (a or node.keywords):
+        d = _cint(a[0]) if a else _cint(_kwval(node, env, ctx, "dim"))
+        rank = len(arr.shape)
+        if d is None or not rank:
+            raise Unsupported("squeeze with a non-constant dim")
+        if not (-rank <= d < rank):
+            if ctx.traps is not None:
+                _trap_add(ctx, ctx.pc, ("IndexError",))                            # dim out of range
+            return _Opaque("squeeze")
+        dd = d % rank
+        sz = _cint(arr.shape[dd])
+        if sz == 1:
+            rest = arr.shape[:dd] + arr.shape[dd + 1:]
+            return _nd_like(arr, rest) if rest else _Opaque("squeeze")             # the size-1 axis drops
+        if sz is not None:
+            return _nd_like(arr, arr.shape)                                        # a non-1 axis is kept
+        raise Unsupported("squeeze of a symbolic-size axis (the rank is value-dependent)")
+    if meth == "unsqueeze" and a:
+        _dim_trap(arr, a[0], ctx, extra=1)                                         # IndexError outside [-(rank+1), rank]
+        d = _cint(a[0])
+        if d is None:
+            raise Unsupported("unsqueeze with a non-constant dim")
+        rank = len(arr.shape)
         dd = max(0, min(d if d >= 0 else rank + 1 + d, rank))
-        return _NdArray(arr.shape[:dd] + (z3.IntVal(1),) + arr.shape[dd:])         # insert a size-1 axis
+        return _nd_like(arr, arr.shape[:dd] + (z3.IntVal(1),) + arr.shape[dd:])    # insert a size-1 axis
     if meth in ("permute", "movedim", "swapaxes") or (meth == "transpose" and a):
         dims = list(a[0]) if (len(a) == 1 and isinstance(a[0], tuple)) else a
-        ix = [d.as_long() for d in dims if z3.is_expr(d) and z3.is_int_value(d)]
+        ix = [d for d in (_cint(x) for x in dims) if d is not None]
         rank = len(arr.shape)
+        if rank and ctx.traps is not None:
+            for d in ix:
+                if not (-rank <= d < rank):
+                    _trap_add(ctx, ctx.pc, ("IndexError",))                        # dim out of range
+                    return _Opaque("permute")
         if meth == "permute" and len(ix) == rank and sorted(i % rank for i in ix if rank) == list(range(rank)):
-            return _NdArray(tuple(arr.shape[i % rank] for i in ix))               # reorder axes
+            return _nd_like(arr, tuple(arr.shape[i % rank] for i in ix))          # reorder axes
         if meth in ("swapaxes", "transpose", "movedim") and len(ix) == 2 and rank:
             sh = list(arr.shape); i, j = ix[0] % rank, ix[1] % rank; sh[i], sh[j] = sh[j], sh[i]
-            return _NdArray(tuple(sh))                                            # swap two axes
+            return _nd_like(arr, tuple(sh))                                       # swap two axes
         return _Opaque("permute")                                                # non-constant axes: opaque, trap-free
     if meth in ("expand", "broadcast_to", "expand_as", "reshape_as", "view_as"):
         if meth in ("expand_as", "reshape_as", "view_as"):
@@ -2896,20 +2998,46 @@ def _nd_method(arr, meth, a, node, env, ctx):
             return _NdArray(tuple(arr.shape[k] if (z3.is_int_value(d) and d.as_long() == -1) else d
                                   for k, d in enumerate(dims)))                   # a -1 keeps the original axis
         return _Opaque("expand")
-    if meth in ("repeat", "tile", "repeat_interleave"):
+    if meth == "tile" or (meth == "repeat" and arr.origin == "torch"):
         reps = list(a[0]) if (len(a) == 1 and isinstance(a[0], tuple)) else a
-        if meth != "repeat_interleave" and reps and all(z3.is_expr(r) and z3.is_int(r) for r in reps) \
-                and len(reps) >= len(arr.shape):
-            pad = [z3.IntVal(1)] * (len(reps) - len(arr.shape)) + list(arr.shape)
-            return _NdArray(tuple(p * r for p, r in zip(pad, reps)))             # each axis repeated reps[k] times
+        if reps and all(z3.is_expr(r) and z3.is_int(r) for r in reps):
+            if len(reps) < len(arr.shape) and meth == "repeat":
+                if ctx.traps is not None:                    # torch .repeat needs at least ndim repeats
+                    _trap_add(ctx, ctx.pc, ("RuntimeError",))
+                return _Opaque("repeat")
+            pad = [z3.IntVal(1)] * max(0, len(reps) - len(arr.shape)) + list(arr.shape)
+            reps = [z3.IntVal(1)] * max(0, len(arr.shape) - len(reps)) + list(reps)
+            return _nd_like(arr, tuple(p * r for p, r in zip(pad, reps)))        # each axis tiled reps[k] times
         return _Opaque("repeat")
-    if meth == "narrow" and len(a) == 3 and z3.is_expr(a[0]) and z3.is_int_value(a[0]) and len(arr.shape):
-        dd = a[0].as_long() % len(arr.shape)
-        return _NdArray(arr.shape[:dd] + (a[2],) + arr.shape[dd + 1:])           # axis dd shrinks to the given length
-    if meth == "select" and len(a) == 2 and z3.is_expr(a[0]) and z3.is_int_value(a[0]) and len(arr.shape):
-        dd = a[0].as_long() % len(arr.shape)
+    if meth == "repeat" and arr.origin == "np":              # numpy .repeat interleaves elements: no axis
+        ax = _cint(a[1]) if len(a) > 1 else _cint(_kwval(node, env, ctx, "axis"))   # flattens to 1-D of size*n
+        n = a[0] if (a and z3.is_expr(a[0]) and z3.is_int(a[0])) else None
+        if n is None:
+            return _Opaque("repeat")
+        if ctx.traps is not None:
+            _trap_add(ctx, z3.And(ctx.pc, n < 0), ("ValueError",))               # negative repeats
+        if ax is None and not (len(a) > 1 or node.keywords):
+            return _nd_like(arr, (_nd_size(arr.shape) * n,))
+        if ax is not None and -len(arr.shape) <= ax < len(arr.shape) and arr.shape:
+            dd = ax % len(arr.shape)
+            return _nd_like(arr, arr.shape[:dd] + (arr.shape[dd] * n,) + arr.shape[dd + 1:])
+        return _Opaque("repeat")
+    if meth in ("repeat", "repeat_interleave"):
+        return _Opaque("repeat")                             # unknown origin: the two libraries disagree -- no shape claim
+    if meth == "narrow" and len(a) == 3 and _cint(a[0]) is not None and len(arr.shape):
+        dd = _cint(a[0]) % len(arr.shape)
+        if ctx.traps is not None and all(z3.is_expr(x) and z3.is_int(x) for x in a[1:]):
+            size, start, length = arr.shape[dd], _as_int(a[1]), _as_int(a[2])
+            s2 = z3.If(start < 0, start + size, start)       # a negative start wraps; RuntimeError when the
+            _trap_add(ctx, z3.And(ctx.pc, z3.Or(length < 0, s2 < 0, s2 + length > size)), ("RuntimeError",))
+        return _nd_like(arr, arr.shape[:dd] + (a[2],) + arr.shape[dd + 1:])      # axis dd shrinks to the given length
+    if meth == "select" and len(a) == 2 and _cint(a[0]) is not None and len(arr.shape):
+        dd = _cint(a[0]) % len(arr.shape)
+        if ctx.traps is not None and z3.is_expr(a[1]) and z3.is_int(a[1]):
+            n = arr.shape[dd]                                # the index is bounds-checked along the selected dim
+            _trap_add(ctx, z3.And(ctx.pc, z3.Or(_as_int(a[1]) < -n, _as_int(a[1]) >= n)), ("IndexError",))
         rest = arr.shape[:dd] + arr.shape[dd + 1:]
-        return _NdArray(rest) if rest else _Opaque("select")                     # drop an axis
+        return _nd_like(arr, rest) if rest else _Opaque("select")                # drop an axis
     if meth in ("matmul", "mm", "bmm", "mv", "dot") and a and isinstance(a[0], _NdArray):
         return _matmul(arr, a[0], ctx)
     if meth in ("scatter", "scatter_add", "scatter_reduce", "masked_scatter", "index_put", "index_add",
@@ -2921,29 +3049,137 @@ def _nd_method(arr, meth, a, node, env, ctx):
             and isinstance(a[1], _NdArray) and a[1].shape and arr.shape:
         dd = a[0].as_long() % len(arr.shape)
         return _NdArray(arr.shape[:dd] + (a[1].shape[0],) + arr.shape[dd + 1:])    # axis dd shrinks to len(index)
-    if meth in ("squeeze", "unique", "nonzero", "masked_select", "gather", "take", "bincount", "topk",
-                "kthvalue", "sort", "mode", "unbind", "split", "chunk", "tensor_split", "tolist", "data_ptr",
-                "rot90", "diag", "diagonal", "trace", "outer", "kron", "cross", "einsum", "histc"):
+    if meth == "sort":                                       # sort(dim=-1) -> (values, indices), both the input shape
+        d = a[0] if a else _kwval(node, env, ctx, "dim")
+        if d is not None:
+            _dim_trap(arr, d, ctx)
+        return (_nd_like(arr, arr.shape), _nd_like(arr, arr.shape, dtype="int"))
+    if meth == "topk" and a and len(arr.shape):              # topk(k, dim=-1): RuntimeError unless 0 <= k <= size(dim)
+        k = a[0] if (z3.is_expr(a[0]) and z3.is_int(a[0])) else None
+        d = _cint(a[1]) if len(a) > 1 else _cint(_kwval(node, env, ctx, "dim"))
+        d = -1 if d is None and len(a) <= 1 and not any(kw.arg == "dim" for kw in node.keywords) else d
+        if k is not None and d is not None and -len(arr.shape) <= d < len(arr.shape):
+            dd = d % len(arr.shape)
+            if ctx.traps is not None:
+                _trap_add(ctx, z3.And(ctx.pc, z3.Or(_as_int(k) < 0, _as_int(k) > arr.shape[dd])), ("RuntimeError",))
+            out = arr.shape[:dd] + (k,) + arr.shape[dd + 1:]
+            return (_nd_like(arr, out), _nd_like(arr, out, dtype="int"))
+        return _Opaque("topk")
+    if meth == "kthvalue" and a and len(arr.shape):          # kthvalue(k, dim=-1): RuntimeError unless 1 <= k <= size(dim)
+        k = a[0] if (z3.is_expr(a[0]) and z3.is_int(a[0])) else None
+        d = _cint(a[1]) if len(a) > 1 else -1
+        if k is not None and -len(arr.shape) <= d < len(arr.shape):
+            dd = d % len(arr.shape)
+            if ctx.traps is not None:
+                _trap_add(ctx, z3.And(ctx.pc, z3.Or(_as_int(k) < 1, _as_int(k) > arr.shape[dd])), ("RuntimeError",))
+            rest = arr.shape[:dd] + arr.shape[dd + 1:]
+            if rest:
+                return (_nd_like(arr, rest), _nd_like(arr, rest, dtype="int"))
+        return _Opaque("kthvalue")
+    if meth == "chunk" and a:                                # chunk(n, dim=0): a tuple of ceil-division pieces
+        n = _cint(a[0])
+        d = _cint(a[1]) if len(a) > 1 else _cint(_kwval(node, env, ctx, "dim"))
+        d = 0 if d is None and len(a) <= 1 and not any(kw.arg == "dim" for kw in node.keywords) else d
+        if ctx.traps is not None and z3.is_expr(a[0]) and z3.is_int(a[0]):
+            _trap_add(ctx, z3.And(ctx.pc, _as_int(a[0]) <= 0), ("RuntimeError",))   # chunk count must be positive
+        if n is not None and n > 0 and d is not None and len(arr.shape) and -len(arr.shape) <= d < len(arr.shape):
+            dd = d % len(arr.shape)
+            size = _cint(arr.shape[dd])
+            if size is not None:                             # a constant axis: the exact piece sizes, python-side
+                per = -(-size // n) if size else 0           # ceil division; fewer than n pieces when size < n
+                cuts = [min(per, size - i * per) for i in range(n) if size == 0 or i * per < size] or [0]
+                return tuple(_nd_like(arr, arr.shape[:dd] + (z3.IntVal(c),) + arr.shape[dd + 1:]) for c in cuts)
+        return _Opaque("chunk")                              # a symbolic axis: the piece count is value-dependent
+    if meth == "split" and a:                                # split(size, dim=0): equal pieces, the last partial
+        sz = _cint(a[0])
+        d = _cint(a[1]) if len(a) > 1 else _cint(_kwval(node, env, ctx, "dim"))
+        d = 0 if d is None and len(a) <= 1 and not any(kw.arg == "dim" for kw in node.keywords) else d
+        if sz is not None and d is not None and len(arr.shape) and -len(arr.shape) <= d < len(arr.shape):
+            dd = d % len(arr.shape)
+            size = _cint(arr.shape[dd])
+            if ctx.traps is not None and (sz < 0 or (sz == 0 and (size is None or size > 0))):
+                _trap_add(ctx, ctx.pc, ("RuntimeError",))    # a nonpositive split size (0 only splits an empty axis)
+            if size is not None and sz > 0:
+                cuts = [min(sz, size - i * sz) for i in range(-(-size // sz))] or [0]
+                return tuple(_nd_like(arr, arr.shape[:dd] + (z3.IntVal(c),) + arr.shape[dd + 1:]) for c in cuts)
+        return _Opaque("split")
+    if meth == "unbind":                                     # unbind(dim=0): the axis unstacked into a tuple
+        d = _cint(a[0]) if a else (_cint(_kwval(node, env, ctx, "dim")) or 0)
+        if d is not None and len(arr.shape) and -len(arr.shape) <= d < len(arr.shape):
+            dd = d % len(arr.shape)
+            size = _cint(arr.shape[dd])
+            rest = arr.shape[:dd] + arr.shape[dd + 1:]
+            if size is not None and rest:
+                return tuple(_nd_like(arr, rest) for _ in range(size))
+        return _Opaque("unbind")
+    if meth in ("unique", "nonzero", "masked_select", "gather", "take", "bincount", "mode", "tensor_split",
+                "tolist", "data_ptr", "rot90", "diag", "diagonal", "trace", "outer", "kron", "cross",
+                "einsum", "histc", "squeeze"):
         return _Opaque(meth)                                 # data-dependent / rank-changing / tuple: trap-free, shape opaque
     if meth == "numpy":
-        return _NdArray(arr.shape)                            # .numpy(): the same shape, an ndarray view
-    if meth in ("cumsum", "cumprod", "logcumsumexp", "softmax", "log_softmax", "sigmoid", "relu", "tanh",
-                "abs", "exp", "log", "log2", "log10", "sqrt", "rsqrt", "neg", "sign", "clamp", "clip",
-                "clamp_min", "clamp_max", "nan_to_num", "masked_fill", "flip", "roll", "round", "floor",
+        return _nd_like(arr, arr.shape)                       # .numpy(): the same shape, an ndarray view
+    if meth in ("cumsum", "cumprod", "logcumsumexp", "softmax", "log_softmax"):
+        d = a[0] if a else _kwval(node, env, ctx, "dim", "axis")
+        if d is None:                                        # torch requires the dim; numpy cumsum() flattens
+            if arr.origin == "np" and meth in ("cumsum", "cumprod"):
+                return _nd_like(arr, (_nd_size(arr.shape),))
+            raise Unsupported(f"{meth} with no dim argument")
+        _dim_trap(arr, d, ctx)                               # IndexError: dim out of range
+        return _nd_like(arr, arr.shape)
+    if meth in ("flip", "roll"):
+        dims = a[1] if (meth == "roll" and len(a) > 1) else (a[0] if a else _kwval(node, env, ctx, "dims", "axis"))
+        for d in (dims if isinstance(dims, tuple) else () if dims is None else (dims,)):
+            _dim_trap(arr, d, ctx)                           # each named axis is bounds-checked
+        return _nd_like(arr, arr.shape)
+    if meth in ("sigmoid", "relu", "tanh",
+                "abs", "exp", "log", "log2", "log10", "log1p", "sqrt", "rsqrt", "neg", "sign", "clamp", "clip",
+                "clamp_min", "clamp_max", "nan_to_num", "masked_fill", "round", "floor",
                 "ceil", "frac", "reciprocal", "pow", "tril", "triu", "sin", "cos", "tan", "gelu", "silu",
-                "elu", "softplus", "erf", "isnan", "isinf", "isfinite", "logical_not", "argsort", "to_sparse",
+                "elu", "softplus", "erf", "argsort", "to_sparse",
                 "to_dense", "to_sparse_csr", "coalesce", "dequantize", "conj", "resolve_conj", "conj_physical",
                 "angle", "sgn"):
-        return _NdArray(arr.shape)                            # element-wise / shape-preserving / storage cast, opaque elements
+        return _nd_like(arr, arr.shape, dtype=None)           # element-wise / shape-preserving / storage cast, opaque elements
+    if meth in ("isnan", "isinf", "isfinite", "logical_not"):
+        return _nd_like(arr, arr.shape, dtype="bool")
     if meth in ("backward", "retain_grad", "zero_grad", "register_hook"):
         return _NoneVal()                                    # an autograd side-effect: returns None
-    if meth in ("bool", "int", "half", "short", "char", "byte", "type_as", "fix", "as_subclass"):
-        return _NdArray(arr.shape)                            # dtype conversion: same shape
-    if meth in ("transpose", "t"):
-        return _NdArray(tuple(reversed(arr.shape)))           # no-argument transpose: reverse every axis
-    if meth in ("copy", "astype", "to", "detach", "cpu", "cuda", "float", "double", "long", "contiguous",
+    if meth in ("long", "int", "short", "char", "byte"):
+        return _nd_like(arr, arr.shape, dtype="int")          # an integer cast: the shape kept, the kind known
+    if meth == "bool":
+        return _nd_like(arr, arr.shape, dtype="bool")
+    if meth in ("float", "double", "half"):
+        return _nd_like(arr, arr.shape, dtype="float")
+    if meth in ("type_as", "fix", "as_subclass"):
+        return _nd_like(arr, arr.shape, dtype=None)           # dtype conversion: same shape
+    if meth == "t":                                          # torch .t(): 2-D transpose ONLY -- RuntimeError above
+        if arr.origin == "torch" or (arr.origin is None and len(arr.shape) <= 2):
+            if len(arr.shape) > 2:
+                if ctx.traps is not None:
+                    _trap_add(ctx, ctx.pc, ("RuntimeError",))
+                return _Opaque("t")
+            return _nd_like(arr, tuple(reversed(arr.shape)))
+        raise Unsupported(".t() on a non-torch array")        # numpy has no .t(): AttributeError territory
+    if meth == "transpose":                                  # no-argument transpose: numpy reverses every axis;
+        if arr.origin == "np" or len(arr.shape) <= 1:        # torch requires two dims (TypeError)
+            return _nd_like(arr, tuple(reversed(arr.shape)))
+        if arr.origin == "torch" and ctx.traps is not None:
+            _trap_add(ctx, ctx.pc, ("TypeError",))
+            return _Opaque("transpose")
+        raise Unsupported("transpose() with no axes on an array of unknown origin")
+    if meth in ("new_zeros", "new_ones", "new_empty", "new_full"):
+        if meth == "new_full":                               # new_full(shape_tuple, fill_value)
+            dims = list(a[0]) if (a and isinstance(a[0], tuple)) else None
+        else:                                                # new_zeros(2, 3) or new_zeros((2, 3))
+            dims = list(a[0]) if (len(a) == 1 and isinstance(a[0], tuple)) else list(a)
+        if dims and all(z3.is_expr(d) and (z3.is_int(d) or z3.is_bool(d)) for d in dims):
+            if ctx.traps is not None:
+                for d in dims:
+                    _trap_add(ctx, z3.And(ctx.pc, _as_int(d) < 0), ("RuntimeError",))   # a negative dimension
+            return _nd_like(arr, tuple(z3.If(_as_int(d) < 0, z3.IntVal(0), _as_int(d)) for d in dims))
+        return _Opaque(meth)
+    if meth in ("copy", "astype", "to", "detach", "cpu", "cuda", "contiguous",
                 "clone", "requires_grad_") or meth.endswith("_"):
-        return _NdArray(arr.shape)                            # shape-preserving (incl. an in-place op): returns self
+        return _nd_like(arr, arr.shape)                       # shape-preserving (incl. an in-place op): returns self
     return None                                              # another method: the caller's opaque-safe path applies
 
 
@@ -2977,7 +3213,8 @@ def _nd_store_traps(base, slc, env, ctx):
 
 # torch tensor constructors, reused through the numpy ndarray (_NdArray) shape model.
 _TORCH_CTORS = frozenset({"zeros", "ones", "empty", "full", "rand", "randn", "tensor", "arange",
-                          "zeros_like", "ones_like", "empty_like", "rand_like", "randn_like", "eye"})
+                          "zeros_like", "ones_like", "empty_like", "rand_like", "randn_like", "full_like",
+                          "randint_like", "eye", "randint", "linspace", "logspace"})
 
 
 def _torch_tensor_ctor(name, node, env, ctx):
@@ -2990,27 +3227,32 @@ def _torch_tensor_ctor(name, node, env, ctx):
     for kw in node.keywords:
         ev(kw.value, env, ctx)
 
-    def _shaped(dims):
+    def _shaped(dims, dtype="float"):
         if not dims or not all(z3.is_expr(d) and z3.is_int(d) for d in dims):
             return None
         if ctx.traps is not None:
             for d in dims:
                 ctx.traps.append(z3.And(ctx.pc, d < 0))       # RuntimeError: a negative dimension
-        return _NdArray(tuple(z3.If(d < 0, z3.IntVal(0), d) for d in dims))
+        return _NdArray(tuple(z3.If(d < 0, z3.IntVal(0), d) for d in dims), origin="torch", dtype=dtype)
 
-    if name in ("zeros_like", "ones_like", "empty_like", "rand_like", "randn_like"):
-        return _NdArray(args[0].shape) if (args and isinstance(args[0], _NdArray)) else None
+    if name in ("zeros_like", "ones_like", "empty_like", "rand_like", "randn_like", "full_like", "randint_like"):
+        if args and isinstance(args[0], _NdArray):
+            return _NdArray(args[0].shape, origin="torch",
+                            dtype="int" if name == "randint_like" else args[0].dtype)
+        return None
     if name == "tensor":
         a0 = node.args[0] if node.args else None
         shp = _nested_list_shape(a0) if isinstance(a0, (ast.List, ast.Tuple)) else None
         if shp is None:
             return None
-        return _NdArray(tuple(z3.IntVal(d) for d in shp)) if len(shp) > 1 else _NdArray((z3.IntVal(shp[0]),))
+        dt = "int" if all(isinstance(n2, ast.Constant) and isinstance(n2.value, int) and not isinstance(n2.value, bool)
+                          for n2 in ast.walk(a0) if isinstance(n2, ast.Constant)) else None
+        return _NdArray(tuple(z3.IntVal(d) for d in (shp if len(shp) > 1 else shp[:1])), origin="torch", dtype=dt)
     if name == "arange":
         if not args or len(args) > 2 or any(not (z3.is_expr(x) and z3.is_int(x)) for x in args):
             return None
         n = args[0] if len(args) == 1 else args[1] - args[0]
-        return _NdArray((z3.If(n < 0, z3.IntVal(0), n),))
+        return _NdArray((z3.If(n < 0, z3.IntVal(0), n),), origin="torch", dtype="int")
     if name == "eye":
         ints = [a for a in args if z3.is_expr(a) and z3.is_int(a)]
         if not ints:
@@ -3018,11 +3260,28 @@ def _torch_tensor_ctor(name, node, env, ctx):
         nrow, ncol = ints[0], (ints[1] if len(ints) > 1 else ints[0])
         if ctx.traps is not None:
             ctx.traps.append(z3.And(ctx.pc, z3.Or(nrow < 0, ncol < 0)))   # RuntimeError: a negative dimension
-        return _NdArray((z3.If(nrow < 0, z3.IntVal(0), nrow), z3.If(ncol < 0, z3.IntVal(0), ncol)))
+        return _NdArray((z3.If(nrow < 0, z3.IntVal(0), nrow), z3.If(ncol < 0, z3.IntVal(0), ncol)),
+                        origin="torch", dtype="float")
+    if name == "randint":                                    # randint(high, size) / randint(low, high, size):
+        ints = [x for x in args if z3.is_expr(x) and z3.is_int(x)]         # RuntimeError unless low < high
+        tup = next((x for x in args if isinstance(x, tuple)), None)
+        if tup is None or len(ints) not in (1, 2):
+            return None
+        low, high = (z3.IntVal(0), ints[0]) if len(ints) == 1 else (ints[0], ints[1])
+        if ctx.traps is not None:
+            ctx.traps.append(z3.And(ctx.pc, low >= high))
+        return _shaped(list(tup), dtype="int")
+    if name in ("linspace", "logspace"):                     # linspace(start, end, steps): RuntimeError for steps < 0
+        steps = args[2] if len(args) >= 3 else _kwval(node, env, ctx, "steps")
+        if not (z3.is_expr(steps) and z3.is_int(steps)):
+            return None
+        if ctx.traps is not None:
+            ctx.traps.append(z3.And(ctx.pc, steps < 0))
+        return _NdArray((z3.If(steps < 0, z3.IntVal(0), steps),), origin="torch", dtype="float")
     if name == "full":
-        return _shaped(list(args[0])) if (args and isinstance(args[0], tuple)) else None
+        return _shaped(list(args[0]), dtype=None) if (args and isinstance(args[0], tuple)) else None
     dims = list(args[0]) if (len(args) == 1 and isinstance(args[0], tuple)) else args   # separate dims or one tuple/list
-    return _shaped(dims)
+    return _shaped(dims, dtype=None if name == "empty" else "float")
 
 
 # torch / numpy module-level tensor functions, modeled through the _NdArray shape algebra.
@@ -3089,14 +3348,14 @@ def _torch_func(name, node, env, ctx):
     return None
 
 
-# torch.nn.functional layers that preserve the input shape (elementwise activations and normalization). The
-# shape-changing layers (linear, conv, embedding, pooling) and the losses are opaque, value-independent.
+# torch.nn.functional layers that preserve the input shape unconditionally (elementwise activations). The
+# shape-changing layers, the dim/p-taking families, and the normalizations with shape constraints run the
+# exact algebra in _functional_call; the losses and the channel-constrained batch/group/instance norms are
+# unmodeled (UNKNOWN), never assumed total.
 _F_SHAPE_PRESERVING = frozenset({
     "relu", "relu6", "gelu", "elu", "selu", "celu", "leaky_relu", "rrelu", "hardtanh", "hardswish",
     "hardsigmoid", "hardshrink", "softshrink", "tanhshrink", "mish", "sigmoid", "tanh", "logsigmoid",
-    "softplus", "softsign", "threshold", "prelu", "silu", "softmax", "log_softmax", "softmin", "gumbel_softmax",
-    "dropout", "dropout1d", "dropout2d", "dropout3d", "alpha_dropout", "feature_alpha_dropout", "layer_norm",
-    "batch_norm", "group_norm", "instance_norm", "local_response_norm", "normalize", "rms_norm",
+    "softplus", "softsign", "threshold", "prelu", "silu",
 })
 
 # torch.nn activations taking no axis/shape argument: never raise on a tensor, so torch.relu(x) / F.gelu(x) on a
@@ -3115,20 +3374,225 @@ _STATISTICS_REDUCERS = frozenset({
 })
 
 
+def _or(v, default):
+    """v when it is not None, else default -- a None-coalesce that never calls bool() on a z3 term (Python's
+    `or` would, and a symbolic z3 expression raises 'cannot be cast to a concrete Boolean' on __bool__)."""
+    return default if v is None else v
+
+
+def _tuple_of(v, n):
+    """A per-spatial-dim list from a constant int (replicated) or an n-tuple of constant ints, else None."""
+    if isinstance(v, tuple):
+        ix = [_cint(x) for x in v]
+        return ix if len(ix) == n and all(x is not None for x in ix) else None
+    c = _cint(v)
+    return [c] * n if c is not None else None
+
+
+def _f_linear(x, w, b, ctx):
+    """F.linear / nn.Linear shape algebra: x (..., in) with w (out, in) -> (..., out); the RuntimeError torch
+    raises when x's last dimension differs from in (or the bias from out) is the modeled trap."""
+    if not (isinstance(x, _NdArray) and isinstance(w, _NdArray) and len(w.shape) == 2 and x.shape):
+        raise Unsupported("linear over an untracked tensor")
+    if ctx.traps is not None:
+        _trap_add(ctx, z3.And(ctx.pc, x.shape[-1] != w.shape[1]), ("RuntimeError",))
+        if isinstance(b, _NdArray):
+            if len(b.shape) != 1:
+                _trap_add(ctx, ctx.pc, ("RuntimeError",))
+            else:
+                _trap_add(ctx, z3.And(ctx.pc, b.shape[0] != w.shape[0]), ("RuntimeError",))
+    return _nd_like(x, x.shape[:-1] + (w.shape[0],), dtype=None)
+
+
+def _f_conv_out(sdim, k, s, p, d, ceil_mode=False):
+    """One spatial output dimension of a convolution / pooling: floor((S + 2p - d(K-1) - 1) / s) + 1, the
+    ceil_mode variant rounding up EXCEPT that a last window which would start entirely inside the padding
+    is dropped ((o-1)*s >= S + p). Exact integer algebra over a possibly-symbolic input dimension."""
+    num = sdim + 2 * p - d * (k - 1) - 1 + (s - 1 if ceil_mode else 0)
+    o = (num if s == 1 else py_floordiv(num, z3.IntVal(s))) + 1
+    if ceil_mode:
+        o = z3.If((o - 1) * s >= sdim + p, o - 1, o)
+    return o
+
+
+def _f_conv(x, w, spatial, stride, padding, dilation, groups, ctx):
+    """F.convNd / nn.ConvNd shape algebra: x (N, Cin, *S) with w (Cout, Cin/g, *K) -> (N, Cout, *out), with
+    the RuntimeErrors torch raises modeled: a channel/groups mismatch, and an output dimension below 1
+    (kernel larger than the padded input)."""
+    if not (isinstance(x, _NdArray) and isinstance(w, _NdArray)
+            and len(x.shape) == spatial + 2 and len(w.shape) == spatial + 2):
+        raise Unsupported("conv over an untracked tensor or a mismatched rank")
+    st, pd, dl = (_tuple_of(stride, spatial), _tuple_of(padding, spatial), _tuple_of(dilation, spatial))
+    g = _cint(groups) if groups is not None else 1
+    if st is None or pd is None or dl is None or g is None or g < 1 or any(s2 < 1 for s2 in st):
+        raise Unsupported("conv with a non-constant stride / padding / dilation / groups")
+    kdims = [_cint(kd) for kd in w.shape[2:]]
+    if ctx.traps is not None:
+        _trap_add(ctx, z3.And(ctx.pc, x.shape[1] != w.shape[1] * g), ("RuntimeError",))   # Cin != w_Cin * groups
+        gout = py_mod(w.shape[0], z3.IntVal(g)) != 0 if g > 1 else z3.BoolVal(False)
+        _trap_add(ctx, z3.And(ctx.pc, gout), ("RuntimeError",))                           # Cout % groups
+    out = []
+    for i in range(spatial):
+        kd = z3.IntVal(kdims[i]) if kdims[i] is not None else w.shape[2 + i]
+        o = _f_conv_out(x.shape[2 + i], kd, st[i], pd[i], dl[i])
+        if ctx.traps is not None:
+            _trap_add(ctx, z3.And(ctx.pc, o < 1), ("RuntimeError",))                      # kernel exceeds padded input
+        out.append(o)
+    return _nd_like(x, (x.shape[0], w.shape[0]) + tuple(out), dtype=None)
+
+
+def _f_pool(x, spatial, kernel, stride, padding, dilation, ceil_mode, ctx):
+    """F.max_poolNd / avg_poolNd / nn.*PoolNd shape algebra, with the pad <= kernel/2 RuntimeError and the
+    output formula (ceil_mode rounds the division up)."""
+    if not (isinstance(x, _NdArray) and len(x.shape) in (spatial + 1, spatial + 2)):
+        raise Unsupported("pool over an untracked tensor or a mismatched rank")
+    kn = _tuple_of(kernel, spatial)
+    st = _tuple_of(stride, spatial) if stride is not None else kn   # stride defaults to the kernel size
+    pd = _tuple_of(padding, spatial) if padding is not None else [0] * spatial
+    dl = _tuple_of(dilation, spatial) if dilation is not None else [1] * spatial
+    cm = bool(ceil_mode)
+    if kn is None or st is None or pd is None or dl is None or any(s2 < 1 for s2 in st) or any(k2 < 1 for k2 in kn):
+        raise Unsupported("pool with a non-constant kernel / stride / padding")
+    if any(2 * pd[i] > kn[i] for i in range(spatial)):
+        if ctx.traps is not None:
+            _trap_add(ctx, ctx.pc, ("RuntimeError",))         # pad should be at most half of kernel size
+        return _Opaque("pool")
+    lead = x.shape[:-spatial]
+    out = []
+    for i in range(spatial):
+        o = _f_conv_out(x.shape[len(lead) + i], z3.IntVal(kn[i]), st[i], pd[i], dl[i], ceil_mode=cm)
+        if ctx.traps is not None:
+            _trap_add(ctx, z3.And(ctx.pc, o < 1), ("RuntimeError",))
+        out.append(o)
+    return _nd_like(x, lead + tuple(out), dtype=None)
+
+
 def _functional_call(name, node, env, ctx):
-    """A `torch.nn.functional.X(tensor, ...)` call: an elementwise activation or normalization preserves the
-    input shape, a shape-changing layer (linear, conv, embedding, pooling) or a loss is opaque. None for a
-    non-tensor first argument so the caller falls through to the unmodeled-call path."""
+    """A `torch.nn.functional.X(tensor, ...)` call: an elementwise activation preserves the input shape; the
+    shape-changing layers (linear, the convolutions and poolings, embedding, one_hot, pad, interpolate) and
+    the elementwise losses run the exact shape algebra with the RuntimeError/ValueError traps torch raises;
+    an unmodeled layer returns None so the caller falls through to the unmodeled-call path (UNKNOWN) rather
+    than assuming a raising layer total."""
     args = [ev(a, env, ctx) for a in node.args]
     for kw in node.keywords:
         ev(kw.value, env, ctx)
-    if not (args and isinstance(args[0], _NdArray)):
+    x = args[0] if args else None
+    if not isinstance(x, _NdArray):
         if name in _NN_ACTIVATION_TRAPFREE:                  # F.relu(x) / F.gelu(x) on a bare tensor param: trap free
             return _Opaque(name)
         return None
+    if name in ("softmax", "log_softmax", "softmin", "gumbel_softmax"):
+        d = args[1] if len(args) > 1 else _kwval(node, env, ctx, "dim")
+        if d is not None:
+            _dim_trap(x, d, ctx)                             # IndexError: dim out of range
+        return _nd_like(x, x.shape, dtype=None)
+    if name in ("dropout", "dropout1d", "dropout2d", "dropout3d", "alpha_dropout", "feature_alpha_dropout"):
+        p = args[1] if len(args) > 1 else _kwval(node, env, ctx, "p")
+        if p is not None and ctx.traps is not None and (_is_fp(p) or (z3.is_expr(p) and (z3.is_int(p) or z3.is_bool(p)))):
+            pf = _to_fp(p) if not _is_fp(p) else p           # ValueError unless 0 <= p <= 1
+            _trap_add(ctx, z3.And(ctx.pc, z3.Or(z3.fpLT(pf, z3.FPVal(0.0, _F64)),
+                                                z3.fpGT(pf, z3.FPVal(1.0, _F64)))), ("ValueError",))
+        return _nd_like(x, x.shape)
+    if name == "linear":
+        return _f_linear(x, args[1] if len(args) > 1 else _kwval(node, env, ctx, "weight"),
+                         args[2] if len(args) > 2 else _kwval(node, env, ctx, "bias"), ctx)
+    if name in ("conv1d", "conv2d", "conv3d"):
+        sp = int(name[4])
+        w = args[1] if len(args) > 1 else _kwval(node, env, ctx, "weight")
+        stride = args[3] if len(args) > 3 else _or(_kwval(node, env, ctx, "stride"), z3.IntVal(1))
+        padding = args[4] if len(args) > 4 else _or(_kwval(node, env, ctx, "padding"), z3.IntVal(0))
+        dilation = args[5] if len(args) > 5 else _or(_kwval(node, env, ctx, "dilation"), z3.IntVal(1))
+        groups = args[6] if len(args) > 6 else _or(_kwval(node, env, ctx, "groups"), z3.IntVal(1))
+        b = args[2] if len(args) > 2 else _kwval(node, env, ctx, "bias")
+        out = _f_conv(x, w, sp, stride, padding, dilation, groups, ctx)
+        if isinstance(b, _NdArray) and isinstance(w, _NdArray) and ctx.traps is not None and len(b.shape) == 1:
+            _trap_add(ctx, z3.And(ctx.pc, b.shape[0] != w.shape[0]), ("RuntimeError",))
+        return out
+    if name in ("max_pool1d", "max_pool2d", "max_pool3d", "avg_pool1d", "avg_pool2d", "avg_pool3d"):
+        sp = int(name[-2])
+        kernel = args[1] if len(args) > 1 else _kwval(node, env, ctx, "kernel_size")
+        stride = args[2] if len(args) > 2 else _kwval(node, env, ctx, "stride")
+        padding = args[3] if len(args) > 3 else _kwval(node, env, ctx, "padding")
+        dilation = (args[4] if len(args) > 4 else _kwval(node, env, ctx, "dilation")) if name.startswith("max") else None
+        cm = _kwval(node, env, ctx, "ceil_mode")
+        cm_b = bool(_cint(cm)) if cm is not None and _cint(cm) is not None else False
+        return _f_pool(x, sp, kernel, stride, padding, dilation, cm_b, ctx)
+    if name == "embedding":                                  # embedding(indices[int], weight (V, D)) -> indices + (D,)
+        w = args[1] if len(args) > 1 else _kwval(node, env, ctx, "weight")
+        if isinstance(w, _NdArray) and len(w.shape) == 2 and x.dtype == "int":
+            return _nd_like(x, x.shape + (w.shape[1],), dtype=None)
+        return None                                          # a float/unknown index dtype would raise: unmodeled
+    if name == "one_hot":                                    # one_hot(indices[int], C) -> indices + (C,)
+        c = args[1] if len(args) > 1 else _kwval(node, env, ctx, "num_classes")
+        cc = _cint(c)
+        if x.dtype == "int" and cc is not None and cc > 0:
+            return _nd_like(x, x.shape + (z3.IntVal(cc),), dtype="int")
+        return None                                          # num_classes=-1 infers from the data: unmodeled
+    if name == "pad":                                        # pad(x, (l0, r0, l1, r1, ...)): last len/2 dims grow
+        pads = args[1] if len(args) > 1 else _kwval(node, env, ctx, "pad")
+        mode = node.args[2] if len(node.args) > 2 else next((k.value for k in node.keywords if k.arg == "mode"), None)
+        if mode is not None and not (isinstance(mode, ast.Constant) and mode.value == "constant"):
+            return None                                      # reflect / replicate carry their own constraints
+        if isinstance(pads, tuple):
+            px = [_cint(p) for p in pads]
+            if all(p is not None for p in px) and len(px) % 2 == 0 and len(px) // 2 <= len(x.shape):
+                sh = list(x.shape)
+                for i in range(len(px) // 2):
+                    k = len(sh) - 1 - i
+                    sh[k] = sh[k] + px[2 * i] + px[2 * i + 1]
+                    if ctx.traps is not None and (px[2 * i] < 0 or px[2 * i + 1] < 0):
+                        _trap_add(ctx, z3.And(ctx.pc, sh[k] < 0), ("RuntimeError",))   # negative pads over-shrink
+                return _nd_like(x, tuple(sh))
+        return None
+    if name == "interpolate":                                # interpolate(x, size= / scale_factor=): spatial dims set
+        if len(x.shape) < 3:
+            return None
+        size = _kwval(node, env, ctx, "size")
+        sf = next((k.value for k in node.keywords if k.arg == "scale_factor"), None)
+        spatial = len(x.shape) - 2
+        if size is not None:
+            dims = _tuple_of(size, spatial)
+            if dims is not None:
+                return _nd_like(x, x.shape[:2] + tuple(z3.IntVal(d2) for d2 in dims))
+            return None
+        if isinstance(sf, ast.Constant) and isinstance(sf.value, (int, float)) and float(sf.value) > 0:
+            f = float(sf.value)
+            if f == int(f):                                  # an integral factor scales a symbolic dim exactly
+                return _nd_like(x, x.shape[:2] + tuple(d2 * int(f) for d2 in x.shape[2:]))
+            cd = [_cint(d2) for d2 in x.shape[2:]]
+            if all(c2 is not None for c2 in cd):             # constant dims: floor(dim * factor), python-side
+                return _nd_like(x, x.shape[:2] + tuple(z3.IntVal(int(c2 * f)) for c2 in cd))
+        return None
+    if name in ("mse_loss", "l1_loss", "smooth_l1_loss", "huber_loss"):
+        t = args[1] if len(args) > 1 else _kwval(node, env, ctx, "target")
+        if not isinstance(t, _NdArray):
+            return None
+        out, ok = _broadcast_shapes([x.shape, t.shape])
+        if ctx.traps is not None:
+            _trap_add(ctx, z3.And(ctx.pc, z3.Not(ok)), ("RuntimeError",))   # non-broadcastable input/target
+        red = next((k.value for k in node.keywords if k.arg == "reduction"), None)
+        if isinstance(red, ast.Constant) and red.value == "none":
+            return _nd_like(x, out, dtype=None)
+        return _Opaque(name)                                 # mean / sum reduction: an opaque scalar
+    if name in ("layer_norm", "rms_norm"):                   # layer_norm(x, normalized_shape): a suffix match
+        ns = args[1] if len(args) > 1 else _kwval(node, env, ctx, "normalized_shape")
+        dims = list(ns) if isinstance(ns, tuple) else ([ns] if z3.is_expr(ns) and z3.is_int(ns) else None)
+        if dims is None or len(dims) > len(x.shape):
+            return None
+        if ctx.traps is not None:
+            for i, d in enumerate(dims):
+                _trap_add(ctx, z3.And(ctx.pc, x.shape[len(x.shape) - len(dims) + i] != _as_int(d)), ("RuntimeError",))
+        return _nd_like(x, x.shape)
+    if name == "normalize":                                  # normalize(x, p=2, dim=1): the dim is bounds-checked
+        d = _kwval(node, env, ctx, "dim")
+        d = d if d is not None else (args[2] if len(args) > 2 else z3.IntVal(1))
+        _dim_trap(x, d, ctx)
+        return _nd_like(x, x.shape)
+    if name == "flatten":
+        return _nd_method(x, "flatten", args[1:], node, env, ctx)
     if name in _F_SHAPE_PRESERVING:
-        return _NdArray(args[0].shape)
-    return _Opaque("functional")                             # a shape-changing layer or a loss: trap-free, opaque
+        return _nd_like(x, x.shape)
+    return None                                              # an unmodeled layer / loss: the unmodeled-call path (UNKNOWN)
 
 
 def _functional_aliases(module):
@@ -3146,6 +3610,195 @@ def _functional_aliases(module):
                 if al.name == "functional":
                     out.add(al.asname or "functional")
     return frozenset(out)
+
+
+def _nn_aliases(module):
+    """The names a module binds to `torch.nn` -- `import torch.nn as nn`, `from torch import nn` -- so an
+    `nn.Linear(...)` construction is recognized only where the import establishes it."""
+    out = set()
+    for n in ast.walk(module):
+        if isinstance(n, ast.Import):
+            for al in n.names:
+                if al.name == "torch.nn" and al.asname:
+                    out.add(al.asname)
+        elif isinstance(n, ast.ImportFrom) and n.module == "torch":
+            for al in n.names:
+                if al.name == "nn":
+                    out.add(al.asname or "nn")
+    return frozenset(out)
+
+
+_NN_ACTIVATION_MODULES = frozenset({"ReLU", "ReLU6", "GELU", "SiLU", "ELU", "SELU", "CELU", "LeakyReLU",
+                                    "Sigmoid", "Tanh", "Mish", "Hardtanh", "Hardswish", "Hardsigmoid",
+                                    "Softplus", "Softsign", "Tanhshrink", "Identity"})
+_NN_MODULE_KINDS = _NN_ACTIVATION_MODULES | frozenset({
+    "Linear", "Conv1d", "Conv2d", "Conv3d", "Dropout", "Dropout1d", "Dropout2d", "Dropout3d", "Flatten",
+    "Softmax", "LogSoftmax", "MaxPool1d", "MaxPool2d", "MaxPool3d", "AvgPool1d", "AvgPool2d", "AvgPool3d",
+    "BatchNorm1d", "BatchNorm2d", "BatchNorm3d", "LayerNorm", "Embedding", "Sequential",
+})
+
+
+class _TorchModule(_Opaque):
+    """A torch.nn layer constructed as a local (m = nn.Linear(16, 32)) and applied like a function (m(x)):
+    the construction stores the structural arguments and the application runs the same shape algebra as the
+    matching torch.nn.functional call. Sequential folds its children. An unmodeled kind or a non-constant
+    structural argument never constructs one, so the call falls to the unmodeled path (UNKNOWN)."""
+    __slots__ = ("kind", "cargs", "kws", "inner")
+    def __init__(self, kind, cargs, kws, inner=None):
+        super().__init__("nn." + kind)
+        self.kind = kind
+        self.cargs = cargs
+        self.kws = kws
+        self.inner = inner
+
+
+def _nn_module_ctor(kind, node, env, ctx):
+    """Construct a modeled torch.nn layer: every argument is trap-checked, the construction-time errors torch
+    raises are modeled (a Dropout p outside [0, 1], channels not divisible by groups, a negative Linear /
+    Embedding dimension), and the structural values are stored for the call-time shape algebra. Returns None
+    -- the unmodeled-call path -- for an unrecognized signature."""
+    args = [ev(a, env, ctx) for a in node.args]
+    kws = {}
+    for kw in node.keywords:
+        kws[kw.arg] = ev(kw.value, env, ctx)
+    if kind == "Sequential":
+        if all(isinstance(m, _TorchModule) for m in args) and not kws:
+            return _TorchModule(kind, [], {}, inner=list(args))
+        return None
+    if kind in ("Dropout", "Dropout1d", "Dropout2d", "Dropout3d"):
+        p = args[0] if args else kws.get("p")
+        if p is not None and ctx.traps is not None and (_is_fp(p) or (z3.is_expr(p) and (z3.is_int(p) or z3.is_bool(p)))):
+            pf = _to_fp(p) if not _is_fp(p) else p           # ValueError unless 0 <= p <= 1
+            _trap_add(ctx, z3.And(ctx.pc, z3.Or(z3.fpLT(pf, z3.FPVal(0.0, _F64)),
+                                                z3.fpGT(pf, z3.FPVal(1.0, _F64)))), ("ValueError",))
+        return _TorchModule(kind, args, kws)
+    if kind == "Linear":
+        inf, outf = (args + [None, None])[:2]
+        inf = kws.get("in_features", inf); outf = kws.get("out_features", outf)
+        if all(z3.is_expr(v) and z3.is_int(v) for v in (inf, outf) if v is not None) and inf is not None and outf is not None:
+            if ctx.traps is not None:
+                _trap_add(ctx, z3.And(ctx.pc, z3.Or(inf < 0, outf < 0)), ("RuntimeError",))
+            return _TorchModule(kind, [inf, outf], kws)
+        return None
+    if kind in ("Conv1d", "Conv2d", "Conv3d"):
+        sp = int(kind[4])
+        ic, oc, k = (args + [None, None, None])[:3]
+        ic = kws.get("in_channels", ic); oc = kws.get("out_channels", oc); k = kws.get("kernel_size", k)
+        g = _cint(kws.get("groups", args[6] if len(args) > 6 else None))
+        g = 1 if g is None and "groups" not in kws and len(args) <= 6 else g
+        ci, co = _cint(ic), _cint(oc)
+        if ci is None or co is None or g is None or g < 1 or _tuple_of(k, sp) is None:
+            return None
+        if ctx.traps is not None and (ci < 0 or co < 0 or ci % g or co % g):
+            _trap_add(ctx, ctx.pc, ("ValueError",))          # channels not divisible by groups / negative
+            return _Opaque("conv")
+        return _TorchModule(kind, [z3.IntVal(ci), z3.IntVal(co), k], dict(kws, groups=z3.IntVal(g),
+                            stride=kws.get("stride", args[3] if len(args) > 3 else None),
+                            padding=kws.get("padding", args[4] if len(args) > 4 else None),
+                            dilation=kws.get("dilation", args[5] if len(args) > 5 else None)))
+    if kind in ("MaxPool1d", "MaxPool2d", "MaxPool3d", "AvgPool1d", "AvgPool2d", "AvgPool3d"):
+        sp = int(kind[-2])
+        k = args[0] if args else kws.get("kernel_size")
+        if _tuple_of(k, sp) is None:
+            return None
+        return _TorchModule(kind, [k], dict(kws,
+                            stride=kws.get("stride", args[1] if len(args) > 1 else None),
+                            padding=kws.get("padding", args[2] if len(args) > 2 else None),
+                            dilation=kws.get("dilation", args[3] if len(args) > 3 else None)))
+    if kind in ("BatchNorm1d", "BatchNorm2d", "BatchNorm3d"):
+        c = _cint(args[0] if args else kws.get("num_features"))
+        return _TorchModule(kind, [z3.IntVal(c)], kws) if c is not None else None
+    if kind == "LayerNorm":
+        ns = args[0] if args else kws.get("normalized_shape")
+        dims = list(ns) if isinstance(ns, tuple) else ([ns] if z3.is_expr(ns) and z3.is_int(ns) else None)
+        return _TorchModule(kind, dims, kws) if dims else None
+    if kind == "Embedding":
+        v, d = (args + [None, None])[:2]
+        v = kws.get("num_embeddings", v); d = kws.get("embedding_dim", d)
+        if all(z3.is_expr(x) and z3.is_int(x) for x in (v, d) if x is not None) and v is not None and d is not None:
+            if ctx.traps is not None:
+                _trap_add(ctx, z3.And(ctx.pc, z3.Or(v < 0, d < 0)), ("RuntimeError",))
+            return _TorchModule(kind, [v, d], kws)
+        return None
+    if kind in ("Flatten", "Softmax", "LogSoftmax") or kind in _NN_ACTIVATION_MODULES:
+        return _TorchModule(kind, args, kws)
+    return None
+
+
+def _apply_nn_module(mod, x, node, env, ctx):
+    """Apply a constructed torch.nn layer to a tensor, running the matching functional shape algebra."""
+    if isinstance(x, _NdArray):
+        if mod.kind == "Sequential":
+            for m in mod.inner:
+                x = _apply_nn_module(m, x, node, env, ctx)
+                if not isinstance(x, _NdArray):
+                    raise Unsupported("a Sequential stage left the tensor untracked")
+            return x
+        if mod.kind == "Linear":
+            return _f_linear(x, _NdArray((mod.cargs[1], mod.cargs[0])), None, ctx)   # the module's own bias always fits
+        if mod.kind.startswith("Conv"):
+            sp = int(mod.kind[4])
+            kd = _tuple_of(mod.cargs[2], sp)
+            g = _cint(mod.kws.get("groups")) or 1
+            ci = _cint(mod.cargs[0])
+            w = _NdArray((mod.cargs[1], z3.IntVal(ci // g)) + tuple(z3.IntVal(k) for k in kd))
+            return _f_conv(x, w, sp, _or(mod.kws.get("stride"), z3.IntVal(1)),
+                           _or(mod.kws.get("padding"), z3.IntVal(0)),
+                           _or(mod.kws.get("dilation"), z3.IntVal(1)), z3.IntVal(g), ctx)
+        if mod.kind.endswith(("Pool1d", "Pool2d", "Pool3d")):
+            sp = int(mod.kind[-2])
+            cm = _cint(mod.kws.get("ceil_mode"))
+            return _f_pool(x, sp, mod.cargs[0], mod.kws.get("stride"), mod.kws.get("padding"),
+                           mod.kws.get("dilation"), bool(cm) if cm is not None else False, ctx)
+        if mod.kind.startswith("BatchNorm"):
+            want = int(mod.kind[-2]) + 2                     # BatchNorm1d: (N, C) or (N, C, L); 2d: 4-D; 3d: 5-D
+            if len(x.shape) not in ((2, 3) if want == 3 else (want,)):
+                if ctx.traps is not None:
+                    _trap_add(ctx, ctx.pc, ("RuntimeError",))   # wrong input rank
+                return _Opaque("batchnorm")
+            if ctx.traps is not None:
+                _trap_add(ctx, z3.And(ctx.pc, x.shape[1] != mod.cargs[0]), ("RuntimeError",))   # channel mismatch
+                per = z3.IntVal(1)                           # training-mode BatchNorm needs > 1 value per channel
+                for k, d in enumerate(x.shape):
+                    if k != 1:
+                        per = per * d
+                _trap_add(ctx, z3.And(ctx.pc, per == 1), ("ValueError",))
+            return _nd_like(x, x.shape, dtype=None)
+        if mod.kind == "LayerNorm":
+            dims = mod.cargs
+            if len(dims) <= len(x.shape) and ctx.traps is not None:
+                for i, d in enumerate(dims):
+                    _trap_add(ctx, z3.And(ctx.pc, x.shape[len(x.shape) - len(dims) + i] != _as_int(d)), ("RuntimeError",))
+            return _nd_like(x, x.shape, dtype=None)
+        if mod.kind == "Embedding":
+            if x.dtype != "int":
+                raise Unsupported("Embedding of a non-integer-typed index tensor")
+            return _nd_like(x, x.shape + (mod.cargs[1],), dtype=None)
+        if mod.kind == "Flatten":
+            s = mod.cargs[0] if mod.cargs else mod.kws.get("start_dim", z3.IntVal(1))
+            e = mod.cargs[1] if len(mod.cargs) > 1 else mod.kws.get("end_dim", z3.IntVal(-1))
+            sn, en, rank = _cint(s), _cint(e), len(x.shape)
+            if sn is None or en is None or not rank:
+                raise Unsupported("Flatten with a non-constant dim")
+            sn, en = (sn if sn >= 0 else rank + sn), (en if en >= 0 else rank + en)
+            if not (0 <= sn < rank and 0 <= en < rank) or sn > en:
+                if ctx.traps is not None:
+                    _trap_add(ctx, ctx.pc, ("IndexError",))
+                return _Opaque("flatten")
+            folded = z3.IntVal(1)
+            for d in x.shape[sn:en + 1]:
+                folded = folded * d
+            return _nd_like(x, x.shape[:sn] + (folded,) + x.shape[en + 1:])
+        if mod.kind in ("Softmax", "LogSoftmax"):
+            d = mod.cargs[0] if mod.cargs else mod.kws.get("dim")
+            if d is not None:
+                _dim_trap(x, d, ctx)
+            return _nd_like(x, x.shape, dtype=None)
+        if mod.kind.startswith("Dropout") or mod.kind in _NN_ACTIVATION_MODULES:
+            return _nd_like(x, x.shape)
+    if mod.kind in _NN_ACTIVATION_MODULES or mod.kind.startswith("Dropout"):
+        return _Opaque("nnmod")                              # an activation on an untracked tensor: trap free
+    raise Unsupported(f"nn.{mod.kind} applied to an untracked tensor")
 
 
 # pandas / pyarrow constructors recognized by the value engine.
@@ -3430,9 +4083,14 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
     if isinstance(node, ast.Lambda):                         # lambda as a first-class value (a closure)
         return _Lambda([a.arg for a in node.args.args], node.body, dict(env))
     if isinstance(node, ast.Call) and (isinstance(node.func, ast.Lambda)
-            or (isinstance(node.func, ast.Name) and isinstance(env.get(node.func.id), (_Lambda, _FuncRef)))):
+            or (isinstance(node.func, ast.Name)
+                and isinstance(env.get(node.func.id), (_Lambda, _FuncRef, _TorchModule)))):
         callee = ev(node.func, env, ctx) if isinstance(node.func, ast.Lambda) else env[node.func.id]
         argvals = _eval_args(node.args, env, ctx)
+        if isinstance(callee, _TorchModule):                  # a constructed nn layer applied: m(x)
+            if len(argvals) != 1:
+                raise Unsupported("an nn module applied to other than one tensor")
+            return _apply_nn_module(callee, argvals[0], node, env, ctx)
         if isinstance(callee, _FuncRef):                      # a function-valued variable, called
             return _call_repo(callee.name, argvals, ctx)
         if len(callee.params) != len(argvals):
@@ -4574,6 +5232,11 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 res = _torch_func(node.func.attr, node, env, ctx)   # cat / matmul / where / a reduction over a tensor
                 if res is not None:                                 # (a scalar / non-tensor arg falls through to _STDLIB)
                     return res
+            if (node.func.value.id in getattr(ctx, "nn_aliases", ()) and node.func.attr in _NN_MODULE_KINDS
+                    and node.func.value.id not in env):
+                res = _nn_module_ctor(node.func.attr, node, env, ctx)   # m = nn.Linear(16, 32): a modeled layer
+                if res is not None:
+                    return res
             if node.func.value.id in ("pd", "pandas") and node.func.attr in _PANDAS_CTORS \
                     and node.func.value.id not in env:
                 res = _pandas_ctor(node.func.attr, node, env, ctx)
@@ -4891,6 +5554,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
              and node.func.value.id not in env)
                 or (_dotted_callee(node.func) or "").startswith("torch.nn.functional.")):
             res = _functional_call(node.func.attr, node, env, ctx)
+            if res is not None:
+                return res
+        if (_dotted_callee(node.func) or "") == "torch.nn." + node.func.attr and node.func.attr in _NN_MODULE_KINDS:
+            res = _nn_module_ctor(node.func.attr, node, env, ctx)   # the dotted torch.nn.Linear(...) form
             if res is not None:
                 return res
         recv = ev(node.func.value, env, ctx)
@@ -6289,9 +6956,11 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
     saved_traps, saved_pc = ctx.traps, ctx.pc
     saved_td, saved_po = ctx.tracked_dicts, ctx.mutate_once
     saved_np, saved_fa = ctx.numeric_params, ctx.func_aliases
+    saved_nn = ctx.nn_aliases
     saved_dirty = getattr(ctx, "dirty_attrs", None)
     ctx.dirty_attrs = set()                                   # object attributes stored in this run: a later read is fresh
     ctx.func_aliases = _functional_aliases(_mod)              # names bound to torch.nn.functional in this module
+    ctx.nn_aliases = _nn_aliases(_mod)                        # names bound to torch.nn in this module
     ctx.tracked_dicts = _tracked_dict_names(fn)               # this function's value-engine-modeled dicts
     ctx.readonly_dicts = _readonly_dict_names(fn)             # dict params whose reads d[k] memoize to a stable value
     ctx.dval_cache = {}                                       # fresh per symexec run
@@ -6529,10 +7198,18 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         if not isinstance(a2, ast.Starred):    # arguments, then terminate the path (SystemExit is an
                             ev(a2, e, ctx)                     # intentional exit, not a modeled crash) -- no fall-through
                 elif isinstance(s, ast.Expr):                 # bare expression statement: for its traps only
-                    ev(s.value, e, ctx)
+                    _ev_res = ev(s.value, e, ctx)
                     c = s.value                               # a method call on a name -- or on a subscript /
                     rn = (_recv_root_name(c.func.value)       # attribute of one (a[0].append(x), self.xs.pop())
                           if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) else None)
+                    if (rn is not None and rn in e and isinstance(e[rn], _NdArray)
+                            and isinstance(_ev_res, _NdArray) and isinstance(c.func.value, ast.Name)):
+                        # a bare in-place tensor method (x.add_(1), x.clamp_(0, 1)) mutates x but returns self,
+                        # and the shape algebra already computed the post-op shape -- so rebind x to that result
+                        # rather than forgetting it (a tensor has no aliasing the value model misses: elements are
+                        # opaque, and an alias would read the SAME post-op shape).
+                        e2 = dict(e); e2[rn] = _ev_res
+                        nxt.append((e2, p)); continue
                     if rn is not None and rn in e:            # -- may mutate the container, so forget the ROOT
                         e2 = dict(e); e2[rn] = _ForgottenVal(rn)   # name: a later read abstains, not a stale value.
                         if c.func.attr in _MUTATING_METHODS:  # a mutator (append/pop/...) changes the object in
@@ -6753,6 +7430,7 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
     finally:
         ctx.traps, ctx.pc, ctx.tracked_dicts, ctx.mutate_once = saved_traps, saved_pc, saved_td, saved_po
         ctx.numeric_params, ctx.func_aliases = saved_np, saved_fa
+        ctx.nn_aliases = saved_nn
         ctx.dirty_attrs = saved_dirty
     none_pc = z3.Or(*none_list) if none_list else z3.BoolVal(False)
     return args, z3args, rets, local_traps, none_pc

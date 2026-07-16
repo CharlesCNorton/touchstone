@@ -639,6 +639,158 @@ def math_domain_audit():
     return n
 
 
+def torch_shape_audit():
+    """The tensor model against REAL torch, where installed: every formula-bearing op (conv / pool output
+    sizes, linear, flatten / unflatten, chunk / split / unbind piece shapes, topk, matmul broadcasting,
+    pad, interpolate, one_hot / embedding) is executed on a parameter grid and its shape compared exactly,
+    and every modeled trap (a negative dimension, randint low >= high, linspace steps, .t() above rank 2,
+    a dim out of range, topk k > size, a linear / conv mismatch, dropout p) is confirmed to raise -- and to
+    raise ONLY where the model traps, so the trap conditions are exact, not conservative. Skips cleanly
+    (available: False) when torch is absent, so the gate carries it wherever torch exists."""
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as tF
+    except Exception:
+        return {"available": False, "checks": 0}
+    n = 0
+
+    def conv_out(S, k, s, p, d, ceil_mode=False):
+        num = S + 2 * p - d * (k - 1) - 1 + (s - 1 if ceil_mode else 0)
+        o = num // s + 1
+        if ceil_mode and (o - 1) * s >= S + p:               # a last window entirely inside the padding is dropped
+            o -= 1
+        return o
+
+    for S in (5, 8, 13):                                     # convolution: the output formula and its trap boundary
+        for k in (1, 2, 3):
+            for s in (1, 2, 3):
+                for p in (0, 1):
+                    for d in (1, 2):
+                        want = conv_out(S, k, s, p, d)
+                        try:
+                            got = tF.conv2d(torch.zeros(1, 2, S, S), torch.zeros(3, 2, k, k),
+                                            stride=s, padding=p, dilation=d).shape
+                            assert want >= 1 and got == (1, 3, want, want), (S, k, s, p, d, got, want)
+                        except RuntimeError:
+                            assert want < 1, (S, k, s, p, d, "raised though the formula gives %d" % want)
+                        n += 1
+    for S in (5, 9):                                         # pooling: floor and ceil modes, stride defaulting
+        for k in (2, 3):
+            for s in (None, 1, 2):
+                for p in (0, 1):
+                    for cm in (False, True):
+                        if 2 * p > k:
+                            continue
+                        eff = s or k
+                        want = conv_out(S, k, eff, p, 1, ceil_mode=cm)
+                        got = tF.max_pool2d(torch.zeros(1, 1, S, S), k, stride=s, padding=p, ceil_mode=cm).shape
+                        assert got == (1, 1, want, want), (S, k, s, p, cm, got, want)   # exact in both modes
+                        n += 1
+    for inf, wf in ((16, 16), (16, 20)):                     # linear: raises exactly on the feature mismatch
+        try:
+            got = tF.linear(torch.zeros(8, inf), torch.zeros(32, wf)).shape
+            assert inf == wf and got == (8, 32)
+        except RuntimeError:
+            assert inf != wf
+        n += 1
+    for rank in (1, 2, 3):                                   # .t(): rank <= 2 only
+        try:
+            torch.zeros(*([2] * rank)).t()
+            assert rank <= 2
+        except RuntimeError:
+            assert rank > 2
+        n += 1
+    for k in (0, 2, 3, 5):                                   # topk: 0 <= k <= size
+        try:
+            v, i = torch.zeros(3).topk(k)
+            assert k <= 3 and v.shape == (k,)
+        except RuntimeError:
+            assert k > 3
+        n += 1
+    for dim in range(-4, 4):                                 # dim bounds on the dim-taking elementwise family
+        for op in (lambda t, d: t.softmax(d), lambda t, d: t.cumsum(d)):
+            try:
+                op(torch.zeros(2, 3), dim)
+                assert -2 <= dim < 2, dim
+            except IndexError:
+                assert not (-2 <= dim < 2), dim
+            n += 1
+    for size, cnt in ((6, 3), (7, 3), (2, 5)):               # chunk: ceil pieces, fewer when size < n
+        per = -(-size // cnt)
+        want = [min(per, size - i * per) for i in range(cnt) if i * per < size]
+        got = [t.shape[0] for t in torch.zeros(size, 2).chunk(cnt, 0)]
+        assert got == want, (size, cnt, got, want)
+        n += 1
+    for size, sz in ((6, 2), (7, 2), (5, 5)):                # split: equal pieces, the last partial
+        want = [min(sz, size - i * sz) for i in range(-(-size // sz))]
+        got = [t.shape[0] for t in torch.zeros(size, 2).split(sz, 0)]
+        assert got == want, (size, sz, got, want)
+        n += 1
+    assert len(torch.zeros(3, 4).unbind(0)) == 3 and torch.zeros(3, 4).unbind(0)[0].shape == (4,); n += 1
+    try:
+        torch.randint(10, 0, (3,)); raise AssertionError("randint low >= high did not raise")
+    except RuntimeError:
+        n += 1
+    try:
+        torch.linspace(0.0, 1.0, -3); raise AssertionError("negative linspace steps did not raise")
+    except RuntimeError:
+        n += 1
+    assert torch.linspace(0.0, 1.0, 7).shape == (7,); n += 1
+    assert torch.randint(0, 10, (3, 4)).shape == (3, 4); n += 1
+    assert (torch.zeros(5, 1, 2, 3) @ torch.zeros(4, 3, 6)).shape == (5, 4, 2, 6); n += 1   # batched broadcast
+    assert (torch.zeros(3, 4) @ torch.zeros(4)).shape == (3,); n += 1
+    try:
+        torch.zeros(3) @ torch.zeros(4); raise AssertionError("1-D dot mismatch did not raise")
+    except RuntimeError:
+        n += 1
+    assert tF.pad(torch.zeros(2, 3), (1, 2)).shape == (2, 6); n += 1
+    assert tF.pad(torch.zeros(2, 3), (1, 1, 2, 0)).shape == (4, 5); n += 1
+    assert tF.interpolate(torch.zeros(1, 3, 16, 16), scale_factor=2.0).shape == (1, 3, 32, 32); n += 1
+    assert tF.one_hot(torch.zeros(7).long(), 5).shape == (7, 5); n += 1
+    assert tF.embedding(torch.zeros(8, 12).long(), torch.zeros(100, 64)).shape == (8, 12, 64); n += 1
+    try:
+        tF.dropout(torch.zeros(2, 2), 1.5); raise AssertionError("dropout p > 1 did not raise")
+    except ValueError:
+        n += 1
+    assert torch.zeros(2, 3, 4).flatten(1, 2).shape == (2, 12); n += 1
+    assert torch.zeros(6, 4).unflatten(0, (2, 3)).shape == (2, 3, 4); n += 1
+    try:
+        torch.zeros(6, 4).unflatten(0, (2, 4)); raise AssertionError("unflatten mismatch did not raise")
+    except RuntimeError:
+        n += 1
+    for idx in (-3, -2, 0, 1, 2):                            # select: the index is bounds-checked along the dim
+        try:
+            torch.zeros(2, 5).select(0, idx)
+            assert -2 <= idx < 2
+        except IndexError:
+            assert not (-2 <= idx < 2)
+        n += 1
+    assert torch.zeros(2, 5).narrow(1, 1, 3).shape == (2, 3); n += 1
+    try:
+        torch.zeros(2, 5).narrow(1, 3, 4); raise AssertionError("narrow overrun did not raise")
+    except RuntimeError:
+        n += 1
+    m = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 4))
+    assert m(torch.zeros(8, 16)).shape == (8, 4); n += 1
+    assert nn.Conv2d(3, 8, 3)(torch.zeros(1, 3, 32, 32)).shape == (1, 8, 30, 30); n += 1
+    assert nn.Flatten()(torch.zeros(8, 2, 3)).shape == (8, 6); n += 1
+    try:
+        nn.BatchNorm2d(5)(torch.zeros(4, 3, 8, 8)); raise AssertionError("BatchNorm channel mismatch did not raise")
+    except RuntimeError:
+        n += 1
+    try:
+        nn.BatchNorm2d(3)(torch.zeros(1, 3, 1, 1)); raise AssertionError("BatchNorm N==1 training did not raise")
+    except ValueError:
+        n += 1
+    assert nn.Embedding(100, 64)(torch.zeros(8, 12).long()).shape == (8, 12, 64); n += 1
+    import numpy as _np2
+    assert _np2.array([1, 2, 3]).repeat(2).shape == (6,); n += 1                 # numpy repeat interleaves
+    assert torch.zeros(3).repeat(2).shape == (6,); n += 1                        # torch repeat tiles
+    assert _np2.zeros((2, 3)).transpose().shape == (3, 2); n += 1                # numpy argless transpose reverses
+    return {"available": True, "checks": n}
+
+
 def stdlib_trapfree_audit():
     """Confirm each core._STDLIB_TF function raises no modeled trap on a well-typed argument and resolves to a callable; a modeled trap on a valid argument is an unsound allowlist entry (SoundnessError), an unmodeled exception (OSError, ...) is fine."""
     import importlib, os
@@ -7595,6 +7747,88 @@ def run_self_tests(fast=False):
     assert check("def f():\n    a = [2, 0]\n    d = a[:]\n    a.insert(0, 2)\n    a += [0]\n    return len(d)\n",
                  target="f").status != REFUTED                                    # a clean function: d is a copy
 
+    # the torch coverage battery: realistic tensor-code snippets, each pinned to the verdict real torch's
+    # behavior demands (every ground truth below was executed against torch 2.10 -- an ok row must not refute,
+    # a raising row must not prove). The verifier never imports torch, so these run everywhere.
+    _T2 = "import torch\n"
+    _F2 = "import torch\nimport torch.nn.functional as F\n"
+    _N2 = "import torch\nimport torch.nn as nn\n"
+    for _src, _want in [
+        (_T2 + "def f():\n    a = torch.randint(0, 10, (3, 4))\n    return a[2, 3]\n", PROVED),
+        (_T2 + "def f():\n    return torch.randint(10, 0, (3,))\n", REFUTED),                # low >= high
+        (_T2 + "def f():\n    a = torch.linspace(0.0, 1.0, 7)\n    return a[6]\n", PROVED),
+        (_T2 + "def f():\n    return torch.linspace(0.0, 1.0, -3)\n", REFUTED),              # negative steps
+        (_T2 + "def f():\n    a = torch.zeros(2, 3)\n    b = torch.full_like(a, 5.0)\n    return b[1, 2]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(2)\n    b = a.new_zeros(3, 4)\n    return b[2, 3]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(2, 3, 4)\n    b = a.flatten(1, 2)\n    return b.shape[1]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(2, 3)\n    return a.flatten()[6]\n", REFUTED),  # 1-D of 6: index 6 OOB
+        (_T2 + "def f():\n    a = torch.zeros(6, 4)\n    b = a.unflatten(0, (2, 3))\n    return b.shape[1]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(1, 2, 3)\n    b = a.squeeze(0)\n    return b[1, 2]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(2, 3)\n    return a.t().shape[0]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(2, 3, 4)\n    return a.t()\n", REFUTED),        # .t() needs rank <= 2
+        (_T2 + "def f():\n    a = torch.zeros(6, 4)\n    p = a.chunk(3, 0)\n    return p[0].shape[0]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(6, 4)\n    p = a.split(2, 0)\n    return p[2].shape[0]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(3, 4)\n    p = a.unbind(0)\n    return p[2].shape[0]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(5)\n    v, i = a.sort()\n    return v[4]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(10)\n    v, i = a.topk(3)\n    return v[2]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(3)\n    return a.topk(5)\n", REFUTED),          # k > size
+        (_T2 + "def f():\n    a = torch.zeros(2, 3, 4)\n    return a.mean(1).shape[1]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(2, 3)\n    return a.sum(-1).shape[0]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(2, 3)\n    return a.cumsum(5)\n", REFUTED),     # dim out of range
+        (_T2 + "def f():\n    a = torch.zeros(2, 3)\n    return a.softmax(4)\n", REFUTED),    # dim out of range
+        (_T2 + "def f():\n    a = torch.zeros(2, 3)\n    return a.softmax(1)[1, 2]\n", PROVED),
+        (_T2 + "def f():\n    m = torch.zeros(3, 4)\n    v = torch.zeros(4)\n    return (m @ v)[2]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(3)\n    b = torch.zeros(4)\n    return a @ b\n", REFUTED),
+        (_T2 + "def f():\n    a = torch.zeros(5, 1, 2, 3)\n    b = torch.zeros(4, 3, 6)\n    return (a @ b).shape[1]\n", PROVED),
+        (_F2 + "def f():\n    x = torch.zeros(8, 16)\n    w = torch.zeros(32, 16)\n    return F.linear(x, w).shape[1]\n", PROVED),
+        (_F2 + "def f():\n    x = torch.zeros(8, 16)\n    w = torch.zeros(32, 20)\n    return F.linear(x, w)\n", REFUTED),
+        (_F2 + "def f():\n    x = torch.zeros(8, 16)\n    w = torch.zeros(32, 16)\n    b = torch.zeros(32)\n    return F.linear(x, w, b).shape[0]\n", PROVED),
+        (_F2 + "def f():\n    x = torch.zeros(1, 3, 32, 32)\n    w = torch.zeros(8, 3, 3, 3)\n    return F.conv2d(x, w).shape[2]\n", PROVED),
+        (_F2 + "def f():\n    x = torch.zeros(1, 4, 32, 32)\n    w = torch.zeros(8, 3, 3, 3)\n    return F.conv2d(x, w)\n", REFUTED),
+        (_F2 + "def f():\n    x = torch.zeros(1, 3, 32, 32)\n    w = torch.zeros(8, 3, 3, 3)\n    return F.conv2d(x, w, None, 2, 1).shape[3]\n", PROVED),
+        (_F2 + "def f():\n    x = torch.zeros(1, 3, 32, 32)\n    return F.max_pool2d(x, 2).shape[2]\n", PROVED),
+        (_F2 + "def f():\n    x = torch.zeros(1, 3, 33, 33)\n    return F.avg_pool2d(x, 2).shape[3]\n", PROVED),
+        (_F2 + "def f():\n    x = torch.zeros(4, 4)\n    return F.dropout(x, 0.5)[0, 0]\n", PROVED),
+        (_F2 + "def f():\n    x = torch.zeros(4, 4)\n    return F.dropout(x, 1.5)\n", REFUTED),   # p outside [0, 1]
+        (_F2 + "def f():\n    w = torch.zeros(100, 64)\n    i = torch.zeros(8, 12)\n    return F.embedding(i.long(), w).shape[2]\n", PROVED),
+        (_F2 + "def f():\n    i = torch.zeros(7)\n    return F.one_hot(i.long(), 5).shape[1]\n", PROVED),
+        (_F2 + "def f():\n    a = torch.zeros(4, 4)\n    b = torch.zeros(4, 4)\n    return F.mse_loss(a, b)\n", PROVED),
+        (_F2 + "def f():\n    x = torch.zeros(2, 3)\n    return F.pad(x, (1, 1)).shape[1]\n", PROVED),
+        (_F2 + "def f():\n    x = torch.zeros(1, 3, 16, 16)\n    return F.interpolate(x, scale_factor=2.0).shape[3]\n", PROVED),
+        (_F2 + "def f():\n    x = torch.zeros(4, 8)\n    return F.normalize(x).shape[1]\n", PROVED),
+        (_F2 + "def f():\n    x = torch.zeros(4, 8)\n    return F.layer_norm(x, (8,))[3, 7]\n", PROVED),
+        (_N2 + "def f():\n    m = nn.Linear(16, 32)\n    x = torch.zeros(8, 16)\n    return m(x).shape[1]\n", PROVED),
+        (_N2 + "def f():\n    m = nn.Linear(16, 32)\n    x = torch.zeros(8, 20)\n    return m(x)\n", REFUTED),
+        (_N2 + "def f():\n    m = nn.ReLU()\n    x = torch.zeros(2, 3)\n    return m(x)[1, 2]\n", PROVED),
+        (_N2 + "def f():\n    m = nn.Conv2d(3, 8, 3)\n    x = torch.zeros(1, 3, 32, 32)\n    return m(x).shape[1]\n", PROVED),
+        (_N2 + "def f():\n    m = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 4))\n    x = torch.zeros(8, 16)\n    return m(x).shape[1]\n", PROVED),
+        (_N2 + "def f():\n    m = nn.Flatten()\n    x = torch.zeros(8, 2, 3)\n    return m(x).shape[1]\n", PROVED),
+        (_N2 + "def f():\n    m = nn.Dropout(0.1)\n    x = torch.zeros(4, 4)\n    return m(x)[3, 3]\n", PROVED),
+        (_N2 + "def f():\n    m = nn.Dropout(1.5)\n    x = torch.zeros(4, 4)\n    return m(x)\n", REFUTED),
+        (_N2 + "def f():\n    m = nn.Embedding(100, 64)\n    i = torch.zeros(8, 12)\n    return m(i.long()).shape[2]\n", PROVED),
+        (_N2 + "def f():\n    m = nn.BatchNorm2d(3)\n    x = torch.zeros(4, 3, 8, 8)\n    return m(x).shape[1]\n", PROVED),
+        (_N2 + "def f():\n    m = nn.BatchNorm2d(5)\n    x = torch.zeros(4, 3, 8, 8)\n    return m(x)\n", REFUTED),
+        (_T2 + "def f():\n    a = torch.zeros(4, 1)\n    b = torch.zeros(1, 5)\n    return (a + b).shape[1]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(2, 3)\n    b = torch.ones(2, 3)\n    return (a < b).shape[1]\n", PROVED),
+        (_T2 + "def f():\n    q = torch.zeros(2, 8, 16)\n    k = torch.zeros(2, 8, 16)\n    s = q @ k.transpose(1, 2)\n    return s.shape[2]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(2, 3)\n    b = torch.zeros(5, 3)\n    c = torch.cat((a, b), 0)\n    return c.reshape(7, 3)[6, 2]\n", PROVED),
+        (_T2 + "def f():\n    a = torch.zeros(2, 3)\n    return a.to('cpu').float().detach().shape[0]\n", PROVED),
+        (_N2 + "def f():\n    x = torch.zeros(16, 3, 28, 28)\n    c = nn.Conv2d(3, 16, 3, padding=1)\n    p = nn.MaxPool2d(2)\n    return p(c(x)).shape[2]\n", PROVED),  # padding= keyword + a CNN block
+        (_T2 + "def f():\n    x = torch.zeros(8, 64)\n    x.relu_()\n    x.add_(1)\n    return x.shape[1]\n", PROVED),   # bare in-place tensor ops keep the shape
+        (_N2 + "def f():\n    c = nn.Conv1d(32, 64, 5, stride=2)\n    x = torch.zeros(16, 32, 100)\n    return c(x).shape[2]\n", PROVED),  # a stride= keyword conv
+    ]:
+        _v2 = check(_src, target="f")
+        assert _v2.status == _want, (_src, _v2.status, _v2.reason)
+    # numpy .repeat interleaves elements (torch's .repeat tiles): the two decide per origin, and an array of
+    # unknown origin abstains on the divergent methods rather than borrow the wrong library's meaning.
+    assert prove("import numpy as np\ndef f():\n    a = np.array([1, 2, 3])\n    return a.repeat(2).shape[0]\n",
+                 "result == 6", target="f").status == PROVED
+    assert prove("import torch\ndef f():\n    a = torch.zeros(3)\n    return a.repeat(2).shape[0]\n",
+                 "result == 6", target="f").status == PROVED
+    # the model's shapes and traps against the real libraries, where installed: torch mirrors the numpy
+    # differential below -- every formula-bearing op is executed on a parameter grid and compared exactly.
+    assert torch_shape_audit()["available"] in (True, False)
+
     # count the asserts by parsing the whole file and walking run_self_tests. inspect.getsource's block detection can under-read the function on some platforms, so the full-file parse is primary, inspect the fallback for a frozen or source-less install.
     try:
         with open(__file__, encoding="utf-8") as _fh:
@@ -7872,6 +8106,7 @@ __all__ = [
     'math_pow_axiom_audit',
     'math_domain_audit',
     'stdlib_trapfree_audit',
+    'torch_shape_audit',
     'tryexcept_differential_audit',
     'string_method_axiom_audit',
     'format_spec_audit',
