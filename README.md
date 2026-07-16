@@ -147,7 +147,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: CharlesCNorton/touchstone@v1.29.0
+      - uses: CharlesCNorton/touchstone@v1.60.0
         with:
           baseline: .touchstone-baseline.json   # fail only on a newly introduced trap
 ```
@@ -156,7 +156,7 @@ jobs:
 # .pre-commit-config.yaml -- gate changed functions before each commit
 repos:
   - repo: https://github.com/CharlesCNorton/touchstone
-    rev: v1.29.0
+    rev: v1.60.0
     hooks:
       - id: touchstone-gate
 ```
@@ -172,11 +172,12 @@ work and any repeated top-level side effects (a stray print per worker).
 
 ```
 $ touchstone prove f.py --ensures 'result == x'
-REFUTED  [property via verified VC generator (Rocq-extracted wpg)]
+REFUTED  f  [property via verified VC generator (Rocq-extracted wpg)]
   counterexample: x=0
   trace:
-    line 2: return x + 1    [x=0]
-    => returns 1
+    at x=0
+      line 2: return x + 1    [x=0]
+      => returns 1
 ```
 
 ## What it covers
@@ -188,8 +189,10 @@ synthesized loop invariants, with a sound over-approximation for a for-loop, com
 the exact engines decline; abstract interpretation (interval, zone, octagon, Karr, polyhedra, machine-integer);
 IEEE-754 floating point total over every double, with Inf and NaN as first-class inputs, exact floor division
 and modulo, and the `math` module (domain errors as traps, transcendentals as sound over-approximations); numpy
-arrays and torch tensors carried by their shape (broadcasting, matrix multiply, axis reductions, reshape, the
-shape-mismatch trap); a curated set of pure standard-library functions proved trap free; arrays with quantified
+arrays and torch tensors carried by their shape -- construction, broadcasting, batched matrix multiply, axis
+reductions, the reshape / view / flatten / squeeze / unsqueeze family, concatenation and stacking, chunk / split
+partitioning, and per-axis index bounds -- with the negative-dimension, shape-mismatch, and out-of-range traps
+the libraries raise; a curated set of pure standard-library functions proved trap free; arrays with quantified
 specifications; termination and cost of counted, container, and data-dependent loops and of self- and mutual
 recursion, with non-termination reported as a findable bug; exceptions; rely-guarantee concurrency over locks,
 counting semaphores, condition variables, and async/await; and separation logic with the frame rule, the magic
@@ -201,6 +204,16 @@ Unicode codepoint bijection; and the fields of an opaque object parameter, duck-
 an attribute decides. A generator's yielded values are checked at every yield, including a loop-carried
 accumulator unrolled to a bound; a recursive callee the inliner cannot unfold is summarized at the call site by
 its `@ensure` contract; and `verify_equiv` decides equivalence of two for-loops by a relational product.
+
+The neural-network layers run on that same shape algebra: the `torch.nn.functional` operators and their
+`torch.nn` module equivalents -- `linear`, the 1-D through 3-D convolutions and poolings (the exact
+output-size formula, floor and ceil mode), `embedding`, `one_hot`, `pad`, `interpolate`, the elementwise
+losses, and layer / RMS normalization -- each produce their output shape and raise the `RuntimeError` /
+`ValueError` torch raises on a feature, channel, or kernel mismatch, and a `torch.nn.Sequential` of them folds
+end to end, so an MLP or a convolutional block decides its shapes and shape traps through the pipeline. The
+model runs the numpy and torch semantics apart where they diverge (`.t()` above rank two, torch `.repeat`
+tiling versus numpy interleave) and abstains when an array's originating library is unknown; a per-operator
+differential audit holds every output formula and trap against the installed torch, gated in CI.
 
 A non-integer parameter is carried through the value engine rather than abandoned to the integer engines: a
 string method such as `encode`, a starred unpacking `a, *b = seq`, and an in-repo class constructor (its
@@ -305,7 +318,8 @@ trap-aware); a fixed-width two's-complement model proven to agree with unbounded
 operation overflows; the division and modulo encoding proven to refine the SMT-LIB theory for every conforming
 solver; the abstract-domain transfers; the type-inference lattice join; the string, container, and heap
 McCarthy-array (read-after-write and frame) laws; the tensor shape algebra (broadcast, concatenation, matrix
-multiply, reshape, and transpose); the separation-logic frame rule; the rely-guarantee concurrency principle;
+multiply, reshape, transpose, the convolution and pooling output formula in floor and ceil mode, flatten, and
+the chunk / split partition); the separation-logic frame rule; the rely-guarantee concurrency principle;
 the float divmod laws (over the rationals the IEEE-754 doubles inhabit, so the proof is axiom-free); the
 translation as a semantics-preserving functor; and the end-to-end theorem that a discharged verification
 condition implies the property. SMTCoq additionally re-checks each integer obligation's certificate inside
@@ -315,7 +329,8 @@ The VC generators, the interval operators, the `//` / `%` encoding, and the type
 from those proofs; the engine runs the Python image of that extraction directly, and a shipped audit holds each
 module byte-for-byte equal to the committed JSON extraction on every install with no Coq toolchain. The
 differential checks against CPython and the machine-generated fuzz corpora (integer, sequence, recursion,
-while-invariant, interprocedural) are completeness regressions over that verified core.
+while-invariant, interprocedural, object-attribute) are completeness regressions over that verified core, and
+where numpy or torch is installed a per-operator differential holds the tensor shape model against the library.
 
 ## Type inference
 
