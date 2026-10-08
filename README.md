@@ -147,7 +147,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: CharlesCNorton/touchstone@v1.60.0
+      - uses: CharlesCNorton/touchstone@v1.61.0
         with:
           baseline: .touchstone-baseline.json   # fail only on a newly introduced trap
 ```
@@ -156,7 +156,7 @@ jobs:
 # .pre-commit-config.yaml -- gate changed functions before each commit
 repos:
   - repo: https://github.com/CharlesCNorton/touchstone
-    rev: v1.60.0
+    rev: v1.61.0
     hooks:
       - id: touchstone-gate
 ```
@@ -220,14 +220,89 @@ string method such as `encode`, a starred unpacking `a, *b = seq`, and an in-rep
 `__init__` confirmed trap free). A behavior-preserving decorator (`functools.lru_cache` / `cache` / `wraps`, or a
 binding marker) is analyzed as its undecorated body; a for-loop counter stepped by an integer constant carries
 its exact post-loop value `s_init + step * len(seq)`; and a variable possibly read before assignment makes the
-checker abstain.
+checker abstain. A list parameter the body only reads is carried through the loop engines as its length and an
+element array, its `for` loops lowered to index loops, so a binary search's bounds and a loop's index reads are
+proved; a trap inside a single loop is checked under the loop invariant.
 
 Values carry their real types through the symbolic core; the heap models object identity, aliasing, mutation,
 and method dispatch along the C3 MRO; a sequence index is checked against the container's length and a dict key
-against the keys provably present (`*args` is such a sequence, `**kwargs` such a dict). The traps that refute a
-totality claim are these, plus None in arithmetic, type mismatches, division by zero, and fixed-width overflow;
-inside a for-loop the first iteration is checked exactly, so a per-element trap refutes on a non-empty witness
-while later iterations stay an over-approximation.
+against the keys provably present (`*args` is such a sequence, `**kwargs` such a dict), and a container annotated
+`list[str]` / `tuple[float, ...]` / `set[bool]` holds elements of that type, a `dict[str, int]` keys and values of
+its two types, and each position of a `tuple[int, str]`, of a `zip` / `enumerate` / `items()` element, and of an
+unpacking its own type. An element of a sequence parameter is read as a fresh value of its type, and a second read
+that may name an element already read (the same or a symbolic index, an alias, a copy, a slice, a `sorted` or
+`reversed` view, an aggregate such as `min` or `sum`) marks the state over-approximated, so a trap that needs two
+reads to disagree is never a refutation, while reads of provably distinct elements and a single read of a view stay
+exact. The traps that refute a totality
+claim are these, plus None in arithmetic, type mismatches, division by zero, and fixed-width overflow; inside a
+for-loop the first iteration is checked exactly, so a per-element trap refutes on a non-empty witness while later
+iterations stay an over-approximation.
+
+Comparison and equality follow CPython exactly. An int compares with a float by mathematical value, never by
+rounding the int (`2**53 + 1 > 2.0**53`), and so does a Fraction; `1`, `1.0` and `True` are one dict key and one
+set element, `+0.0` and `-0.0` are one key, and a NaN equals nothing. A container membership, a tuple comparison
+and a dict lookup test identity before `==`, so the same NaN object is found while a recomputed NaN is not; two
+float arguments the caller may alias carry that choice as an input, and a counterexample is reported only when it
+does not depend on it. A list never equals a tuple, and an unhashable key or set element (a list, a dict) is the
+TypeError CPython raises. A container equals itself and never a number, a string, `None` or a container of another
+kind; two literals compare by content (a bytes literal carries its own bytes, so an index or an iteration over it
+reads the literal's values), and two sequences the engine cannot compare by content give an undetermined answer that
+implies equal lengths and holds for two empty ones, so no trap is fabricated from it. The conversions CPython performs raise where CPython raises: an int too large for a
+double raises OverflowError in `float(n)`, in int-float arithmetic and in every `math` function that converts its
+argument (`math.log` does not, and is modeled as not); an int / int true division whose quotient overflows a
+double raises it too; rendering an int of more than `sys.get_int_max_str_digits()` digits in decimal -- `str`,
+`repr`, `print`, an f-string, `format`, `%d` / `%s`, `json.dumps` -- raises ValueError, while hex, octal and binary
+renderings do not; `str.encode()` raises UnicodeEncodeError on a surrogate code point; and `hash()` of an int is
+CPython's exact residue modulo the Mersenne prime of the build. A printf-style `%` with a constant format string
+is checked conversion by conversion (argument count, mapping keys, the type each conversion accepts, `%c` range),
+and `sum()` over a literal sequence reproduces CPython's own algorithm, including the int fast path's C-long
+limits and, from 3.12, its compensated float summation. `int(x)`, `math.floor` / `ceil` / `trunc` and `round(x)`
+of a float are exact: the integer equal to the double rounded to an integral value in the conversion's direction
+(half to even for `round`), with OverflowError for an infinity and ValueError for a NaN.
+
+A value that may be None is carried as such: a callee that returns None on some path, `d.get(k)` and `re.match`
+hand back a value that is None exactly where CPython's is, so arithmetic, ordering, a subscript or an attribute on
+it raises there, while an `is None` test, a truthiness guard or `or default` narrows it. A callee is inlined with
+the caller's own argument types, and a self-recursive callee proved trap free stands for its body only at a call
+whose arguments have the types it was proved for, its result of the sort it returns. A constant regular expression
+is translated through CPython's own parser into a z3 regular expression, so `re.match` / `search` / `fullmatch`
+succeed exactly when CPython's do, a `Match` group past the pattern's groups is an IndexError, and a group that
+need not take part may be None; a pattern outside the translation (lookaround, backreferences, case folding, a
+word boundary) leaves the match undecided. The predicates `isdigit` / `isdecimal` / `isnumeric` / `isalpha` /
+`isalnum` / `isspace` / `isascii` / `isprintable` / `isupper` / `islower` are exact over the interpreter's own
+character classes; `int(s)` and `float(s)` raise ValueError exactly off their literal grammars, `int(s)` also past
+the digit limit; and `encode` / `decode` raise exactly where the utf-8, utf-16, utf-32, ascii and latin-1 codecs
+do, the decode of encoded bytes reading back the source. `str.split`, the case maps, `replace` and `count` are
+functions of their arguments with sound length facts (a case map grows exactly when a character's map is longer,
+as `'ß'.upper()` does), and a refutation that rests on one stands only once its model agrees with CPython's own
+result.
+
+The curated trap-free standard-library functions carry their argument traps: a negative count in
+`itertools.tee` / `product(repeat=)` / `batched`, a width at or below zero in `textwrap`, a negative `lo` in
+`bisect`, a negative `maxlen` in `collections.deque`, an empty separator in `string.capwords`, an invalid action
+or line number in `warnings` filters (AssertionError on 3.11, ValueError / TypeError from 3.12), a NUL in a path
+passed to `os.stat` and its relatives, an out-of-range `os.strerror` code, `json.dumps` of an unserializable value
+or of an int past the digit limit, and a str passed where bytes are required (`hashlib`, `base64`). A function the
+running interpreter does not provide (`itertools.batched` before 3.12, `os.getuid` off POSIX) is never assumed
+trap free, and a bare name resolves to a standard-library function only through the module's own
+`from m import name`. Behavior that differs by platform or version (which path functions reject a NUL, which
+`strftime` directives are valid) is read from the running interpreter with fixed, harmless probe calls.
+
+A parameter whose default is None or an empty mutable literal is also checked with the argument omitted, the
+call that binds the default, since its annotation (or the int reading of an unannotated parameter) never
+includes None; a refutation there names the omitted argument. A recursive callee's `@ensure` contract stands for
+its body at a call site only after the callee is proved, on its own, to establish that contract trap free under
+its `@require` (its own self-calls using the contract as the induction hypothesis); a call whose arguments may
+violate the `@require` is then a possible trap. A generator expression its function never consumes runs only its
+first iterable, and `range(...)` in a for-loop evaluates its bounds once, at loop entry, as CPython does.
+
+When the symbolic engines leave `check`, `prove` or `verify_equiv` undecided, inputs of the parameters' types are
+run in the sandbox -- boundary values first (0 and ±1, the limits of the double and C-long ranges, the IEEE-754
+specials, strings at the int digit limit or holding a case-changing letter, a non-decimal digit, a surrogate or a
+NUL), then random draws -- and a modeled trap, a postcondition false of the returned value, or two different
+outcomes refute with that input. A symbolic refutation with no replayable input gets one the same way. The sandbox
+gives the subject only pure builtins (no import, no file or network access) and a step budget per input; it is on
+by default and off in `scan` without `--execute`.
 
 A property is stated in Python over the parameters and `result` (`prove`), with `len`, indexing, membership,
 `old(e)` for the entry value, and bounded `all` / `any` over a concrete range or literal; written as
@@ -293,7 +368,8 @@ What returns UNKNOWN, always named, never guessed:
 - a generator with branching control flow (the object is total; its lazily-yielded elements are left to the
   consumer), and a possible read-before-assignment;
 - a nonlinear or hard query left undecided within the deterministic budget, where a larger one is available
-  with `--budget high`.
+  with `--budget high`;
+- a string literal holding a character beyond U+2FFFF, outside the SMT-LIB string alphabet both solvers share.
 
 ## Soundness
 
@@ -311,6 +387,27 @@ solver re-verifies. `prove` / `verify` / `check` establish partial correctness (
 holds, not termination -- that is `verify_total` / `check --total`); a UNKNOWN that exceeds the default bound can
 be retried at `--budget high`.
 
+A verdict describes the program under the interpreter running Touchstone: its CPython version and platform
+decide the behaviors that differ between them (the `sum()` algorithm, the `warnings` exception types, which path
+functions reject a NUL, the C `long` width), and the gate runs on 3.11, 3.12 and 3.13. A parameter's inputs are
+those of its annotation; an unannotated parameter is read as the type its uses imply -- a str when it is passed to
+a str argument of a standard-library function or has a str method called on it, a sequence when indexed, a dict
+when keyed by a string, an int otherwise -- and an unparameterized container annotation (`list`, `dict`, `tuple`,
+`set`) as one holding ints. A type error that would follow only from another reading of an unannotated parameter
+makes the engine abstain rather than report it. The execution model counts every input of that reading, with two
+bounds every real run respects: a container holds at most
+`sys.maxsize` items, and a single loop runs fewer than 2**63 iterations, so a trap that only a longer run reaches
+(counting a `range` past 10**4300 before rendering the count) is not reported. String inputs range over the
+SMT-LIB alphabet, U+0000 through U+2FFFF. A conversion between int (or Fraction) and float is never decided by
+z3, which answers such queries unsoundly in every solver configuration: a comparison of a conversion with a
+numeral becomes its exact integer image (round-to-nearest-even is monotone, so the reals that round to a double
+form an interval with rational ends), a query whose integers are all bounded is decided as an exact bitvector and
+float image, an unbounded one is proved by a conversion-free over-approximation or refuted on a bounded region,
+and cvc5, under a time cap, is the last resort; a counterexample from any of these is re-checked against the
+original query with its values pinned. Spacer's invariant for a PROVED is re-checked by cvc5 verification
+condition by verification condition; an invariant that fails the check is re-derived with relation inlining off,
+and a proof whose invariant still does not validate is withheld.
+
 The trust base is machine-checked in Rocq (`proofs/`), every theorem closed under the global context with no
 axioms and no Admitted: the operational semantics of the modeled subset; the VC generator over it (sound and
 complete for straight-line assignment and conditionals, sound for while-loops carrying an invariant,
@@ -321,8 +418,11 @@ McCarthy-array (read-after-write and frame) laws; the tensor shape algebra (broa
 multiply, reshape, transpose, the convolution and pooling output formula in floor and ceil mode, flatten, and
 the chunk / split partition); the separation-logic frame rule; the rely-guarantee concurrency principle;
 the float divmod laws (over the rationals the IEEE-754 doubles inhabit, so the proof is axiom-free); the
-translation as a semantics-preserving functor; and the end-to-end theorem that a discharged verification
-condition implies the property. SMTCoq additionally re-checks each integer obligation's certificate inside
+integer images behind the int / float bridge (a monotone rounding's comparison with a constant is one threshold,
+an integer against a rational threshold is a ceiling or floor comparison, a quotient against a threshold scales
+by the divisor, and SMT-LIB's Euclidean division is the truncating one corrected by a step); the translation as
+a semantics-preserving functor; and the end-to-end theorem that a discharged verification condition implies the
+property. SMTCoq additionally re-checks each integer obligation's certificate inside
 Coq's kernel.
 
 The VC generators, the interval operators, the `//` / `%` encoding, and the type-lattice join are extracted
@@ -331,6 +431,12 @@ module byte-for-byte equal to the committed JSON extraction on every install wit
 differential checks against CPython and the machine-generated fuzz corpora (integer, sequence, recursion,
 while-invariant, interprocedural, object-attribute) are completeness regressions over that verified core, and
 where numpy or torch is installed a per-operator differential holds the tensor shape model against the library.
+The gate also replays the models this section describes against the running CPython: the rounding intervals
+behind the int / float rewrite, random int-float claims decided by the conversion-free routes, `sum()` bit for
+bit, printf-style formatting, every allowlisted standard-library trap at its boundary, `==` and dict lookup
+across int, bool, float, str, None, tuple and list values, the regular-expression translation against `re` (every
+code point of each character class, then random patterns, strings and match modes), and the string predicates,
+the `int()` / `float()` literal grammars with the digit limit at its boundary, and the codec failure conditions.
 
 ## Type inference
 

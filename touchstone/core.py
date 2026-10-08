@@ -15,6 +15,21 @@ from functools import lru_cache
 from typing import Callable, Dict, List, Optional, Tuple
 import z3
 
+def _string_val(s, ctx=None):
+    """z3.StringVal with every character escaped exactly: z3's own StringVal leaves a backslash as is, so the
+    Python text '\\\\u0041' (a backslash, u, 0041) would be read back as the SMT escape for 'A'. Each backslash and
+    each non-printable or non-ASCII character becomes its \\u{...} code point here. A character beyond U+2FFFF --
+    outside the SMT-LIB string alphabet -- has no image and is refused as unmodeled."""
+    if isinstance(s, str):
+        if any(ord(ch) > 0x2FFFF for ch in s):
+            raise Unsupported("a string character beyond U+2FFFF is outside the SMT-LIB string alphabet")
+        s = "".join(ch if 32 <= ord(ch) < 127 and ch != "\\" else "\\u{%x}" % ord(ch) for ch in s)
+    ctx = z3.z3._get_ctx(ctx)
+    return z3.SeqRef(z3.Z3_mk_string(ctx.ref(), s), ctx)
+
+
+z3.StringVal = _string_val
+z3.z3.StringVal = _string_val
 z3.set_param("smt.random_seed", 1)
 z3.set_param("sat.random_seed", 1)
 z3.set_param("fp.spacer.random_seed", 0)     # the Fixedpoint/Spacer engines, deterministic across machines
@@ -58,6 +73,8 @@ FP_SOLVE_RLIMIT = 400000000              # deterministic bound for the bit-blast
 #                                          not to bind on a decidable FP query (a double bit-blast costs far
 #                                          more than the integer path)
 CVC5_RLIMIT = 12000000                   # deterministic resource bound for cvc5 (rlimit, not wall-clock tlimit)
+CVC5_BRIDGE_TLIMIT_MS = 10000            # wall-clock backstop for cvc5 on an int / float conversion it decides alone
+#                                          (its rlimit does not meter every step of that theory combination)
 SOS_RLIMIT = 80000000                    # deterministic bound for the (nonlinear) SOS Gram-matrix synthesis
 BUDGET_ESCALATE_CAP = 200000000          # rlimit ceiling for one auto-escalation of a budget-bound UNKNOWN
 _BUDGET_ESCALATING = False               # re-entrancy guard so an escalated retry does not escalate again
@@ -153,8 +170,9 @@ class _TrapList(list):
 
 
 def _trap_add(ctx, cond, kinds):
-    """Append a trap condition with its possible exception kinds when the sink tracks kinds, else plainly."""
-    if isinstance(ctx.traps, _TrapList):
+    """Append a trap condition with its possible exception kinds when the sink tracks kinds, else plainly
+    (kinds None: any exception may be raised there)."""
+    if isinstance(ctx.traps, _TrapList) and kinds is not None:
         ctx.traps.add(cond, kinds)
     else:
         ctx.traps.append(cond)
@@ -321,18 +339,53 @@ class _Desugar(ast.NodeTransformer):
         if sv is None or sv == 0:                          # nonzero constant step (`-1` parses as a unary minus)
             return node
         i = node.target.id
-        ctr = "__forc%d" % self._bump()                    # a fresh counter, independent of the loop variable: a
+        k = self._bump()
+        ctr = "__forc%dk%d" % (k, abs(sv))                 # a fresh counter, independent of the loop variable: a
         #                                                    nested loop that reuses the name (for i ...: for i ...)
-        #                                                    must not clobber this one, as Python's iterator does not
+        #                                                    must not clobber this one, as Python's iterator does not.
+        #                                                    The name carries |step| for the iteration bound below.
         init = ast.Assign(targets=[ast.Name(id=ctr, ctx=ast.Store())], value=start)
-        bind = ast.Assign(targets=[ast.Name(id=i, ctx=ast.Store())],   # rebind the loop variable each iteration from
-                          value=ast.Name(id=ctr, ctx=ast.Load()))      # the hidden counter, the way the protocol does
-        incr = ast.Assign(targets=[ast.Name(id=ctr, ctx=ast.Store())],
+        const_start = isinstance(start, ast.Constant) or (isinstance(start, ast.UnaryOp)
+                                                          and isinstance(start.operand, ast.Constant))
+        base = ast.Assign(targets=[ast.Name(id="__forb%d" % k, ctx=ast.Store())],   # the start, kept: the counter
+                          value=(start if const_start else ast.Name(id=ctr, ctx=ast.Load())))   # stays within
+        bind = ast.Assign(targets=[ast.Name(id=i, ctx=ast.Store())],   # 2**63 steps of it. Rebind the loop variable
+                          value=ast.Name(id=ctr, ctx=ast.Load()))      # each iteration from the hidden counter, the
+        incr = ast.Assign(targets=[ast.Name(id=ctr, ctx=ast.Store())],   # way the protocol does
                           value=ast.BinOp(left=ast.Name(id=ctr, ctx=ast.Load()), op=ast.Add(), right=step))
+        pre = [init, base]
+        # range() evaluates its bound once, at loop entry: a bound the body can change (a reassigned name, a call,
+        # an attribute or subscript) is held in a hidden variable rather than re-read by the loop test
+        changed, elem_changed = set(), set()               # names the body rebinds / resizes, or whose items it sets
+        for st in node.body:
+            for n in ast.walk(st):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                    changed.add(n.id)
+                elif isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store) and isinstance(n.value, ast.Name) \
+                        and not isinstance(n.slice, ast.Slice):
+                    elem_changed.add(n.value.id)             # a[i] = v keeps len(a)
+                elif isinstance(n, (ast.Subscript, ast.Attribute)) and isinstance(n.ctx, (ast.Store, ast.Del)) \
+                        and isinstance(n.value, ast.Name):
+                    changed.add(n.value.id)
+                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
+                        and isinstance(n.func.value, ast.Name) and n.func.attr in _MUTATING_METHODS:
+                    changed.add(n.func.value.id)
+        pure = all(not isinstance(n, ast.Call) or (isinstance(n.func, ast.Name) and n.func.id in ("len", "abs",
+                   "min", "max", "int")) for n in ast.walk(stop))
+        len_args = {id(c.args[0]) for c in ast.walk(stop) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                    and c.func.id == "len" and len(c.args) == 1 and isinstance(c.args[0], ast.Name)}
+        stop_names = {n.id for n in ast.walk(stop) if isinstance(n, ast.Name)}
+        value_names = {n.id for n in ast.walk(stop) if isinstance(n, ast.Name) and id(n) not in len_args}
+        if not pure or (stop_names & changed) or (value_names & elem_changed):
+            held = "__fors%d" % k
+            pre.append(ast.Assign(targets=[ast.Name(id=held, ctx=ast.Store())], value=stop))
+            stop = ast.Name(id=held, ctx=ast.Load())
+        if const_start:                                    # a constant start: the counter's init stays the statement
+            pre = pre[1:] + [init]                         # right before the loop (_while_enters reads it there)
         # ascending range stops at the counter >= stop, descending at <= stop
         cmp = ast.Lt() if sv > 0 else ast.Gt()
         test = ast.Compare(left=ast.Name(id=ctr, ctx=ast.Load()), ops=[cmp], comparators=[stop])
-        return [init, ast.While(test=test, body=[bind] + node.body + [incr], orelse=node.orelse)]
+        return pre + [ast.While(test=test, body=[bind] + node.body + [incr], orelse=node.orelse)]
 
     def _unroll_for(self, node):
         """Unroll a for-loop over a constant iterable (a tuple/list literal, or enumerate/zip of
@@ -544,7 +597,7 @@ class _Desugar(ast.NodeTransformer):
         """Lower a list/set/dict comprehension or generator expression over a constant iterable to
         statements that build the collection element by element, with the filter as a guarded
         append/add/store. Returns None unless the iterable is constant and has a single clause."""
-        if len(comp.generators) != 1:
+        if len(comp.generators) != 1 or getattr(comp, "_ts_lazy", False):   # an unconsumed generator never runs
             return None
         gen = comp.generators[0]
         if getattr(gen, "is_async", 0):
@@ -628,6 +681,8 @@ def _clone_ast(node):
                 setattr(new, attr, getattr(node, attr))
         if getattr(node, "_inplace_aug", False):
             new._inplace_aug = True                          # the desugarer's aug-assign marker (not an ast attribute)
+        if getattr(node, "_ts_lazy", False):
+            new._ts_lazy = True                              # a generator expression nothing in its function consumes
         return new
     if type(node) is list:
         return [_clone_ast(x) for x in node]
@@ -641,12 +696,39 @@ def _parse_template(src: str) -> ast.Module:
     template is never handed out directly -- _parse returns a fast deep clone -- so a caller that mutates its
     tree (symexec's async strip, a contract-decorator strip) cannot corrupt the cache or another caller's tree."""
     parsed = ast.parse(textwrap.dedent(src))
+    _mark_lazy_generators(parsed)
     classes = {n.name: n for n in parsed.body if isinstance(n, ast.ClassDef)}
     suppress_names = {a.asname or a.name for n in ast.walk(parsed)        # `from contextlib import suppress`
                       if isinstance(n, ast.ImportFrom) and n.module == "contextlib"
                       for a in n.names if a.name == "suppress"}
     tree = _Desugar(classes, suppress_names).visit(parsed)
     return ast.fix_missing_locations(tree)
+
+
+def _mark_lazy_generators(tree):
+    """Mark (`_ts_lazy`) each generator expression its function never consumes: one returned, discarded as a
+    statement, or bound to a name that is only ever returned. Such a generator's element and conditions never run
+    inside the function (only its first iterable is evaluated, at creation), so their traps are not the function's."""
+    scopes = [tree] + [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
+    for scope in scopes:
+        body_nodes = []
+        stack = list(ast.iter_child_nodes(scope))
+        while stack:                                          # this scope's nodes, not a nested function's
+            n = stack.pop()
+            body_nodes.append(n)
+            if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                stack.extend(ast.iter_child_nodes(n))
+        returned = {id(n.value) for n in body_nodes if isinstance(n, ast.Return) and isinstance(n.value, ast.Name)}
+        for n in body_nodes:
+            if isinstance(n, (ast.Return, ast.Expr)) and isinstance(n.value, ast.GeneratorExp):
+                n.value._ts_lazy = True
+            elif (isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
+                  and isinstance(n.value, ast.GeneratorExp)):
+                g = n.targets[0].id
+                loads = [m for m in body_nodes if isinstance(m, ast.Name) and m.id == g and isinstance(m.ctx, ast.Load)]
+                stores = [m for m in body_nodes if isinstance(m, ast.Name) and m.id == g and isinstance(m.ctx, ast.Store)]
+                if len(stores) == 1 and all(id(m) in returned for m in loads):
+                    n.value._ts_lazy = True
 
 
 def _parse(src: str) -> ast.Module:
@@ -663,12 +745,47 @@ def _mark_free_math_names(tree):
     trees (parse_spec) are never marked, so a specification keeps the math reading."""
     family = _BARE_MATH_FAMILY
     imported = None                                          # computed on the first hit (most modules have none)
+    bindings = None
     for n in ast.walk(tree):
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in family:
             if imported is None:
                 imported = _module_math_imports(tree)
             if n.func.id not in imported:
                 n.func._ts_freename = True
+        if isinstance(n, ast.Call):                           # an allowlisted stdlib callee, resolved through the
+            if bindings is None:                              # module's imports: `from os.path import getsize` binds a
+                bindings = _stdlib_import_bindings(tree)      # bare name, `import textwrap as tw` an alias
+            q = None
+            if isinstance(n.func, ast.Name):
+                q = bindings[0].get(n.func.id)
+            elif isinstance(n.func, ast.Attribute):
+                parts, r = [], n.func
+                while isinstance(r, ast.Attribute):
+                    parts.append(r.attr)
+                    r = r.value
+                if isinstance(r, ast.Name) and (r.id in bindings[1] or r.id in bindings[0]):
+                    q = ".".join([bindings[1].get(r.id) or bindings[0][r.id]] + parts[::-1])   # `from os import path`
+            if q is not None and q in _STDLIB_TF:
+                n.func._ts_stdlib = q
+
+
+def _stdlib_import_bindings(tree):
+    """({bare name: 'module.name'} from `from module import name [as bare]`, {alias: 'module'} from `import module
+    [as alias]`) over every import in the tree."""
+    bare, mods = {}, {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.module and not n.level:
+            for a in n.names:
+                if a.name != "*":
+                    bare[a.asname or a.name] = n.module + "." + a.name
+        elif isinstance(n, ast.Import):
+            for a in n.names:
+                if a.asname:
+                    mods[a.asname] = a.name
+                else:
+                    root = a.name.split(".")[0]
+                    mods[root] = root
+    return bare, mods
 
 
 def _fndef(src: str):
@@ -870,9 +987,14 @@ def _is_fp(x):
     return z3.is_fp(x)
 
 
-def _to_fp(x):
+_INT_FLOAT_OVF = 2 ** 1024 - 2 ** 970   # |n| >= this rounds past the largest double: float(n) is an OverflowError
+
+
+def _to_fp(x, ctx=None):
     """Promote an int-, bool-, or exact-rational-valued term to Float64 (Python int / bool / Fraction
-    -> float). A Fraction is rounded to the nearest double, as Python does when a Fraction meets a float."""
+    -> float). A Fraction is rounded to the nearest double, as Python does when a Fraction meets a float.
+    With ctx, the conversion is one CPython performs (float(n), int-float arithmetic, a math function), so an int
+    too large for a double is its OverflowError trap."""
     if isinstance(x, (_Opaque, _Closure)):
         if BEST_EFFORT and type(x) is _Opaque:               # best-effort: an opaque result is assumed to be a float
             _best_effort_assume()
@@ -884,7 +1006,29 @@ def _to_fp(x):
         return z3.fpToFP(_RM, x, _F64)                       # an exact rational to the nearest double
     if z3.is_bool(x):
         x = z3.If(x, z3.IntVal(1), z3.IntVal(0))
+    elif ctx is not None and getattr(ctx, "traps", None) is not None:
+        _exact_trap(ctx, z3.Or(x >= _INT_FLOAT_OVF, x <= -_INT_FLOAT_OVF), ("OverflowError",))
     return z3.fpToFP(_RM, z3.ToReal(x), _F64)
+
+
+def _exact_trap(ctx, cond, kinds):
+    """A trap whose condition is exact in the operands; while nothing evaluated so far is over-approximated (or
+    havoc'd), it also goes to the hard channel, so it refutes even if a later value is over-approximated."""
+    _trap_add(ctx, z3.And(ctx.pc, cond), kinds)
+    hard = getattr(ctx, "hard_traps", None)
+    if hard is not None and not getattr(ctx, "overapprox", False) and not getattr(ctx, "havoc", False):
+        hard.append(z3.And(ctx.pc, cond))
+
+
+def _int_truediv(la, lb, ctx=None):
+    """CPython's int / int: the exact quotient correctly rounded once (never via float operands), its sign the xor
+    of the operands' signs (0 / -5 is -0.0). With ctx, a quotient past the largest double is the OverflowError
+    trap ("integer division result too large for a float"); the zero divisor is the caller's trap."""
+    aa, ab = z3.If(la < 0, -la, la), z3.If(lb < 0, -lb, lb)
+    if ctx is not None and getattr(ctx, "traps", None) is not None:
+        _trap_add(ctx, z3.And(ctx.pc, lb != 0, aa >= _INT_FLOAT_OVF * ab), ("OverflowError",))
+    mag = z3.fpToFP(_RM, z3.ToReal(aa) / z3.ToReal(ab), _F64)
+    return z3.If(z3.Xor(la < 0, lb < 0), z3.fpNeg(mag), mag)
 
 
 def _is_str(x):
@@ -960,6 +1104,332 @@ class _NoneVal(_Opaque):
     def __init__(self): super().__init__("None")
 
 
+class _MaybeNone:
+    """A callee's result that is None exactly when `cond` holds and `val` otherwise (a function that falls off its
+    end or returns None on some path). `is None` / `== None` test `cond` exactly and narrow the path; arithmetic,
+    ordering, a subscript or an attribute on it raise (TypeError / AttributeError) under `cond` and see `val`
+    otherwise. Not an _Opaque, so a use the engine does not model fails closed instead of reading it as a
+    compatible value."""
+    __slots__ = ("cond", "val")
+    def __init__(self, cond, val): self.cond = cond; self.val = val
+
+
+def _maybe_none(cond, val):
+    c = z3.simplify(cond)
+    if z3.is_false(c):
+        return val
+    if z3.is_true(c):
+        return _NoneVal()
+    return _MaybeNone(c, val)
+
+
+def _unwrap_none(v, ctx, kind="TypeError"):
+    """The value `v` stands for once it is not None: for a _MaybeNone, its trap (`kind`, raised when it is None) is
+    added under the path condition and its non-None value returned; any other value is returned unchanged."""
+    if isinstance(v, _MaybeNone):
+        if ctx.traps is not None:
+            _exact_trap(ctx, v.cond, (kind,))
+        return v.val
+    return v
+
+
+# --------------------------------------------------------------------------- #
+# Regular expressions. A constant str pattern is parsed by CPython's own parser (re._parser) and translated to a z3   #
+# regular expression, so re.match / search / fullmatch return None exactly when CPython's do; a pattern outside the  #
+# translated subset (lookaround, backreferences, atomic groups, case folding, word boundaries) keeps an undecided    #
+# result. regex_model_audit holds the translation against the re module.                                             #
+# --------------------------------------------------------------------------- #
+class _ReInfo:
+    """A translated pattern: `body` (a z3 regex for the pattern without its edge anchors), the leading anchor (^ / \\A
+    or None) and the trailing one ('$', 'Z' or None), the group count, the group names, and the groups that take
+    part in every match."""
+    __slots__ = ("body", "lead", "trail", "ngroups", "names", "mandatory")
+
+
+class _RePattern(_Opaque):
+    """re.compile(constant pattern[, constant flags]): the pattern text, its flags and its group count."""
+    __slots__ = ("pattern", "flags", "ngroups")
+    def __init__(self, pattern, flags, ngroups):
+        super().__init__("pattern")
+        self.pattern = pattern
+        self.flags = flags
+        self.ngroups = ngroups
+
+
+class _MatchObj(_Opaque):
+    """A Match object: the pattern's group count, names and always-participating groups (from its _ReInfo, or the
+    count alone for an untranslated pattern), and the subject string."""
+    __slots__ = ("ngroups", "names", "mandatory", "subject")
+    def __init__(self, ngroups, names, mandatory, subject):
+        super().__init__("match")
+        self.ngroups = ngroups
+        self.names = names
+        self.mandatory = mandatory
+        self.subject = subject
+
+
+@lru_cache(maxsize=None)
+def _uni_class_ranges(kind, ascii_only=False):
+    """The code-point ranges of a regex class over the solvers' alphabet (U+0000..U+2FFFF): 'digit' is \\d
+    (str.isdecimal), 'space' \\s (str.isspace), 'word' \\w (str.isalnum or '_') -- the predicates sre applies to a str
+    pattern -- each restricted to ASCII under re.ASCII."""
+    if ascii_only:                                           # re.ASCII: the classes are fixed ASCII sets
+        return {"digit": ((0x30, 0x39),), "space": ((0x09, 0x0D), (0x20, 0x20)),
+                "word": ((0x30, 0x39), (0x41, 0x5A), (0x5F, 0x5F), (0x61, 0x7A))}[kind]
+    pred = {"digit": str.isdecimal, "space": str.isspace, "word": (lambda c: c.isalnum() or c == "_")}[kind]
+    top = 0x2FFFF
+    out, start = [], None
+    for cp in range(top + 1):
+        ok = pred(chr(cp))
+        if ok and start is None:
+            start = cp
+        elif not ok and start is not None:
+            out.append((start, cp - 1)); start = None
+    if start is not None:
+        out.append((start, top))
+    return tuple(out)
+
+
+def _re_set(ranges):
+    R = z3.ReSort(z3.StringSort())
+    parts = [z3.Range(chr(lo), chr(hi)) if lo != hi else z3.Re(z3.StringVal(chr(lo))) for lo, hi in ranges]
+    if not parts:
+        return z3.Empty(R)
+    return parts[0] if len(parts) == 1 else z3.Union(*parts)
+
+
+class _ReOutside(Exception):
+    pass
+
+
+@lru_cache(maxsize=512)
+def _re_translate(pattern):
+    """_ReInfo for a constant str pattern, or None outside the translated subset (or when it does not compile)."""
+    try:
+        import re._parser as P
+        import re._constants as C
+    except ImportError:
+        return None
+    try:
+        tree = P.parse(pattern, 0)
+    except Exception:
+        return None
+    flags = tree.state.flags
+    if flags & (C.SRE_FLAG_IGNORECASE | C.SRE_FLAG_LOCALE | C.SRE_FLAG_MULTILINE):
+        return None
+    dotall, ascii_only = bool(flags & C.SRE_FLAG_DOTALL), bool(flags & C.SRE_FLAG_ASCII)
+    R = z3.ReSort(z3.StringSort())
+    allc = z3.AllChar(R)
+    def notset(r):
+        return z3.Intersect(allc, z3.Complement(r))
+    cats = {C.CATEGORY_DIGIT: ("digit", False), C.CATEGORY_NOT_DIGIT: ("digit", True),
+            C.CATEGORY_SPACE: ("space", False), C.CATEGORY_NOT_SPACE: ("space", True),
+            C.CATEGORY_WORD: ("word", False), C.CATEGORY_NOT_WORD: ("word", True)}
+    mandatory = set()
+
+    def cls(items):
+        neg = bool(items) and items[0][0] is C.NEGATE
+        parts = []
+        for op, av in (items[1:] if neg else items):
+            if op is C.LITERAL:
+                parts.append(_re_set([(av, av)]))
+            elif op is C.RANGE:
+                parts.append(_re_set([av]))
+            elif op is C.CATEGORY and av in cats:
+                k, inv = cats[av]
+                r = _re_set(_uni_class_ranges(k, ascii_only))
+                parts.append(notset(r) if inv else r)
+            else:
+                raise _ReOutside()
+        r = z3.Empty(R) if not parts else parts[0] if len(parts) == 1 else z3.Union(*parts)
+        return notset(r) if neg else r
+
+    def seq(items, optional):
+        parts, lit = [], []
+        for op, av in items:
+            if op is C.LITERAL:
+                lit.append(chr(av)); continue
+            if lit:
+                parts.append(z3.Re(z3.StringVal("".join(lit)))); lit = []
+            parts.append(node(op, av, optional))
+        if lit:
+            parts.append(z3.Re(z3.StringVal("".join(lit))))
+        if not parts:
+            return z3.Re(z3.StringVal(""))
+        return parts[0] if len(parts) == 1 else z3.Concat(*parts)
+
+    def node(op, av, optional):
+        if op is C.NOT_LITERAL:
+            return notset(_re_set([(av, av)]))
+        if op is C.ANY:
+            return allc if dotall else notset(z3.Re(z3.StringVal("\n")))
+        if op is C.IN:
+            return cls(list(av))
+        if op is C.BRANCH:
+            alts = [seq(list(a), True) for a in av[1]]
+            return alts[0] if len(alts) == 1 else z3.Union(*alts)
+        if op is C.SUBPATTERN:
+            group, add_flags, del_flags, sub = av
+            if add_flags or del_flags:
+                raise _ReOutside()
+            if group is not None and not optional:
+                mandatory.add(group)
+            return seq(list(sub), optional)
+        if op in (C.MAX_REPEAT, C.MIN_REPEAT):              # lazy or greedy: whether a match exists is the same
+            lo, hi, sub = av
+            r = seq(list(sub), optional or lo == 0)
+            if hi is C.MAXREPEAT:
+                if lo == 0:
+                    return z3.Star(r)
+                return z3.Plus(r) if lo == 1 else z3.Concat(z3.Loop(r, lo, lo), z3.Star(r))
+            if lo == 0 and hi == 1:
+                return z3.Option(r)
+            return z3.Loop(r, lo, hi) if hi > 0 else z3.Re(z3.StringVal(""))
+        raise _ReOutside()                                   # anchors inside, lookaround, backreferences, atomic
+
+    items = list(tree)
+    info = _ReInfo()
+    info.lead = info.trail = None
+    if items and items[0][0] is C.AT and items[0][1] in (C.AT_BEGINNING, C.AT_BEGINNING_STRING):
+        info.lead = "^"; items = items[1:]
+    if items and items[-1][0] is C.AT and items[-1][1] in (C.AT_END, C.AT_END_STRING):
+        info.trail = "$" if items[-1][1] is C.AT_END else "Z"; items = items[:-1]
+    try:
+        info.body = seq(items, False)
+    except (_ReOutside, z3.Z3Exception, Unsupported, ValueError):
+        return None
+    info.ngroups = tree.state.groups - 1
+    info.names = dict(tree.state.groupdict)
+    info.mandatory = frozenset(mandatory)
+    return info
+
+
+def _re_groups(pattern, flags=0):
+    """(group count, {name: index}) of a compilable constant pattern, or None."""
+    import re as _re
+    try:
+        c = _re.compile(pattern, flags)
+    except Exception:
+        return None
+    return c.groups, dict(c.groupindex)
+
+
+def _re_holds(info, s, how):
+    """z3: CPython's re.<how>(pattern, s) finds a match (how: 'match' / 'search' / 'fullmatch')."""
+    R = z3.ReSort(z3.StringSort())
+    anys = z3.Star(z3.AllChar(R))
+    eps = z3.Re(z3.StringVal(""))
+    tail = {"$": z3.Union(eps, z3.Re(z3.StringVal("\n"))), "Z": eps, None: None}[info.trail]   # $: the end, or before
+    if how == "fullmatch":                                                                      # a final newline
+        return z3.InRe(s, info.body)
+    post = tail if tail is not None else anys
+    if how == "match" or info.lead is not None:
+        return z3.InRe(s, z3.Concat(info.body, post))
+    return z3.InRe(s, z3.Concat(anys, info.body, post))
+
+
+def _re_call(how, pattern, subject, ctx, flags=0, exact=True):
+    """The value of re.<how>(constant pattern, subject[, flags]) -- or a compiled pattern's method -- for match /
+    search / fullmatch / findall / split. The subject must be a str: bytes against a str pattern is a TypeError, a
+    guessed parameter an abstention. Nonzero flags (or `exact` False) leave the pattern untranslated."""
+    g = _re_groups(pattern, flags)
+    if g is None:
+        raise Unsupported("re pattern does not compile (re.error)")
+    ngroups, names = g
+    info = _re_translate(pattern) if (exact and not flags) else None
+    if not _is_str(subject):
+        if isinstance(subject, _SafeContainer) and subject.byteslike and ctx.traps is not None:
+            _exact_trap(ctx, z3.BoolVal(True), ("TypeError",))   # a str pattern on bytes
+            return _Opaque("re_bytes")
+        if (z3.is_expr(subject) and (z3.is_int(subject) or z3.is_bool(subject) or _is_fp(subject))
+                and not (z3.is_const(subject) and subject.decl().name() in getattr(ctx, "guessed_params", ()))
+                and ctx.traps is not None):
+            _exact_trap(ctx, z3.BoolVal(True), ("TypeError",))   # expected string or bytes-like object
+            return _Opaque("re_num")
+        raise Unsupported("re.%s on a subject of unmodeled type" % how)
+    if how in ("match", "search", "fullmatch"):
+        mobj = _MatchObj(ngroups, names, info.mandatory if info is not None else frozenset(), subject)
+        if info is None:
+            _note_overapprox(ctx, "re.%s() of a pattern outside the translated subset" % how)
+            return _MaybeNone(z3.FreshConst(z3.BoolSort(), "nomatch"), mobj)
+        return _maybe_none(z3.Not(_re_holds(info, subject, how)), mobj)
+    k = z3.FreshInt("re_" + how)
+    found = _re_holds(info, subject, "search") if info is not None else None
+    if found is None:
+        _note_overapprox(ctx, "re.%s() of a pattern outside the translated subset" % how)
+    if ctx.facts is not None:
+        if how == "findall":                                 # [] exactly when nothing matches
+            ctx.facts.append(k >= 0)
+            if found is not None:
+                ctx.facts.append(z3.And(z3.Implies(z3.Not(found), k == 0), z3.Implies(found, k >= 1)))
+        else:                                                # split: [s] when nothing matches, else at least 2
+            ctx.facts.append(k >= 1)
+            if found is not None:
+                ctx.facts.append(z3.And(z3.Implies(z3.Not(found), k == 1), z3.Implies(found, k >= 2)))
+    if how == "findall" and ngroups >= 2:                   # tuples of the groups' strings
+        return _SafeContainer(z3.FreshInt("findall").decl().name(), length=k, tuple_arity=ngroups,
+                              tuple_protos=("str",) * ngroups)
+    if how == "split" and ngroups >= 1:                     # the captured groups, None where one did not take part
+        return _SafeContainer(z3.FreshInt("resplit").decl().name(), length=k, scalar="opaque")
+    return _StrSeq(how, length=k)
+
+
+def _match_group_index(m, g, ctx):
+    """The group index a group() / start() / end() / span() argument names, after its IndexError trap (no such
+    group); None for an index known only symbolically."""
+    if _is_str(g):
+        gs = z3.simplify(g)
+        if not z3.is_string_value(gs):
+            raise Unsupported("a match group named by a non-literal string")
+        name = _z3_str_value(gs)
+        if name not in m.names:
+            _exact_trap(ctx, z3.BoolVal(True), ("IndexError",))
+            return 0
+        return m.names[name]
+    if z3.is_expr(g) and (z3.is_int(g) or z3.is_bool(g)):
+        gi = z3.simplify(_as_int(g))
+        _exact_trap(ctx, z3.Or(gi < 0, gi > m.ngroups), ("IndexError",))
+        return gi.as_long() if z3.is_int_value(gi) else None
+    raise Unsupported("a match group named by a value of unmodeled type")
+
+
+def _match_group_value(m, i, ctx):
+    """The value group(i) returns: the matched text for group 0 and a group taking part in every match, else that
+    text or None. The text itself is not modeled (an over-approximation)."""
+    _note_overapprox(ctx, "the text of a match group")
+    text = z3.FreshConst(_SS, "mgroup")
+    if i == 0 or (i is not None and i in m.mandatory):
+        return text
+    return _MaybeNone(z3.FreshConst(z3.BoolSort(), "mgnone"), text)
+
+
+def _match_method(m, meth, a, node, ctx):
+    """A method of a Match object (group / groups / start / end / span / groupdict)."""
+    if node.keywords and meth != "groups":
+        raise Unsupported("Match.%s with keyword arguments" % meth)
+    if meth == "group":
+        idx = [_match_group_index(m, g, ctx) for g in a] if a else [0]
+        vals = [_match_group_value(m, i, ctx) for i in idx]
+        return vals[0] if len(vals) == 1 else tuple(vals)
+    if meth == "groups":
+        return tuple(_match_group_value(m, i, ctx) for i in range(1, m.ngroups + 1))
+    if meth in ("start", "end", "span"):
+        if len(a) > 1:
+            raise Unsupported("Match.%s with more than one argument" % meth)
+        i = _match_group_index(m, a[0], ctx) if a else 0
+        _note_overapprox(ctx, "a match position")
+        lo = z3.IntVal(0) if (i == 0 or (i is not None and i in m.mandatory)) else z3.IntVal(-1)
+        def pos(nm):
+            p = z3.FreshInt(nm)
+            if ctx.facts is not None:
+                ctx.facts.append(z3.And(p >= lo, p <= z3.Length(m.subject)))
+            return p
+        return (pos("mstart"), pos("mend")) if meth == "span" else pos("m" + meth)
+    if meth == "groupdict":
+        return _DictLit("groupdict")
+    raise Unsupported("Match.%s" % meth)
+
+
 class _ListLit(tuple):
     """A list literal value -- a tuple of its element terms, so every existing tuple handling (indexing, unpacking,
     concatenation, sum, len) applies unchanged, but distinguished from a genuine tuple literal so that in-place item
@@ -991,10 +1461,23 @@ class _SafeContainer(_Opaque):
     (IndexError when out of [-len, len)); the oracle samples an indexed parameter as a real list so that
     out-of-range trap is witnessable, and an iteration- or method-only one as a benign stand-in. `immutable`
     marks a tuple, whose item assignment c[i] = v always raises (TypeError)."""
-    __slots__ = ("immutable", "length", "unindexable", "byteslike", "elem", "unsized", "tuple_arity", "nonneg")
+    __slots__ = ("immutable", "length", "unindexable", "byteslike", "elem", "unsized", "tuple_arity", "nonneg",
+                 "scalar", "rng", "tuple_protos", "arr", "rkey", "related")
     def __init__(self, name, immutable=False, length=None, unindexable=False, byteslike=False, elem=None,
-                 unsized=False, tuple_arity=None, nonneg=False):
+                 unsized=False, tuple_arity=None, nonneg=False, scalar=None, tuple_protos=None, arr=None,
+                 rkey=None, related=False):
         super().__init__(name)
+        self.arr = arr              # an Int -> Int array holding the elements (a read-only list carried through a
+        #                             loop engine's state), so two reads of one index agree; None: fresh elements
+        self.rkey = rkey            # the container whose elements this one's are drawn from (a copy, a slice, a
+        #                             sorted or reversed view), so reads of both register on one element pool
+        #                             (_elem_read); None: this container is its own pool
+        self.related = related      # the elements are a rearrangement of the pool's (sorted / reversed / a slice):
+        #                             a read at any index may name any element, so no two reads are independent
+        self.scalar = scalar        # the annotated scalar element type ('int' / 'str' / 'float' / 'bool'), or None
+        self.tuple_protos = tuple_protos   # per position of a tuple_arity element: a scalar kind, an element
+        #                             prototype (a sequence / dict), or None (an int, the default reading)
+        self.rng = None             # (start, stop, constant step) of a range: its elements are start + k * step
         self.immutable = immutable
         self.nonneg = nonneg        # every element is provably >= 0 (a range with start >= 0 and step > 0), so
         #                             sum() over it is non-negative; default False loses only precision, never sound
@@ -1012,6 +1495,17 @@ class _SafeContainer(_Opaque):
         #                             is a TypeError (abstains, never a false PROVED), and a, b = c[i] unpacks.
 
 
+class _Encoded(_SafeContainer):
+    """The bytes s.encode(codec) produces, remembering the source string and the codec / handler, so a later
+    decode is decided against the source (_bytes_decode)."""
+    __slots__ = ("src", "codec", "handler")
+    def __init__(self, name, length, src, codec, handler):
+        super().__init__(name, immutable=True, length=length, byteslike=True)
+        self.src = src
+        self.codec = codec
+        self.handler = handler
+
+
 class _SetExpr(_SafeContainer):
     """A set operation (union | intersection & difference - symmetric ^) of two set-like operands. Membership is
     the operands' combination (x in a|b iff x in a or x in b, etc.); the length carries the size relation."""
@@ -1027,10 +1521,11 @@ class _DictParam(_Opaque):
     d[k] = v never traps (a dict accepts any key). The oracle samples it as a real dict. `valproto` is a
     prototype of the annotated value type (dict[K, V]); for a read-only dict, a read d[k] is modeled as a fresh
     V-typed value (memoized per key) so d[k][i] / d[k].append / len(d[k]) decide rather than staying opaque."""
-    __slots__ = ("valproto",)
-    def __init__(self, name, valproto=None):
+    __slots__ = ("valproto", "keyproto")
+    def __init__(self, name, valproto=None, keyproto=None):
         super().__init__(name)
         self.valproto = valproto
+        self.keyproto = keyproto    # the annotated scalar key kind ('str' / 'int' / 'float' / 'bool'), or None
 
 
 class _DictLit(_Opaque):
@@ -1104,11 +1599,14 @@ class _StrSeq(_Opaque):
     length: >= 1 for split/rsplit with a separator, unconstrained for split()/splitlines. An index returns a fresh
     string bounds-checked against `length`. `unsized` marks a lazy iterator: join(it) is a string, but len(it) and
     it[i] are TypeErrors."""
-    __slots__ = ("length", "unsized")
-    def __init__(self, name, length=None, unsized=False):
+    __slots__ = ("length", "unsized", "nonempty", "part")
+    def __init__(self, name, length=None, unsized=False, nonempty=False, part=None):
         super().__init__(name)
         self.length = length
         self.unsized = unsized
+        self.nonempty = nonempty    # every element is a non-empty string (the words of a whitespace split)
+        self.part = part            # index term -> the element's term (a concrete function of the split's arguments),
+        #                             or None: the elements are then unconstrained strings (an over-approximation)
 
 
 def _cx(v):
@@ -1127,10 +1625,11 @@ def _cx_binop(op, a, b):
     raise Unsupported(f"complex operator {op.__name__}")
 
 
-def _fp_arith(op, l, r):
+def _fp_arith(op, l, r, ctx=None):
     """IEEE-754 round-to-nearest arithmetic for a binop with a float operand; the other
-    operand is promoted from int/bool. Floor division and modulo go through _fp_divmod."""
-    l, r = _to_fp(l), _to_fp(r)
+    operand is promoted from int/bool (an OverflowError trap for an int past the double range, with ctx).
+    Floor division and modulo go through _fp_divmod."""
+    l, r = _to_fp(l, ctx), _to_fp(r, ctx)
     if op is ast.Add: return z3.fpAdd(_RM, l, r)
     if op is ast.Sub: return z3.fpSub(_RM, l, r)
     if op is ast.Mult: return z3.fpMul(_RM, l, r)
@@ -1138,6 +1637,67 @@ def _fp_arith(op, l, r):
     if op is ast.FloorDiv: return _fp_divmod(l, r)[0]
     if op is ast.Mod: return _fp_divmod(l, r)[1]
     raise Unsupported(f"float operator {op.__name__}")
+
+
+import ctypes as _ctypes
+_C_LONG_BITS = _ctypes.sizeof(_ctypes.c_long) * 8          # builtin sum's fast paths unpack items as a C long
+_SSIZE_BITS = _ctypes.sizeof(_ctypes.c_ssize_t) * 8        # and keep the 3.12+ int partial sum in a Py_ssize_t
+_NEUMAIER_SUM = sys.version_info >= (3, 12)                # 3.12+: a float sum is Neumaier-compensated
+
+
+def _py_sum(start, items, ctx):
+    """builtins.sum(items, start) over a constant-length sequence of ints / bools / floats, following CPython's
+    builtin_sum (3.12+): ints accumulate exactly; the int fast path holds while the start and every item fit a C
+    long and every partial sum a Py_ssize_t, and the first float then switches to the float fast path (the int so
+    far converted, an OverflowError past the double range) -- Neumaier-compensated, a C-long int added
+    uncompensated, a larger int flushing the compensation into the generic path, which adds plainly for the rest;
+    an int sum that left the fast path adds plainly throughout. The compensation is added once at the end when it
+    is nonzero and finite. Before 3.12 every float addition is plain, so the paths agree."""
+    vals = [start] + list(items)
+    if not all(z3.is_expr(v) and (z3.is_int(v) or z3.is_bool(v) or _is_fp(v)) for v in vals):
+        raise Unsupported("sum() of values other than ints, bools and floats")
+    if not any(_is_fp(v) for v in vals):
+        acc = _as_int(start)
+        for v in items:
+            acc = acc + _as_int(v)
+        return acc
+    lo, hi = -(2 ** (_C_LONG_BITS - 1)), 2 ** (_C_LONG_BITS - 1) - 1
+    slo, shi = -(2 ** (_SSIZE_BITS - 1)), 2 ** (_SSIZE_BITS - 1) - 1
+    zero = z3.FPVal(0.0, _F64)
+    fin = lambda v: z3.And(z3.Not(z3.fpIsNaN(v)), z3.Not(z3.fpIsInf(v)))
+    if _is_fp(start):
+        f, rest, in_fast = start, list(items), z3.BoolVal(True)
+    else:
+        acc = _as_int(start)
+        in_fast = z3.And(acc >= lo, acc <= hi)             # the int fast path is entered only for a C-long start
+        rest = list(items)
+        while rest and not _is_fp(rest[0]):
+            v = _as_int(rest.pop(0))
+            in_fast = z3.And(in_fast, v >= lo, v <= hi, acc + v >= slo, acc + v <= shi)
+            acc = acc + v
+        x = rest.pop(0)                                    # the first float: int + float converts the int
+        f = z3.fpAdd(_RM, _to_fp(acc, ctx), x)
+    if not _NEUMAIER_SUM:
+        for v in rest:
+            f = z3.fpAdd(_RM, f, _to_fp(v, ctx))
+        return f
+    c = zero
+    for v in rest:
+        if _is_fp(v):
+            t = z3.fpAdd(_RM, f, v)
+            comp = z3.If(z3.fpGEQ(z3.fpAbs(f), z3.fpAbs(v)), z3.fpAdd(_RM, z3.fpSub(_RM, f, t), v),
+                         z3.fpAdd(_RM, z3.fpSub(_RM, v, t), f))
+            c = z3.If(in_fast, z3.fpAdd(_RM, c, comp), c)
+            f = t
+            continue
+        iv = _as_int(v)
+        fv = _to_fp(iv, ctx)
+        fits = z3.And(iv >= lo, iv <= hi)
+        flushed = z3.If(z3.And(z3.Not(z3.fpIsZero(c)), fin(c)), z3.fpAdd(_RM, f, c), f)
+        f = z3.If(z3.And(in_fast, z3.Not(fits)), z3.fpAdd(_RM, flushed, fv), z3.fpAdd(_RM, f, fv))
+        c = z3.If(z3.And(in_fast, z3.Not(fits)), zero, c)
+        in_fast = z3.And(in_fast, fits)
+    return z3.If(z3.And(in_fast, z3.Not(z3.fpIsZero(c)), fin(c)), z3.fpAdd(_RM, f, c), f)
 
 
 def _fp_fmod(a, b):
@@ -1174,7 +1734,7 @@ def _sqrt_model(a, ctx):
     """math.sqrt as the IEEE-754 square root (correctly rounded, what CPython computes), with a
     negative argument a domain error: math.sqrt(x) raises ValueError for x < 0, so it is a trap,
     while -0.0, +0.0, +Inf, and NaN pass through. The argument is promoted from int/bool."""
-    a = _to_fp(a)
+    a = _to_fp(a, ctx)
     if ctx.traps is not None:
         _trap_add(ctx, z3.And(ctx.pc, z3.fpLT(a, z3.FPVal(0.0, _F64))), ("ValueError",))
     return z3.fpSqrt(_RM, a)
@@ -1252,16 +1812,705 @@ _STDLIB_TF_BARE: Dict[str, str] = {q.split(".")[-1]: r for q, r in _STDLIB_TF.it
                                    if q.split(".")[-1] not in _TF_BARE_DENY}
 
 
-def _safe_stdlib_result(qual):
+@lru_cache(maxsize=None)
+def _stdlib_exists(qual):
+    """Whether the running interpreter provides the dotted stdlib callable (itertools.batched is 3.12+, os.getuid is
+    POSIX-only): an absent one is an AttributeError at run time, so it is never assumed trap free."""
+    import importlib
+    parts = qual.split(".")
+    for i in range(len(parts) - 1, 0, -1):
+        try:
+            obj = importlib.import_module(".".join(parts[:i]))
+        except ImportError:
+            continue
+        try:
+            for p in parts[i:]:
+                obj = getattr(obj, p)
+            return True
+        except AttributeError:
+            return False
+    return False
+
+
+@lru_cache(maxsize=None)
+def _platform_valueerror(name):
+    """Whether this interpreter raises ValueError on one fixed, harmless probe call -- behavior that differs across
+    platforms and versions (a NUL in a path is rejected by some path functions and accepted by others)."""
+    import shutil as _shutil, time as _time
+    probes = {"ismount_nul": lambda: os.path.ismount("a\0b"), "which_nul": lambda: _shutil.which("a\0b"),
+              "realpath_nul": lambda: os.path.realpath("a\0b"), "abspath_nul": lambda: os.path.abspath("a\0b"),
+              "strftime_nul": lambda: _time.strftime("a\0b"), "getenv_surrogate": lambda: os.getenv("\ud800"),
+              "expanduser_nul": lambda: os.path.expanduser("~a\0b")}
+    try:
+        probes[name]()
+    except ValueError:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _tf_kind(v):
+    """The Python type an engine value certainly has ('int' / 'bool' / 'float' / 'str' / 'bytes' / 'list' / 'tuple'
+    / 'dict' / 'set' / 'none'), or None when the engine does not know it."""
+    if isinstance(v, _NoneVal):
+        return "none"
+    if isinstance(v, _ListLit):
+        return "list"
+    if isinstance(v, tuple):
+        return "tuple"
+    if isinstance(v, (_MapVal, _DictLit, _DictParam, _DefaultDict)):
+        return "dict"
+    if type(v) is _Opaque and v.name == "set":
+        return "set"
+    if isinstance(v, _SafeContainer):
+        if v.byteslike and v.immutable:
+            return "bytes"
+        if v.immutable and not v.unindexable and not v.byteslike:
+            return "tuple"
+        return None
+    if z3.is_expr(v):
+        if z3.is_bool(v):
+            return "bool"
+        if z3.is_int(v):
+            return "int"
+        if _is_fp(v):
+            return "float"
+        if _is_str(v):
+            return "str"
+    return None
+
+
+_NUMERIC_KINDS = ("int", "bool", "float")
+
+
+def _str_has(s, lo, hi):
+    """z3: string s contains a character with code point in [lo, hi]."""
+    any_ = z3.Star(z3.AllChar(z3.ReSort(_SS)))
+    rng = z3.Range(z3.StringVal(chr(lo)), z3.StringVal(chr(hi)))
+    return z3.InRe(s, z3.Concat(any_, rng, any_))
+
+
+def _str_has_surrogate(s):
+    return _str_has(s, 0xD800, 0xDFFF)
+
+
+def _str_has_nul(s):
+    return z3.Contains(s, z3.StringVal(chr(0)))
+
+
+class _TFCall:
+    """One allowlisted stdlib call's evaluated arguments, and the channel its argument-dependent traps go into."""
+    def __init__(self, qual, args, kws, ctx, starred):
+        self.qual, self.args, self.kws, self.ctx, self.starred = qual, args, kws, ctx, starred
+
+    def arg(self, i, name=None, default=None):
+        if i is not None and i < len(self.args):
+            return self.args[i]
+        if name is not None and name in self.kws:
+            return self.kws[name]
+        return default
+
+    def given(self, i, name=None):
+        return (i is not None and i < len(self.args)) or (name is not None and name in self.kws)
+
+    def trap(self, cond, kind):
+        if kind == "TypeError" and any(self.guessed(v) for v in list(self.args) + list(self.kws.values())):
+            # an argument is an unannotated parameter read as an int by default: a type error here may be that
+            # reading's own, so the engine abstains rather than report it or assume the call well typed
+            raise Unsupported("%s() of an unannotated parameter whose type the call does not fix" % self.qual)
+        if self.ctx.traps is not None:
+            _trap_add(self.ctx, z3.And(self.ctx.pc, cond), (kind,))
+
+    def maybe(self, why, kind="ValueError"):
+        """A trap whose condition the engine cannot pin: reachable on an over-approximated path."""
+        _note_overapprox(self.ctx, "%s (%s)" % (self.qual, why))
+        self.trap(z3.FreshConst(z3.BoolSort(), "tfmaybe"), kind)
+
+    def int_arg(self, v):
+        return _as_int(v) if _tf_kind(v) in ("int", "bool") else None
+
+    def guessed(self, v):
+        """An unannotated parameter the engine reads as an int by default: its type is a guess, not a fact."""
+        return (z3.is_expr(v) and z3.is_const(v)
+                and v.decl().name() in getattr(self.ctx, "guessed_params", frozenset()))
+
+    def type_error_if(self, v, bad_kinds):
+        if _tf_kind(v) in bad_kinds:
+            self.trap(z3.BoolVal(True), "TypeError")
+
+    def not_iterable(self, v):
+        self.type_error_if(v, _NUMERIC_KINDS + ("none",))
+
+    def path_nul(self, v, kind="ValueError"):
+        k = _tf_kind(v)
+        if k == "str":
+            self.trap(_str_has_nul(v), kind)
+        elif k in _NUMERIC_KINDS[1:] + ("list", "dict", "set", "tuple"):
+            self.trap(z3.BoolVal(True), "TypeError")
+
+
+def _tf_check_kwargs(c, allowed):
+    """Unknown keyword names are a TypeError; a **mapping hides them (unsupported)."""
+    if c.starred:
+        raise Unsupported("%s(**kwargs): the keyword names are not visible" % c.qual)
+    for k in c.kws:
+        if k not in allowed:
+            c.trap(z3.BoolVal(True), "TypeError")
+
+
+def _tf_itertools(c):
+    nm = c.qual.split(".")[-1]
+    if nm == "tee":
+        c.not_iterable(c.arg(0, "iterable"))
+        n = c.arg(1, "n")
+        if n is not None:
+            c.type_error_if(n, ("float", "str", "none"))
+            if c.int_arg(n) is not None:
+                c.trap(c.int_arg(n) < 0, "ValueError")
+    elif nm == "product":
+        for a in c.args:
+            c.not_iterable(a)
+        r = c.kws.get("repeat")
+        if r is not None:
+            c.type_error_if(r, ("float", "str", "none"))
+            if c.int_arg(r) is not None:
+                c.trap(c.int_arg(r) < 0, "ValueError")
+    elif nm == "batched":
+        c.not_iterable(c.arg(0, "iterable"))
+        n = c.arg(1, "n")
+        if n is not None:
+            c.type_error_if(n, ("float", "str", "none"))
+            if c.int_arg(n) is not None:
+                c.trap(c.int_arg(n) < 1, "ValueError")
+        strict = c.kws.get("strict")
+        if strict is not None and not (z3.is_expr(strict) and z3.is_false(z3.simplify(strict))):
+            raise Unsupported("itertools.batched(strict=True) raises on a short final batch (data-dependent)")
+    elif nm == "repeat":
+        t = c.arg(1, "times")
+        if t is not None:
+            c.type_error_if(t, ("float", "str"))
+    elif nm == "count":
+        for a in (c.arg(0, "start"), c.arg(1, "step")):
+            if a is not None:
+                c.type_error_if(a, ("str", "list", "tuple", "dict", "none", "bytes"))
+    elif nm in ("cycle", "pairwise", "accumulate"):
+        c.not_iterable(c.arg(0, "iterable"))
+    elif nm == "compress":
+        c.not_iterable(c.arg(0, "data")); c.not_iterable(c.arg(1, "selectors"))
+    elif nm == "zip_longest":
+        for a in c.args:
+            c.not_iterable(a)
+    elif nm in ("dropwhile", "takewhile", "filterfalse", "starmap"):
+        c.not_iterable(c.arg(1, None))
+
+
+def _tf_textwrap(c):
+    nm = c.qual.split(".")[-1]
+    if nm not in ("fill", "wrap", "shorten"):
+        return
+    if c.starred:
+        raise Unsupported("textwrap.%s(**kwargs): the wrapper options are not visible" % nm)
+    width = c.arg(1, "width", None if nm == "shorten" else z3.IntVal(70))
+    if width is None:
+        return
+    w = c.int_arg(width)
+    if w is None:
+        if _tf_kind(width) is None:
+            raise Unsupported("textwrap width of an unmodeled value")
+        return
+    c.trap(w <= 0, "ValueError")                                # "invalid width" (checked before any text)
+    max_lines = c.kws.get("max_lines", z3.IntVal(1) if nm == "shorten" else None)
+    if max_lines is None or isinstance(max_lines, _NoneVal):
+        return
+    ml = c.int_arg(max_lines)
+    ph = c.kws.get("placeholder", z3.StringVal(" [...]"))
+    ind_name = "initial_indent"
+    if ml is not None and z3.is_int_value(z3.simplify(ml)) and z3.simplify(ml).as_long() > 1:
+        ind_name = "subsequent_indent"
+    ind = c.kws.get(ind_name, z3.StringVal(""))
+    if not (z3.is_expr(ph) and z3.is_string_value(z3.simplify(ph))):
+        raise Unsupported("textwrap placeholder that is not a literal string")
+    ph_len = len(_z3_str_value(z3.simplify(ph)).lstrip())
+    if _tf_kind(ind) != "str":
+        raise Unsupported("textwrap indent of an unmodeled value")
+    if ml is not None and not z3.is_int_value(z3.simplify(ml)):
+        raise Unsupported("textwrap max_lines that is not a literal")
+    c.trap(z3.And(w > 0, z3.Length(ind) + ph_len > w), "ValueError")   # "placeholder too large for max width"
+
+
+def _tf_bisect(c):
+    a = c.arg(0, "a")
+    c.type_error_if(a, _NUMERIC_KINDS + ("none", "dict", "set"))
+    lo = c.arg(2, "lo")
+    if lo is not None:
+        if c.int_arg(lo) is None:
+            c.type_error_if(lo, ("float", "str", "none"))
+            if _tf_kind(lo) is None:
+                raise Unsupported("bisect lo of an unmodeled value")
+        else:
+            c.trap(c.int_arg(lo) < 0, "ValueError")              # "lo must be non-negative"
+    hi = c.arg(3, "hi")
+    if hi is not None and not isinstance(hi, _NoneVal):
+        if c.int_arg(hi) is None:
+            raise Unsupported("bisect hi of an unmodeled value")
+        if not isinstance(a, (_SafeContainer, tuple)):
+            raise Unsupported("bisect hi against a sequence of unknown length")
+        n = _container_len(a, c.ctx)
+        loi = c.int_arg(lo) if lo is not None and c.int_arg(lo) is not None else z3.IntVal(0)
+        hv = c.int_arg(hi)
+        # a hi past the end probes a[mid] beyond it only for some data: a possible IndexError
+        _note_overapprox(c.ctx, "bisect with hi > len(a)")
+        c.trap(z3.And(hv > n, hv != -1, loi < hv, z3.FreshConst(z3.BoolSort(), "bisect_oob")), "IndexError")
+
+
+def _tf_collections(c):
+    nm = c.qual.split(".")[-1]
+    if nm == "deque":
+        it = c.arg(0, "iterable")
+        if it is not None:
+            c.not_iterable(it)
+        m = c.arg(1, "maxlen")
+        if m is not None and not isinstance(m, _NoneVal):
+            c.type_error_if(m, ("float", "str"))
+            if c.int_arg(m) is not None:
+                c.trap(c.int_arg(m) < 0, "ValueError")
+            elif _tf_kind(m) is None:
+                raise Unsupported("deque maxlen of an unmodeled value")
+    elif nm == "OrderedDict":
+        if len(c.args) > 1:
+            c.trap(z3.BoolVal(True), "TypeError")
+            return
+        if not c.args:
+            return
+        a = c.args[0]
+        k = _tf_kind(a)
+        if k in _NUMERIC_KINDS + ("none",):
+            c.trap(z3.BoolVal(True), "TypeError")
+        elif k == "str":
+            c.trap(z3.Length(a) > 0, "ValueError")                 # each 1-char element unpacks to one value
+        elif k == "dict":
+            return
+        elif isinstance(a, _SafeContainer) and a.tuple_arity == 2:
+            return
+        elif isinstance(a, tuple):
+            for e in a:
+                ek = _tf_kind(e)
+                if ek in _NUMERIC_KINDS + ("none",):
+                    c.trap(z3.BoolVal(True), "TypeError"); return
+                if isinstance(e, tuple):
+                    if len(e) != 2:
+                        c.trap(z3.BoolVal(True), "ValueError"); return
+                elif ek == "str":
+                    c.trap(z3.Length(e) != 2, "ValueError")
+                else:
+                    raise Unsupported("OrderedDict over elements of unmodeled type")
+        else:
+            raise Unsupported("OrderedDict over an iterable of unmodeled elements")
+
+
+_WARN_ACTIONS = ("error", "ignore", "always", "default", "module", "once") + (
+    ("all",) if sys.version_info >= (3, 12) else ())
+_WARN_BAD = "ValueError" if sys.version_info >= (3, 12) else "AssertionError"
+_WARN_TYPE = "TypeError" if sys.version_info >= (3, 12) else "AssertionError"
+_WARNING_CLASSES = frozenset({"Warning", "UserWarning", "DeprecationWarning", "PendingDeprecationWarning",
+                              "SyntaxWarning", "RuntimeWarning", "FutureWarning", "ImportWarning",
+                              "UnicodeWarning", "BytesWarning", "ResourceWarning", "EncodingWarning"})
+
+
+def _tf_warnings(c):
+    nm = c.qual.split(".")[-1]
+    if nm == "warn":
+        cat = c.arg(1, "category")
+        if cat is not None and not isinstance(cat, _NoneVal) and not _is_warning_class_value(cat):
+            if _tf_kind(cat) is not None:
+                c.trap(z3.BoolVal(True), "TypeError")
+            else:
+                raise Unsupported("warnings.warn category of an unmodeled value")
+        return
+    if c.starred:
+        raise Unsupported("warnings.%s(**kwargs)" % nm)
+    action = c.arg(0, "action")
+    if _tf_kind(action) == "str":
+        c.trap(z3.Not(z3.Or(*[action == z3.StringVal(a) for a in _WARN_ACTIONS])), _WARN_BAD)
+    elif action is not None:
+        c.trap(z3.BoolVal(True), _WARN_BAD)
+    pos = {"simplefilter": {"category": 1, "lineno": 2}, "filterwarnings":
+           {"message": 1, "category": 2, "module": 3, "lineno": 4}}[nm]
+    if nm == "filterwarnings":
+        for fld in ("message", "module"):
+            v = c.arg(pos[fld], fld)
+            if v is None:
+                continue
+            k = _tf_kind(v)
+            if k is not None and k != "str":
+                c.trap(z3.BoolVal(True), _WARN_TYPE)
+            elif k == "str":
+                vs = z3.simplify(v)
+                if not z3.is_string_value(vs):
+                    raise Unsupported("warnings.filterwarnings with a non-literal regex (may raise re.error)")
+                if _z3_str_value(vs):
+                    try:
+                        import re as _re
+                        _re.compile(_z3_str_value(vs), _re.I if fld == "message" else 0)
+                    except _re.error:
+                        raise Unsupported("warnings.filterwarnings %s pattern does not compile (re.error)" % fld)
+            else:
+                raise Unsupported("warnings.filterwarnings %s of an unmodeled value" % fld)
+        cat = c.arg(pos["category"], "category")
+        if cat is not None and not _is_warning_class_value(cat):
+            if _tf_kind(cat) is not None:
+                c.trap(z3.BoolVal(True), _WARN_TYPE)
+            else:
+                raise Unsupported("warnings.filterwarnings category of an unmodeled value")
+    ln = c.arg(pos["lineno"], "lineno")
+    if ln is not None:
+        k = _tf_kind(ln)
+        if k in ("int", "bool"):
+            c.trap(_as_int(ln) < 0, _WARN_BAD)
+        elif k is not None:
+            c.trap(z3.BoolVal(True), _WARN_BAD)
+        else:
+            raise Unsupported("warnings lineno of an unmodeled value")
+
+
+def _is_warning_class_value(v):
+    return type(v) is _Opaque and v.name in _WARNING_CLASSES
+
+
+_BASICCONFIG_KEYS = frozenset({"filename", "filemode", "format", "datefmt", "style", "level", "stream", "handlers",
+                               "force", "encoding", "errors"})
+
+
+def _tf_logging(c):
+    nm = c.qual.split(".")[-1]
+    if nm == "log":
+        lvl = c.arg(0, "level")
+        if _tf_kind(lvl) in ("str", "float", "none", "list", "tuple", "dict", "bytes"):
+            c.trap(z3.BoolVal(True), "TypeError")                  # "level must be an integer"
+    elif nm == "getLogger":
+        name = c.arg(0, "name")
+        if name is not None and _tf_kind(name) in _NUMERIC_KINDS[:2] + ("float", "bytes", "list", "tuple", "dict"):
+            c.trap(z3.BoolVal(True), "TypeError")                  # "A logger name must be a string"
+    elif nm == "basicConfig":
+        if c.starred:
+            raise Unsupported("logging.basicConfig(**kwargs)")
+        if c.args:
+            c.trap(z3.BoolVal(True), "TypeError")
+        bad = [k for k in c.kws if k not in _BASICCONFIG_KEYS]
+        style = c.kws.get("style")
+        if style is not None and z3.is_expr(style) and _is_str(style):
+            ss = z3.simplify(style)
+            if not z3.is_string_value(ss) or _z3_str_value(ss) not in ("%", "{", "$"):
+                bad.append("style")
+        if ("stream" in c.kws and "filename" in c.kws) or ("handlers" in c.kws and (
+                "stream" in c.kws or "filename" in c.kws)):
+            bad.append("stream/filename/handlers")
+        if bad:                                                    # raised only while the root logger has no
+            c.maybe("basicConfig rejects " + ", ".join(bad))       # handlers yet: a state-dependent ValueError
+
+
+_TIME_T_LIMIT = 2 ** 63
+
+
+def _tf_time(c):
+    nm = c.qual.split(".")[-1]
+    if nm in ("ctime", "gmtime", "localtime"):
+        s = c.arg(0, "secs")
+        if s is None or isinstance(s, _NoneVal):
+            return
+        k = _tf_kind(s)
+        if k == "float":
+            c.trap(z3.fpIsNaN(s), "ValueError")                    # "Invalid value NaN"
+            c.trap(z3.Or(z3.fpIsInf(s), z3.fpGEQ(z3.fpAbs(s), z3.FPVal(float(_TIME_T_LIMIT), _F64))),
+                   "OverflowError")                                # "timestamp out of range for platform time_t"
+        elif k in ("int", "bool"):
+            si = _as_int(s)
+            c.trap(z3.Or(si >= _TIME_T_LIMIT, si < -_TIME_T_LIMIT), "OverflowError")
+        elif k is not None:
+            c.trap(z3.BoolVal(True), "TypeError")
+        else:
+            raise Unsupported("time.%s of an unmodeled value" % nm)
+    elif nm in ("strftime", "asctime"):
+        t = c.arg(1 if nm == "strftime" else 0, "t")
+        if t is not None:
+            raise Unsupported("time.%s of an explicit time tuple (its fields are range-checked)" % nm)
+        if nm == "strftime":
+            fmt = c.arg(0, "format")
+            if _tf_kind(fmt) != "str":
+                if fmt is not None and _tf_kind(fmt) is not None:
+                    c.trap(z3.BoolVal(True), "TypeError")
+                    return
+                raise Unsupported("time.strftime format of an unmodeled value")
+            fs = z3.simplify(fmt)
+            if z3.is_string_value(fs):
+                import time as _time
+                try:
+                    _time.strftime(_z3_str_value(fs), (2000, 1, 1, 0, 0, 0, 5, 1, 0))
+                except ValueError:
+                    c.trap(z3.BoolVal(True), "ValueError")          # an invalid directive on this platform
+            else:
+                c.maybe("a non-literal strftime format may hold an invalid directive")
+
+
+def _tf_os(c):
+    q = c.qual
+    nm = q.split(".")[-1]
+    if q in ("os.stat", "os.listdir", "os.scandir", "os.walk", "os.path.getsize", "os.path.getmtime",
+             "os.path.getctime"):
+        p = c.arg(0, "path" if nm not in ("walk",) else "top")
+        if p is not None and not isinstance(p, _NoneVal):
+            c.path_nul(p)
+    elif q in ("os.path.realpath", "os.path.abspath", "os.path.ismount", "os.path.expanduser"):
+        key = {"realpath": "realpath_nul", "abspath": "abspath_nul", "ismount": "ismount_nul",
+               "expanduser": "expanduser_nul"}[nm]
+        p = c.arg(0, "path")
+        if p is not None:
+            if _tf_kind(p) == "str":
+                if _platform_valueerror(key):
+                    c.trap(_str_has_nul(p), "ValueError")
+            else:
+                c.type_error_if(p, _NUMERIC_KINDS + ("none", "list", "dict", "tuple"))
+    elif q == "os.strerror":
+        code = c.arg(0, "code")
+        if _tf_kind(code) in ("int", "bool"):
+            ci = _as_int(code)
+            c.trap(z3.Or(ci > 2 ** 31 - 1, ci < -(2 ** 31)), "OverflowError")
+        elif _tf_kind(code) is not None:
+            c.trap(z3.BoolVal(True), "TypeError")
+    elif q in ("os.getenv", "os.environ.get"):
+        key = c.arg(0, "key")
+        k = _tf_kind(key)
+        if k is not None and k != "str":
+            c.trap(z3.BoolVal(True), "TypeError")                  # "str expected"
+        elif k == "str" and _platform_valueerror("getenv_surrogate"):
+            # POSIX encodes the key with surrogateescape: a surrogate outside U+DC80..U+DCFF cannot be encoded
+            c.trap(z3.Or(_str_has(key, 0xD800, 0xDC7F), _str_has(key, 0xDD00, 0xDFFF)), "ValueError")
+    elif q == "os.fspath":
+        c.type_error_if(c.arg(0, "path"), _NUMERIC_KINDS + ("none", "list", "dict", "tuple", "set"))
+    elif q == "os.path.join":
+        ks = {_tf_kind(a) for a in c.args}
+        if ks & set(_NUMERIC_KINDS + ("none", "list", "dict", "tuple", "set")) or {"str", "bytes"} <= ks:
+            c.trap(z3.BoolVal(True), "TypeError")
+    elif q in ("os.path.dirname", "os.path.basename", "os.path.normpath", "os.path.normcase", "os.path.expandvars",
+               "os.path.split", "os.path.splitext", "os.path.isabs"):
+        c.type_error_if(c.arg(0, None), _NUMERIC_KINDS + ("none", "list", "dict", "tuple", "set"))
+
+
+def _tf_misc(c):
+    q = c.qual
+    nm = q.split(".")[-1]
+    a0 = c.arg(0, None)
+    if q == "string.capwords":
+        sep = c.arg(1, "sep")
+        if sep is not None and _tf_kind(sep) == "str":
+            c.trap(z3.Length(sep) == 0, "ValueError")              # "empty separator"
+    elif q == "sys.intern":
+        k = _tf_kind(a0)
+        if k is not None and k != "str":
+            c.trap(z3.BoolVal(True), "TypeError")
+    elif q == "re.escape":
+        c.type_error_if(a0, _NUMERIC_KINDS + ("none", "list", "dict", "tuple"))
+    elif q.startswith("base64."):
+        c.type_error_if(c.arg(0, "s"), _NUMERIC_KINDS + ("str", "none", "list", "dict", "tuple"))
+        if nm == "b64encode" and c.given(1, "altchars"):
+            alt = c.arg(1, "altchars")
+            if not isinstance(alt, _NoneVal):
+                if isinstance(alt, _SafeContainer):
+                    c.trap(_container_len(alt, c.ctx) != 2, "AssertionError")
+                else:
+                    raise Unsupported("base64.b64encode altchars of an unmodeled value")
+    elif q.startswith("binascii."):
+        c.type_error_if(c.arg(0, "data"), _NUMERIC_KINDS + ("str", "none", "list", "dict", "tuple"))
+        sep = c.arg(1, "sep")
+        if sep is not None and nm in ("hexlify", "b2a_hex"):
+            if _tf_kind(sep) == "str":
+                c.trap(z3.Length(sep) != 1, "ValueError")          # "sep must be length 1."
+            elif isinstance(sep, _SafeContainer):
+                c.trap(_container_len(sep, c.ctx) != 1, "ValueError")
+    elif q.startswith("hashlib."):
+        if c.given(0, "data" if nm != "blake2b" and nm != "blake2s" else "data"):
+            c.type_error_if(c.arg(0, "data"), _NUMERIC_KINDS + ("str", "none", "list", "dict", "tuple"))
+        if nm in ("blake2b", "blake2s"):
+            big = nm == "blake2b"
+            ds = c.kws.get("digest_size")
+            if ds is not None and c.int_arg(ds) is not None:
+                c.trap(z3.Or(c.int_arg(ds) < 1, c.int_arg(ds) > (64 if big else 32)), "ValueError")
+            for fld, lim in (("key", 64 if big else 32), ("salt", 16 if big else 8), ("person", 16 if big else 8)):
+                v = c.kws.get(fld)
+                if isinstance(v, _SafeContainer):
+                    c.trap(_container_len(v, c.ctx) > lim, "ValueError")
+                elif v is not None:
+                    raise Unsupported("hashlib.%s %s of an unmodeled value" % (nm, fld))
+    elif q == "html.unescape":
+        c.type_error_if(a0, _NUMERIC_KINDS + ("none",))
+    elif q in ("urllib.parse.quote", "urllib.parse.quote_plus"):
+        s = c.arg(0, "string")
+        k = _tf_kind(s)
+        errors = c.arg(3, "errors")
+        if k == "str" and (errors is None or isinstance(errors, _NoneVal)):
+            enc = c.arg(2, "encoding")
+            if enc is None or isinstance(enc, _NoneVal):          # utf-8, strict: a surrogate cannot be encoded
+                c.trap(_str_has_surrogate(s), "ValueError")
+            else:
+                raise Unsupported("urllib.parse.%s with an explicit encoding" % nm)
+        elif k == "str":
+            raise Unsupported("urllib.parse.%s with an explicit errors handler" % nm)
+        elif k in _NUMERIC_KINDS + ("none",):
+            c.trap(z3.BoolVal(True), "TypeError")
+    elif q == "shlex.quote":
+        c.type_error_if(a0, _NUMERIC_KINDS + ("none", "list", "dict", "tuple"))
+    elif q == "functools.partial":
+        c.type_error_if(c.arg(0, "func"), _NUMERIC_KINDS + ("str", "none", "list", "dict", "tuple", "bytes"))
+    elif q == "random.seed":
+        a = c.arg(0, "a")
+        if a is not None:
+            c.type_error_if(a, ("list", "dict", "tuple", "set"))
+    elif q == "uuid.uuid1":
+        node = c.arg(0, "node")
+        if node is not None and c.int_arg(node) is not None:
+            n = c.int_arg(node)
+            c.trap(z3.Or(n < 0, n >= 2 ** 48), "ValueError")       # "field 6 out of range"
+    elif q in ("pathlib.Path", "pathlib.PurePath", "pathlib.PurePosixPath", "pathlib.PureWindowsPath"):
+        for a in c.args:
+            c.type_error_if(a, _NUMERIC_KINDS + ("none", "list", "dict", "tuple", "set"))
+    elif q in ("heapq.heapify", "heapq.heappush"):
+        c.type_error_if(a0, _NUMERIC_KINDS + ("str", "none", "tuple", "dict", "bytes"))
+    elif q == "shutil.which":
+        cmd = c.arg(0, "cmd")
+        if _tf_kind(cmd) == "str" and _platform_valueerror("which_nul"):
+            c.trap(_str_has_nul(cmd), "ValueError")
+    elif q == "json.dumps":
+        _tf_json(c)
+    elif q in ("copy.copy", "copy.deepcopy"):
+        if type(a0) is _Opaque and a0.name in ("gen", "generator"):
+            c.trap(z3.BoolVal(True), "TypeError")                  # "cannot pickle 'generator' object"
+
+
+_INT_STR_DIGITS = 4300          # sys.get_int_max_str_digits(): a decimal str of a longer int is a ValueError
+
+
+def _int_str_limit(n):
+    """The ValueError condition of CPython's int -> decimal str conversion for int term n: more digits than the
+    interpreter's limit (sys.get_int_max_str_digits, 4300 by default; 0 disables it)."""
+    lim = sys.get_int_max_str_digits() if hasattr(sys, "get_int_max_str_digits") else 0
+    if not lim:
+        return z3.BoolVal(False)
+    return z3.Or(n >= 10 ** lim, n <= -(10 ** lim))
+
+
+def _tf_json(c):
+    if c.starred or any(k in c.kws for k in ("cls", "default")):
+        raise Unsupported("json.dumps with a custom encoder / default hook")
+    allow_nan = c.kws.get("allow_nan")
+    strict_nan = allow_nan is not None and z3.is_expr(allow_nan) and z3.is_false(z3.simplify(allow_nan))
+    if allow_nan is not None and not (z3.is_expr(allow_nan) and (z3.is_true(z3.simplify(allow_nan)) or strict_nan)):
+        raise Unsupported("json.dumps allow_nan of an unmodeled value")
+    sort = c.kws.get("sort_keys")
+    sort_keys = sort is not None and z3.is_expr(sort) and z3.is_true(z3.simplify(sort))
+    skipkeys = c.kws.get("skipkeys")
+    skip = skipkeys is not None and z3.is_expr(skipkeys) and z3.is_true(z3.simplify(skipkeys))
+
+    def walk(v, depth=0):
+        if depth > 20:
+            raise Unsupported("json.dumps of a deeply nested value")
+        k = _tf_kind(v)
+        if k in ("str", "bool", "none"):
+            return
+        if k == "int":
+            c.trap(_int_str_limit(v), "ValueError")
+            return
+        if k == "float":
+            if strict_nan:
+                c.trap(z3.Or(z3.fpIsNaN(v), z3.fpIsInf(v)), "ValueError")
+            return
+        if isinstance(v, tuple):
+            for e in v:
+                walk(e, depth + 1)
+            return
+        if isinstance(v, _MapVal):
+            kinds = set()
+            for key, val in zip(v.keys, v.vals):
+                kk = _tf_kind(key)
+                kinds.add("num" if kk in _NUMERIC_KINDS else kk)
+                if kk == "int":
+                    c.trap(_int_str_limit(key), "ValueError")
+                elif kk not in ("str", "bool", "float", "none") and not skip:
+                    if kk is None:
+                        raise Unsupported("json.dumps of a dict key of unmodeled type")
+                    c.trap(z3.BoolVal(True), "TypeError")           # "keys must be str, int, float, bool or None"
+                walk(val, depth + 1)
+            if sort_keys and len(kinds - {"none"}) > 1:
+                c.trap(z3.BoolVal(True), "TypeError")               # sorting str against int keys
+            return
+        if k in ("set", "bytes") or isinstance(v, _Complex):
+            c.trap(z3.BoolVal(True), "TypeError")                   # "Object of type set is not JSON serializable"
+            return
+        if isinstance(v, _SafeContainer) and v.elem is None and v.tuple_arity is None and not v.byteslike \
+                and not v.unindexable:
+            c.maybe("an element of the sequence may be an int beyond the str digit limit")
+            return
+        c.maybe("a value of unmodeled type may not be JSON serializable", "TypeError")
+    if c.args:
+        walk(c.args[0])
+
+
+_TF_TRAP_MODELS = {}
+for _q in _STDLIB_TF:
+    _mod = _q.rsplit(".", 1)[0]
+    if _mod == "itertools":
+        _TF_TRAP_MODELS[_q] = _tf_itertools
+    elif _mod == "textwrap":
+        _TF_TRAP_MODELS[_q] = _tf_textwrap
+    elif _mod == "bisect":
+        _TF_TRAP_MODELS[_q] = _tf_bisect
+    elif _mod == "collections":
+        _TF_TRAP_MODELS[_q] = _tf_collections
+    elif _mod == "warnings":
+        _TF_TRAP_MODELS[_q] = _tf_warnings
+    elif _mod == "logging":
+        _TF_TRAP_MODELS[_q] = _tf_logging
+    elif _mod == "time":
+        _TF_TRAP_MODELS[_q] = _tf_time
+    elif _q.startswith("os."):
+        _TF_TRAP_MODELS[_q] = _tf_os
+    else:
+        _TF_TRAP_MODELS[_q] = _tf_misc
+
+
+def _stdlib_tf_call(qual, args, kws, ctx, starred=False):
+    """The result of an allowlisted trap-free stdlib call, after emitting the traps its argument values raise
+    (an invalid width, a negative count, a NUL in a path, a wrong-typed argument, ...); None when `qual` is not an
+    allowlisted callable of the running interpreter."""
+    if qual not in _STDLIB_TF or not _stdlib_exists(qual):
+        return None
+    model = _TF_TRAP_MODELS.get(qual)
+    if model is not None:
+        model(_TFCall(qual, list(args), dict(kws), ctx, starred))
+    return _safe_stdlib_result(qual, ctx)
+
+
+_CLOCK_SECONDS = 2 ** 63 / 1e9   # CPython's clocks are int64 nanoseconds: every reading lies within +-2**63 ns
+
+
+def _safe_stdlib_result(qual, ctx=None):
     """A trap-free fresh value of the sort `qual` (a dotted stdlib name) returns, or None when `qual` is not a
-    known trap-free stdlib function. Used under trap freedom for a pure stdlib call that raises no modeled trap."""
+    known trap-free stdlib function. Used under trap freedom for a pure stdlib call that raises no modeled trap.
+    A clock reading is a finite double within the int64-nanosecond range CPython's clocks have."""
     ret = _STDLIB_TF.get(qual)
     if ret is None:
         return None
     if ret == "int":
-        return z3.FreshInt("tf_" + qual.split(".")[-1])
+        r = z3.FreshInt("tf_" + qual.split(".")[-1])
+        if qual.endswith("_ns") and ctx is not None and ctx.facts is not None:
+            ctx.facts.append(z3.And(r >= -(2 ** 63), r < 2 ** 63))
+        return r
     if ret == "float":
-        return z3.FreshConst(_F64, "tf_" + qual.split(".")[-1])
+        r = z3.FreshConst(_F64, "tf_" + qual.split(".")[-1])
+        if ctx is not None and ctx.facts is not None:
+            ctx.facts.append(z3.And(z3.fpGEQ(r, z3.FPVal(-_CLOCK_SECONDS, _F64)),
+                                    z3.fpLEQ(r, z3.FPVal(_CLOCK_SECONDS, _F64))))
+        return r
     if ret == "str":
         return z3.FreshConst(_SS, "tf_" + qual.split(".")[-1])
     if ret == "bool":
@@ -1292,7 +2541,7 @@ def _transcendental(name, arg, ctx):
     query is UNKNOWN, not REFUTED (the axioms do not pin the value), so only PROVED is reported there."""
     if name not in _TRANSCENDENTAL:
         raise Unsupported(f"transcendental {name}")
-    x = _to_fp(arg)
+    x = _to_fp(arg, None if name == "log" else ctx)   # math.log takes an int of any size (no conversion error)
     z, one = z3.FPVal(0.0, _F64), z3.FPVal(1.0, _F64)
     if ctx.traps is not None:                                                     # the domain / overflow trap, always
         if name in ("sin", "cos"):
@@ -1440,6 +2689,11 @@ def _math_call(name, args, ctx):
 
     def isfloat(v):
         return z3.is_expr(v) and (z3.is_int(v) or z3.is_bool(v) or _is_fp(v))
+    if name in ("floor", "ceil", "trunc") and isfloat(a0) and _is_fp(a0) and ctx.facts is not None \
+            and not z3.is_fp_value(z3.simplify(a0)):
+        f = a0                                               # a finite float's floor / ceil / trunc, exactly
+        trap(z3.Or(z3.fpIsInf(f), z3.fpIsNaN(f)), ("OverflowError", "ValueError"))
+        return _float_to_int(f, name, ctx)
     if name in ("floor", "ceil", "trunc"):
         if not isfloat(a0):
             return None
@@ -1472,7 +2726,7 @@ def _math_call(name, args, ctx):
         # with the libm anchors x ** 0 == 1, 1 ** y == 1, nonneg base -> nonneg, 0 ** y == 0 (y > 0).
         if len(args) < 2 or not isfloat(a0) or not isfloat(args[1]):
             return None                                      # a non-numeric argument: abstain (its own TypeError)
-        x, y = _to_fp(a0), _to_fp(args[1])
+        x, y = _to_fp(a0, ctx), _to_fp(args[1], ctx)
         one = z3.FPVal(1.0, F)
         mx, my = z3.simplify(x), z3.simplify(y)
         if z3.is_fp_value(mx) and z3.is_fp_value(my):        # both constant: fold to CPython's exact result / trap
@@ -1532,11 +2786,11 @@ def _math_call(name, args, ctx):
         if name in ("fmod", "remainder"):
             if len(args) < 2 or not isfloat(a0) or not isfloat(args[1]):
                 return None
-            trap(z3.Or(z3.fpIsInf(_to_fp(a0)), z3.fpIsZero(_to_fp(args[1]))), ("ValueError",))   # ValueError: an infinite dividend or zero divisor
+            trap(z3.Or(z3.fpIsInf(_to_fp(a0, ctx)), z3.fpIsZero(_to_fp(args[1], ctx))), ("ValueError",))   # ValueError: an infinite dividend or zero divisor
         else:
             if not isfloat(a0):
                 return None
-            f = _to_fp(a0)
+            f = _to_fp(a0, None if name in ("log2", "log10") else ctx)   # log2 / log10 take any int, no conversion
             one, neg1 = z3.FPVal(1.0, F), z3.FPVal(-1.0, F)
             if name in ("log2", "log10"):
                 trap(z3.fpLEQ(f, Z), ("ValueError",))        # log of a non-positive: ValueError
@@ -1551,10 +2805,11 @@ def _math_call(name, args, ctx):
         over()
         return z3.FreshConst(F, "m_" + name)
     if name in _MATH_PURE_FLOAT:
-        for x in args:
+        for i, x in enumerate(args):
             if not isfloat(x):
                 return None                                  # a non-numeric argument: abstain
-            _to_fp(x)                                        # trap-check (already evaluated)
+            if not (name == "ldexp" and i == 1):             # each float argument converts (ldexp's exponent is an int)
+                _to_fp(x, ctx)
         if _TRAPFREE and ctx.traps is not None:              # OverflowError (a trap-freedom concern; the exp-family
             x0 = _to_fp(a0)                                  # -- sinh/cosh/expm1/exp2 -- and ldexp raise it. degrees/
             fx = z3.And(z3.Not(z3.fpIsInf(x0)), z3.Not(z3.fpIsNaN(x0)))   # hypot/radians return inf, so they do not.
@@ -1593,31 +2848,121 @@ _STR_PREDS = {"isdigit", "isalpha", "isalnum", "isspace", "isupper", "islower", 
 _STR_PRED_FN = {}
 
 
+def _float_to_int(x, mode, ctx):
+    """The int a finite double x converts to -- 'trunc' (int(x), math.trunc), 'floor', 'ceil', or 'round' (round(x),
+    half to even) -- as a fresh int pinned by exact int / float comparisons (_num_compare), so the conversion is
+    exact rather than over-approximated; the inf / nan traps are the caller's. Requires the fact channel."""
+    n = z3.FreshInt("f2i_" + mode)
+    fin = z3.And(z3.Not(z3.fpIsInf(x)), z3.Not(z3.fpIsNaN(x)))
+    rm = {"floor": z3.RTN(), "ceil": z3.RTP(), "trunc": z3.RTZ(), "round": z3.RNE()}[mode]   # round: half to even
+    r = z3.fpRoundToIntegral(rm, x)                          # the integral double the conversion lands on
+    _define(ctx, z3.Implies(fin, _num_compare(ast.Eq, n, r)), n)   # and n is that integer, exactly
+    return n
+
+
+_STR_MAP_FNS = {}
+
+
+@lru_cache(maxsize=None)
+def _case_expanding(name):
+    """The code-point ranges of the characters whose single-character case map `name` (upper / lower / casefold /
+    swapcase / title) is longer than one character ('ß'.upper() == 'SS')."""
+    out, start = [], None
+    for cp in range(0x30000):
+        ok = len(getattr(str, name)(chr(cp))) > 1
+        if ok and start is None:
+            start = cp
+        elif not ok and start is not None:
+            out.append((start, cp - 1)); start = None
+    if start is not None:
+        out.append((start, 0x2FFFF))
+    return tuple(out)
+
+
 def _str_method(name, s, ctx):
-    """strip / lstrip / rstrip and the case maps (upper / lower / capitalize / title / swapcase /
-    casefold), which z3's theory lacks, as sound over-approximations: strip leaves a substring no longer
-    than s (lstrip drops a prefix, rstrip a suffix); a case map is empty exactly when s is (Unicode-safe,
-    since 'ss'.upper() and 'ß'.upper() change length). PROVED where it follows, else UNKNOWN."""
+    """strip / lstrip / rstrip and the case maps (upper / lower / capitalize / title / swapcase / casefold), which
+    z3's theory lacks: a concrete function of s (a model is confirmed against CPython) with sound facts. strip leaves
+    a substring no longer than s (lstrip a suffix of it, rstrip a prefix). A case map maps each character to one to
+    three, so its result is no shorter and at most three times as long; upper / lower / casefold / swapcase keep the
+    length exactly unless s holds a character whose map is longer, which makes the result longer. PROVED where it
+    follows, else UNKNOWN."""
     over = _overapprox(ctx, "str." + name, _SS, "str_" + name)
     if over is not None:
         return over
+    if name not in _STR_MAP_FNS:
+        _STR_MAP_FNS[name] = _concrete_fn("py_str_" + name, getattr(str, name), _SS, _SS)
     L = z3.Length
-    r = z3.Function("py_str_" + name, _SS, _SS)(s)
+    r = _STR_MAP_FNS[name](s)
     if name == "strip":
         ctx.facts += [z3.Contains(s, r), L(r) <= L(s)]
     elif name == "lstrip":
         ctx.facts += [z3.SuffixOf(r, s), L(r) <= L(s)]
     elif name == "rstrip":
         ctx.facts += [z3.PrefixOf(r, s), L(r) <= L(s)]
-    else:                                                # case maps: empty iff empty
-        ctx.facts.append((L(s) == 0) == (L(r) == 0))
+    else:                                                # case maps: one to three characters per character
+        ctx.facts += [L(r) >= L(s), L(r) <= 3 * L(s)]
+        if name in ("upper", "lower", "casefold", "swapcase"):
+            grows = z3.InRe(s, z3.Concat(z3.Star(z3.AllChar(z3.ReSort(_SS))), _re_set(_case_expanding(name)),
+                                         z3.Star(z3.AllChar(z3.ReSort(_SS)))))
+            ctx.facts += [z3.Implies(z3.Not(grows), L(r) == L(s)), z3.Implies(grows, L(r) >= L(s) + 1)]
+        else:                                            # capitalize / title: a character maps by its position
+            grows = z3.InRe(s, z3.Concat(z3.Star(z3.AllChar(z3.ReSort(_SS))),
+                                         _re_set(tuple(sorted(set(_case_expanding("title"))
+                                                              | set(_case_expanding("lower"))))),
+                                         z3.Star(z3.AllChar(z3.ReSort(_SS)))))
+            ctx.facts.append(z3.Implies(z3.Not(grows), L(r) == L(s)))
     return r
 
 
+@lru_cache(maxsize=None)
+def _char_class(name):
+    """The code-point ranges over the solvers' alphabet (U+0000..U+2FFFF) of the characters c for which the running
+    interpreter's single-character predicate holds: a str method name ('isdigit', 'isupper', ...) or 'title' (the
+    titlecase letters, general category Lt)."""
+    import unicodedata as _ud
+    pred = (lambda c: _ud.category(c) == "Lt") if name == "title" else getattr(str, name)
+    out, start = [], None
+    for cp in range(0x30000):
+        ok = pred(chr(cp))
+        if ok and start is None:
+            start = cp
+        elif not ok and start is not None:
+            out.append((start, cp - 1)); start = None
+    if start is not None:
+        out.append((start, 0x2FFFF))
+    return tuple(out)
+
+
+_PER_CHAR_PREDS = frozenset({"isdigit", "isdecimal", "isnumeric", "isalpha", "isalnum", "isspace"})
+
+
+def _str_predicate_exact(name, s):
+    """The exact z3 form of str.<name>(s) for the predicates that are a condition on every character (a non-empty
+    string of digits / letters / ..., any string of ASCII or printable characters) and for isupper / islower (no
+    character of the other case or titlecase, at least one of the case), or None for istitle / isidentifier."""
+    R = z3.ReSort(z3.StringSort())
+    allc = z3.AllChar(R)
+    if name in _PER_CHAR_PREDS:
+        return z3.InRe(s, z3.Plus(_re_set(_char_class(name))))
+    if name == "isascii":
+        return z3.InRe(s, z3.Star(_re_set(((0, 0x7F),))))
+    if name == "isprintable":
+        return z3.InRe(s, z3.Star(_re_set(_char_class("isprintable"))))
+    if name in ("isupper", "islower"):
+        own = _re_set(_char_class(name))
+        other = _re_set(_char_class("islower" if name == "isupper" else "isupper"))
+        rest = z3.Intersect(allc, z3.Complement(z3.Union(other, _re_set(_char_class("title")))))
+        return z3.InRe(s, z3.Concat(z3.Star(rest), own, z3.Star(rest)))
+    return None
+
+
 def _str_predicate(name, s, ctx):
-    """An is* predicate as a sound over-approximation: an uninterpreted Bool whose only axiom is its
-    empty-string value (False for "", except isprintable / isascii which are True). PROVED where it
-    follows, else UNKNOWN."""
+    """An is* predicate: exact (_str_predicate_exact) where it is a condition on the characters, else (istitle /
+    isidentifier) a sound over-approximation, an uninterpreted Bool whose only axiom is its empty-string value
+    (False for ""). PROVED where it follows, else UNKNOWN."""
+    exact = _str_predicate_exact(name, s)
+    if exact is not None:
+        return exact
     over = _overapprox(ctx, "str." + name, z3.BoolSort(), "str_" + name)
     if over is not None:
         return over
@@ -1629,33 +2974,50 @@ def _str_predicate(name, s, ctx):
     return r
 
 
-_STR_COUNT = z3.Function("py_str_count", _SS, _SS, z3.IntSort())
-_STR_REPLACE = z3.Function("py_str_replace", _SS, _SS, _SS, _SS)
 _STR_PAD_FN = {}
+_LAZY_CONCRETE = {}
+
+
+def _lazy_concrete(name, py, *sorts):
+    """The concrete function `name` (_concrete_fn), created on first use."""
+    if name not in _LAZY_CONCRETE:
+        _LAZY_CONCRETE[name] = _concrete_fn(name, py, *sorts)
+    return _LAZY_CONCRETE[name]
 
 
 def _str_count(s, sub, ctx):
-    """str.count as a sound over-approximation: a count >= 0 that is 0 when sub is absent from s."""
+    """str.count: a concrete function of (s, sub), confirmed against CPython in a model, with sound facts -- a
+    count >= 0, 0 exactly when a non-empty sub is absent, len(s) + 1 for the empty sub, and at most
+    len(s) / len(sub) occurrences of a literal sub."""
     over = _overapprox(ctx, "str.count", z3.IntSort(), "str_count")
     if over is not None:
         return over
-    r = _STR_COUNT(s, sub)
-    ctx.facts += [r >= 0, z3.Implies(z3.Not(z3.Contains(s, sub)), r == 0)]
+    r = _lazy_concrete("py_str_count", str.count, _SS, _SS, z3.IntSort())(s, sub)
+    L = z3.Length
+    ctx.facts += [r >= 0, z3.Implies(z3.Length(sub) == 0, r == L(s) + 1),
+                  z3.Implies(z3.Length(sub) > 0, (r == 0) == z3.Not(z3.Contains(s, sub)))]
+    subv = z3.simplify(sub)
+    if z3.is_string_value(subv) and _z3_str_value(subv):
+        ctx.facts.append(r * len(_z3_str_value(subv)) <= L(s))
     return r
 
 
 def _str_replace(s, old, new, ctx):
-    """str.replace(old, new): folded exactly when s, old, and new are all constant strings (Python computes
-    it); otherwise a sound over-approximation -- an uninterpreted result equal to s when old is absent. z3's
-    solver does not reason about replace_all symbolically (it returns unknown), so a symbolic replace cannot be
-    made exact and stays PROVED-only on what the absent-fact forces."""
-    if z3.is_string_value(s) and z3.is_string_value(old) and z3.is_string_value(new) and old.as_string() != "":
-        return z3.StringVal(s.as_string().replace(old.as_string(), new.as_string()))
+    """str.replace(old, new): folded exactly when s, old, and new are all constant strings (Python computes it);
+    otherwise a concrete function of the three, confirmed against CPython in a model, equal to s when a non-empty
+    old is absent, and -- for a literal non-empty old and a literal new -- exactly len(s) + count(old) *
+    (len(new) - len(old)) long."""
+    if z3.is_string_value(s) and z3.is_string_value(old) and z3.is_string_value(new) and _z3_str_value(old) != "":
+        return z3.StringVal(_z3_str_value(s).replace(_z3_str_value(old), _z3_str_value(new)))
     over = _overapprox(ctx, "str.replace", _SS, "str_replace")
     if over is not None:
         return over
-    r = _STR_REPLACE(s, old, new)
-    ctx.facts.append(z3.Implies(z3.Not(z3.Contains(s, old)), r == s))
+    r = _lazy_concrete("py_str_replace", str.replace, _SS, _SS, _SS, _SS)(s, old, new)
+    ctx.facts.append(z3.Implies(z3.And(z3.Length(old) > 0, z3.Not(z3.Contains(s, old))), r == s))
+    ov, nv = z3.simplify(old), z3.simplify(new)
+    if z3.is_string_value(ov) and z3.is_string_value(nv) and _z3_str_value(ov):
+        d = len(_z3_str_value(nv)) - len(_z3_str_value(ov))
+        ctx.facts.append(z3.Length(r) == z3.Length(s) + _str_count(s, old, ctx) * d)
     return r
 
 
@@ -1781,6 +3143,277 @@ def _format_spec_safe(spec, v):
     return False
 
 
+def _parse_printf(fmt):
+    """The conversion specifiers of a printf-style format string, in CPython's PyUnicode_Format grammar
+    %[(key)][flags][width][.precision][length]type: a list of (key or None, star_count, type), or the string
+    'incomplete' / 'badchar:<c>' when CPython raises ValueError on the format itself."""
+    out, i, n = [], 0, len(fmt)
+    while i < n:
+        if fmt[i] != "%":
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            return "incomplete"
+        key = None
+        if fmt[i] == "(":
+            depth, j = 1, i + 1
+            while j < n and depth:
+                depth += {"(": 1, ")": -1}.get(fmt[j], 0)
+                j += 1
+            if depth:
+                return "incomplete"                          # "incomplete format key"
+            key, i = fmt[i + 1:j - 1], j
+        stars = 0
+        while i < n and fmt[i] in "-+ #0":
+            i += 1
+        if i < n and fmt[i] == "*":
+            stars += 1; i += 1
+        else:
+            while i < n and fmt[i].isdigit():
+                i += 1
+        if i < n and fmt[i] == ".":
+            i += 1
+            if i < n and fmt[i] == "*":
+                stars += 1; i += 1
+            else:
+                while i < n and fmt[i].isdigit():
+                    i += 1
+        while i < n and fmt[i] in "hlL":
+            i += 1
+        if i >= n:
+            return "incomplete"
+        t = fmt[i]
+        i += 1
+        if t == "%" and key is None and stars == 0:
+            continue                                         # a literal percent sign
+        if t not in "diouxXeEfFgGcrsa%":
+            return "badchar:" + t
+        out.append((key, stars, t))
+    return out
+
+
+def _printf_traps(fmt, args, ctx):
+    """The traps CPython raises evaluating `fmt % args` for a constant format string: a malformed format or an
+    unsupported conversion (ValueError), an argument count that does not match (TypeError), a mapping key absent
+    from the mapping (KeyError), and each conversion's own -- a non-number for %d / %f, a non-int for %x, an int
+    past the str digit limit for %d / %s / %r, a double conversion past its range for %f, an out-of-range %c."""
+    spec = _parse_printf(fmt)
+    if isinstance(spec, str):
+        _trap_add(ctx, ctx.pc, ("ValueError",))
+        return
+    keyed = [s for s in spec if s[0] is not None]
+    if keyed and len(keyed) != len(spec):                    # mixing %(k)s with %s: "format requires a mapping"
+        _trap_add(ctx, ctx.pc, ("TypeError",))
+        return
+    mapping = isinstance(args, (_MapVal, _DictParam, _DictLit, _DefaultDict))
+    if keyed:
+        if not mapping:
+            if isinstance(args, _Opaque) and not isinstance(args, (_NoneVal, _SafeContainer)):
+                _note_overapprox(ctx, "% formatting with a mapping of unmodeled type")
+                _trap_add(ctx, z3.And(ctx.pc, z3.FreshConst(z3.BoolSort(), "pfmap")), ("TypeError", "KeyError"))
+                return
+            _trap_add(ctx, ctx.pc, ("TypeError",))               # "format requires a mapping"
+            return
+        for key, stars, t in keyed:
+            if stars:
+                _trap_add(ctx, ctx.pc, ("TypeError",))            # "* wants int" cannot take from a mapping
+                return
+            kv = z3.StringVal(key)
+            if isinstance(args, _MapVal):
+                v = _map_get(args, kv, ctx)                      # KeyError when absent
+            elif isinstance(args, _DictParam):
+                mem = _dict_member(args, kv)
+                if mem is not None:
+                    _trap_add(ctx, z3.And(ctx.pc, z3.Not(mem)), ("KeyError",))
+                v = None
+            else:
+                v = None
+            if v is not None:
+                _printf_conv_traps(t, v, ctx)
+            elif t in "diouxXeEfFgGc":                           # a value of unknown type for a typed conversion
+                _note_overapprox(ctx, "% formatting of a mapping value of unmodeled type")
+                _trap_add(ctx, z3.And(ctx.pc, z3.FreshConst(z3.BoolSort(), "pfval")), ("TypeError", "ValueError"))
+        return
+    need = sum(1 + s for _k, s, _t in spec)                  # each * consumes an int argument before the value
+    if isinstance(args, tuple) and not isinstance(args, _ListLit):
+        vals = list(args)
+    elif isinstance(args, _SafeContainer) and args.immutable and not args.byteslike:
+        _note_overapprox(ctx, "% formatting with a tuple of unknown length")
+        L = _container_len(args, ctx)
+        _trap_add(ctx, z3.And(ctx.pc, L != need), ("TypeError",))
+        return
+    elif isinstance(args, _Opaque) and not isinstance(args, (_NoneVal, _SafeContainer, _MapVal, _DictParam,
+                                                              _DictLit, _DefaultDict, _StrSeq)):
+        _note_overapprox(ctx, "% formatting with an argument of unmodeled type")
+        _trap_add(ctx, z3.And(ctx.pc, z3.FreshConst(z3.BoolSort(), "pfarg")), ("TypeError", "ValueError"))
+        return
+    else:
+        vals = [args]                                        # a single non-tuple value is the one argument
+    if len(vals) < need:
+        _trap_add(ctx, ctx.pc, ("TypeError",))                # "not enough arguments for format string"
+        return
+    # CPython lets an unused single argument pass when it supports item access and is no tuple / str (a list, a
+    # dict, bytes): PyMapping_Check marks it as the mapping, which suppresses the "not all converted" error
+    is_map_like = mapping or isinstance(args, _ListLit) or (
+        isinstance(args, _SafeContainer) and not args.unindexable and not (args.immutable and not args.byteslike))
+    if len(vals) > need and not (len(vals) == 1 and is_map_like):
+        _trap_add(ctx, ctx.pc, ("TypeError",))                # "not all arguments converted during string formatting"
+        return
+    i = 0
+    for _key, stars, t in spec:
+        for _ in range(stars):
+            w = vals[i]; i += 1
+            k = _tf_kind(w)
+            if k not in ("int", "bool"):
+                if k is not None:
+                    _trap_add(ctx, ctx.pc, ("TypeError",))        # "* wants int"
+                    return
+                _note_overapprox(ctx, "% formatting width of unmodeled type")
+        if i < len(vals):
+            _printf_conv_traps(t, vals[i], ctx)
+        i += 1
+
+
+def _printf_conv_traps(t, v, ctx):
+    """The trap one printf conversion raises on value v (see _printf_traps)."""
+    k = _tf_kind(v)
+    if t in "sra":
+        _text_conv_traps(v, ctx, "str" if t == "s" else "repr")
+        return
+    if t in "diu":
+        if k in ("int",):
+            _exact_trap(ctx, _int_str_limit(_as_int(v)), ("ValueError",))
+        elif k == "float":                                   # converted to an int first (a double has at most
+            _exact_trap(ctx, z3.fpIsInf(v), ("OverflowError",))  # 309 digits, under the str digit limit):
+            _exact_trap(ctx, z3.fpIsNaN(v), ("ValueError",))     # an infinity / a NaN cannot be
+        elif k == "bool":
+            return
+        elif k is not None:
+            _trap_add(ctx, ctx.pc, ("TypeError",))                # "%d format: a real number is required"
+        else:
+            _note_overapprox(ctx, "%%%s formatting of a value of unmodeled type" % t)
+            _trap_add(ctx, z3.And(ctx.pc, z3.FreshConst(z3.BoolSort(), "pfconv")), ("TypeError",))
+        return
+    if t in "oxX":
+        if k in ("int", "bool"):
+            return                                           # a non-decimal rendering has no digit limit
+        if k is not None:
+            _trap_add(ctx, ctx.pc, ("TypeError",))                # "%x format: an integer is required"
+        else:
+            _note_overapprox(ctx, "%%%s formatting of a value of unmodeled type" % t)
+            _trap_add(ctx, z3.And(ctx.pc, z3.FreshConst(z3.BoolSort(), "pfconv")), ("TypeError",))
+        return
+    if t in "eEfFgG":
+        if k == "int":
+            n = _as_int(v)
+            _exact_trap(ctx, z3.Or(n >= _INT_FLOAT_OVF, n <= -_INT_FLOAT_OVF), ("OverflowError",))
+        elif k in ("float", "bool"):
+            return
+        elif k is not None:
+            _trap_add(ctx, ctx.pc, ("TypeError",))                # "must be real number, not str"
+        else:
+            _note_overapprox(ctx, "%%%s formatting of a value of unmodeled type" % t)
+            _trap_add(ctx, z3.And(ctx.pc, z3.FreshConst(z3.BoolSort(), "pfconv")), ("TypeError",))
+        return
+    if t == "c":
+        if k in ("int", "bool"):
+            n = _as_int(v)
+            _exact_trap(ctx, z3.Or(n < 0, n > _MAXCP), ("OverflowError",))   # "%c arg not in range(0x110000)"
+        elif k == "str":
+            _exact_trap(ctx, z3.Length(v) != 1, ("TypeError",))   # "%c requires int or char"
+        elif k is not None:
+            _trap_add(ctx, ctx.pc, ("TypeError",))
+        else:
+            _note_overapprox(ctx, "%c formatting of a value of unmodeled type")
+            _trap_add(ctx, z3.And(ctx.pc, z3.FreshConst(z3.BoolSort(), "pfconv")), ("TypeError",))
+
+
+def _const_spec_text(spec_node):
+    """The constant text of an f-string format spec node ('' for an empty spec), or None for a dynamic spec."""
+    if not isinstance(spec_node, ast.JoinedStr):
+        return None
+    if not spec_node.values:
+        return ""
+    if len(spec_node.values) == 1 and isinstance(spec_node.values[0], ast.Constant) \
+            and isinstance(spec_node.values[0].value, str):
+        return spec_node.values[0].value
+    return None
+
+
+def _text_conv_traps(v, ctx, how, spec=None, depth=0):
+    """The traps CPython raises turning value v into text: str() / repr() (how = 'str' / 'repr') or format(v, spec)
+    (how = 'format'). An int rendered in decimal -- str, repr, print, an f-string field, format with no type or
+    'd' / 'n' -- past sys.get_int_max_str_digits() digits is a ValueError; an int formatted with a float
+    presentation (e / f / g / %) is converted to a double (an OverflowError past its range); a hex / octal / binary
+    rendering has no limit. A tuple or list literal renders each element with repr; a sequence whose int elements
+    are not known may hold such an int (a possible trap, over-approximated)."""
+    if ctx is None or getattr(ctx, "traps", None) is None or depth > 8:
+        return
+    if isinstance(v, tuple):
+        for e in v:
+            _text_conv_traps(e, ctx, "repr", None, depth + 1)
+        return
+    if isinstance(v, _MapVal) and how in ("str", "repr"):
+        for e in list(v.keys) + list(v.vals):
+            _text_conv_traps(e, ctx, "repr", None, depth + 1)
+        return
+    if isinstance(v, (_DictParam, _DictLit, _DefaultDict)) and how in ("str", "repr"):
+        _note_overapprox(ctx, "%s() of a dict whose int items may exceed the str digit limit" % how)
+        _trap_add(ctx, z3.And(ctx.pc, z3.FreshConst(z3.BoolSort(), "digits")), ("ValueError",))
+        return
+    if isinstance(v, _SafeContainer) and getattr(v, "rng", None) is not None and how in ("str", "repr"):
+        start, stop, _s = v.rng                              # repr(range(a, b)) renders its start and stop
+        _exact_trap(ctx, z3.Or(_int_str_limit(start), _int_str_limit(stop)), ("ValueError",))
+        return
+    if isinstance(v, _SafeContainer) and not v.byteslike and v.elem is None and how in ("str", "repr") \
+            and getattr(v, "scalar", None) not in ("str", "float", "bool", "bytes"):
+        _note_overapprox(ctx, "%s() of a sequence whose int elements may exceed the str digit limit" % how)
+        _trap_add(ctx, z3.And(ctx.pc, z3.FreshConst(z3.BoolSort(), "digits")), ("ValueError",))
+        return
+    if not (z3.is_expr(v) and z3.is_int(v)):
+        return
+    typ = ""
+    if how == "format" and spec:
+        m = _FMT_SPEC.fullmatch(spec)
+        typ = (m.group("type") or "") if m else ""
+    if typ in ("", "d", "n"):
+        _exact_trap(ctx, _int_str_limit(v), ("ValueError",))
+    elif typ in ("e", "E", "f", "F", "g", "G", "%"):
+        _exact_trap(ctx, z3.Or(v >= _INT_FLOAT_OVF, v <= -_INT_FLOAT_OVF), ("OverflowError",))
+
+
+def _elements_text_traps(seq, ctx, how):
+    """The traps rendering every element of `seq` with str / repr raises (map(str, seq), key=str, print(*seq)): an
+    int element past the str digit limit. A range's elements are start + k * step, reached within the bounded
+    execution's 2**63 steps; an annotated str / float / bool / bytes element never raises; a string's elements are
+    characters; an element of unknown type may be such an int (a possible trap, over-approximated)."""
+    if ctx is None or getattr(ctx, "traps", None) is None:
+        return
+    if _is_str(seq) or isinstance(seq, _StrSeq):
+        return
+    if isinstance(seq, tuple):
+        for e in seq:
+            _text_conv_traps(e, ctx, how)
+        return
+    if isinstance(seq, _MapVal):
+        for e in seq.keys:
+            _text_conv_traps(e, ctx, how)
+        return
+    if isinstance(seq, _SafeContainer) and getattr(seq, "rng", None) is not None:
+        start, _stop, s = seq.rng
+        k = z3.FreshInt("rngk")
+        _exact_trap(ctx, z3.And(k >= 0, k < seq.length, k < _ITERATION_BOUND, _int_str_limit(start + k * s)),
+                    ("ValueError",))
+        return
+    if isinstance(seq, _SafeContainer) and (seq.byteslike or getattr(seq, "scalar", None) in
+                                            ("str", "float", "bool", "bytes") or seq.elem is not None):
+        if seq.byteslike or seq.elem is None:
+            return                                           # bytes elements are ints in [0, 255]; typed scalars
+    _note_overapprox(ctx, "%s() of elements that may be ints past the str digit limit" % how)
+    _trap_add(ctx, z3.And(ctx.pc, z3.FreshConst(z3.BoolSort(), "digits")), ("ValueError",))
+
+
 def _const_format_spec_safe(spec_node, v):
     """Whether a constant f-string format spec applied to modeled scalar `v` provably never raises. Extracts the
     constant spec text (a dynamic nested spec declines) and defers the type compatibility to _format_spec_safe."""
@@ -1874,24 +3507,59 @@ def _str_call(meth, s, a, ctx, kwnames=None):
         for p in parts[1:]:
             acc = z3.Concat(acc, s, p)
         return acc
-    if meth == "join" and len(a) == 1 and isinstance(a[0], _StrSeq):    # sep.join(a string sequence, e.g. a split
-        return z3.FreshConst(z3.StringSort(), "joined")                 # result): a string result, trap free (the
-        #                                                                 parts are strings, so no TypeError)
+    if meth == "join" and len(a) == 1 and isinstance(a[0], (_StrSeq, _SafeContainer)):
+        # sep.join(seq): a string when every element is a str (a string sequence, a list[str]); an element of another
+        # type -- an int of a list[int] or a bare list, a byte of bytes, an inner sequence -- is a TypeError once the
+        # sequence is non-empty. The joined text is not modeled beyond its length bounds (an over-approximation).
+        c = a[0]
+        k = c.length if isinstance(c, _StrSeq) else (None if c.unsized else _container_len(c, ctx))
+        if isinstance(c, _SafeContainer):
+            strs = (c.scalar == "str" and c.elem is None and c.tuple_arity is None
+                    and not (c.byteslike and not c.unindexable))
+            if not strs:
+                if c.scalar == "opaque" or c.unsized:
+                    return None
+                if ctx.traps is not None:
+                    _exact_trap(ctx, _container_len(c, ctx) >= 1, ("TypeError",))
+        _note_overapprox(ctx, "the text str.join produces")
+        r = z3.FreshConst(z3.StringSort(), "joined")
+        if ctx.facts is not None and k is not None:
+            ctx.facts.append(z3.Implies(k == 0, z3.Length(r) == 0))
+            ss = z3.simplify(s)
+            if z3.is_string_value(ss):                       # k parts carry k - 1 separators (linear for a literal)
+                ctx.facts.append(z3.Length(r) >= (k - 1) * len(_z3_str_value(ss)))
+        return r
     if meth in ("split", "rsplit"):                                  # a list of strings
         if not a:                                                    # s.split(): split on whitespace -- CAN be empty
-            k = z3.FreshInt("splitlen")                              # ('  '.split() == []), so its length is only >= 0
-            if ctx.facts is not None:
-                ctx.facts.append(k >= 0)
-            return _StrSeq("split", length=k)
+            k = _WSPLIT_LEN(s)                                       # ('  '.split() == []), so its length is only >= 0;
+            if ctx.facts is not None:                                # each word is non-empty, and there are at most
+                ctx.facts.append(z3.And(k >= 0, 2 * k <= z3.Length(s) + 1))   # (len + 1) / 2 of them
+            return _StrSeq("split", length=k, nonempty=True, part=lambda i, _s=s: _WSPLIT_PART(_s, i))
         if 1 <= len(a) <= 2 and _is_str(a[0]):                       # s.split(sep[, maxsplit]): empty sep raises
+            sep = a[0]
             if ctx.traps is not None:
-                _trap_add(ctx, z3.And(ctx.pc, z3.Length(a[0]) == 0), ("ValueError",))   # ValueError on an empty separator
-            if len(a) == 2:
-                _as_int(a[1])                                        # maxsplit is trap-checked
-            k = z3.FreshInt("splitlen")                              # a non-empty separator yields >= 1 part (the whole
-            if ctx.facts is not None:                                # string if absent), so split(sep)[0] / [-1] decide
-                ctx.facts.append(k >= 1)
-            return _StrSeq("split", length=k)
+                _trap_add(ctx, z3.And(ctx.pc, z3.Length(sep) == 0), ("ValueError",))   # ValueError on an empty separator
+            ms = _as_int(a[1]) if len(a) == 2 else None              # maxsplit is trap-checked
+            k = _SPLIT_LEN(s, sep) if ms is None else _SPLIT_LEN_MAX(s, sep, ms)   # the part count, a function of
+            #                                                          the arguments (two calls agree); the parts: one
+            #                                                          more than the separators split at,
+            if ctx.facts is not None:                                # so the whole string (one part) when sep is absent,
+                has = z3.Contains(s, sep)                            # at least two when present (unless maxsplit is 0),
+                splits = z3.BoolVal(True) if ms is None else ms != 0  # never more than maxsplit + 1 for a nonnegative
+                ctx.facts.append(z3.And(k >= 1, z3.Implies(z3.Not(has), k == 1),   # maxsplit, and at most
+                                        z3.Implies(z3.And(has, splits), k >= 2)))   # len(s) / len(sep) separators
+                if ms is not None:
+                    ctx.facts.append(z3.Implies(ms == 0, k == 1))
+                    ctx.facts.append(z3.Implies(ms > 0, k <= ms + 1))
+                if z3.is_string_value(z3.simplify(sep)) and len(_z3_str_value(z3.simplify(sep))) > 0:
+                    ctx.facts.append((k - 1) * len(_z3_str_value(z3.simplify(sep))) <= z3.Length(s))
+            if ms is None:                                           # rsplit without maxsplit yields split's parts
+                part = (lambda i, _s=s, _p=sep: _SPLIT_PART(_s, _p, i))
+            elif meth == "split":
+                part = (lambda i, _s=s, _p=sep, _m=ms: _SPLIT_PART_MAX(_s, _p, _m, i))
+            else:
+                part = (lambda i, _s=s, _p=sep, _m=ms: _RSPLIT_PART_MAX(_s, _p, _m, i))
+            return _StrSeq("split", length=k, part=part)
         return None
     if meth == "splitlines" and len(a) <= 1:
         k = z3.FreshInt("splitlen")                                  # splitlines() of '' is [] -- only >= 0
@@ -1899,18 +3567,93 @@ def _str_call(meth, s, a, ctx, kwnames=None):
             ctx.facts.append(k >= 0)
         return _StrSeq("splitlines", length=k)
     if meth == "format" and z3.is_string_value(s):           # a literal format string: sound over-approximation
-        return _str_format(s.as_string(), a, ctx, kwnames)   # (a non-literal receiver / format_map stays UNKNOWN)
+        return _str_format(_z3_str_value(s), a, ctx, kwnames)   # (a non-literal receiver / format_map: UNKNOWN)
     if meth == "encode" and z3.is_expr(s) and s.sort() == z3.StringSort() and ctx.facts is not None and not kwnames:
-        # s.encode() / s.encode('utf-8'): the default utf-8 -- and the utf-8 family by name -- encodes every str
-        # without raising, producing bytes of length >= len(s) (each character is one to four bytes), so a later
-        # encode()[i] under a len(s) guard stays sound. A lossy codec (ascii / latin-1) can raise UnicodeEncodeError,
-        # and a keyword form (encoding= / errors=) hides the codec, so only a no-arg or explicit-utf-8 positional
-        # form is modeled; anything else is left UNKNOWN.
-        _u8 = not a or (len(a) == 1 and z3.is_string_value(a[0])
-                        and a[0].as_string().lower().replace("-", "").replace("_", "") in ("utf8", "u8"))
-        if _u8:
-            k = z3.FreshInt("enc"); ctx.facts.append(k >= 0)
-            return _SafeContainer("encoded", byteslike=True, length=z3.Length(s) + k)
+        # s.encode([encoding[, errors]]) for the codecs whose failures are a condition on the characters: the utf-8 /
+        # utf-16 / utf-32 family raises UnicodeEncodeError (a ValueError) on a surrogate code point, ascii on a code
+        # point past U+007F, latin-1 past U+00FF -- under the strict handler; ignore / replace / backslashreplace /
+        # xmlcharrefreplace / namereplace never raise. The result's length is exact or bounded per codec, and the
+        # bytes remember their source, so a later decode is decided against it. Another codec, a handler with its
+        # own failure modes, or a keyword form is left UNKNOWN.
+        codec = _codec_name(a[0]) if a else "utf-8"
+        handler = _codec_handler(a[1]) if len(a) >= 2 else "strict"
+        if codec is None or handler is None or len(a) > 2:
+            return None
+        n = z3.Length(s)
+        bad = {"utf-8": _str_has_surrogate(s), "utf-16": _str_has_surrogate(s), "utf-32": _str_has_surrogate(s),
+               "ascii": _str_has(s, 0x80, 0x2FFFF), "latin-1": _str_has(s, 0x100, 0x2FFFF)}[codec]
+        if handler == "strict" and ctx.traps is not None:
+            _exact_trap(ctx, bad, ("ValueError", "UnicodeEncodeError", "UnicodeError"))
+        k = z3.FreshInt("enclen")
+        if handler == "strict":
+            ctx.facts.append({"utf-8": z3.And(k >= n, k <= 4 * n), "ascii": k == n, "latin-1": k == n,
+                              "utf-16": z3.And(k >= 2 * n + 2, k <= 4 * n + 2), "utf-32": k == 4 * n + 4}[codec])
+        else:
+            ctx.facts.append(k >= 0)
+        return _Encoded(z3.FreshInt("encoded").decl().name(), length=k, src=s, codec=codec, handler=handler)
+    return None
+
+
+def _codec_name(v):
+    """The codec family a constant encoding name denotes ('utf-8' / 'utf-16' / 'utf-32' / 'ascii' / 'latin-1', by
+    CPython's own codec registry), or None for another codec or a non-constant name."""
+    sv = z3.simplify(v) if z3.is_expr(v) else None
+    if sv is None or not z3.is_string_value(sv):
+        return None
+    import codecs as _codecs
+    try:
+        nm = _codecs.lookup(_z3_str_value(sv)).name
+    except LookupError:
+        return None
+    return {"utf-8": "utf-8", "utf-16": "utf-16", "utf-32": "utf-32", "ascii": "ascii",
+            "iso8859-1": "latin-1", "latin-1": "latin-1"}.get(nm)
+
+
+def _codec_handler(v):
+    """'strict' / 'lossless' (a handler that never raises: ignore, replace, backslashreplace, xmlcharrefreplace,
+    namereplace) for a constant errors= value, or None for another handler or a non-constant one."""
+    sv = z3.simplify(v) if z3.is_expr(v) else None
+    if sv is None or not z3.is_string_value(sv):
+        return None
+    h = _z3_str_value(sv)
+    if h == "strict":
+        return "strict"
+    if h in ("ignore", "replace", "backslashreplace", "xmlcharrefreplace", "namereplace"):
+        return "lossless"
+    return None
+
+
+def _bytes_decode(b, a, ctx):
+    """b.decode([encoding[, errors]]) for bytes whose source string is known (_Encoded): the bytes of a strict
+    utf-8 / utf-16 / utf-32 / ascii / latin-1 encoding decode back to the source under the same family; utf-8 or
+    latin-1 bytes decoded as ascii raise UnicodeDecodeError (a ValueError) exactly when the source holds a non-ASCII
+    character, ascii bytes decode as themselves under any of the families, and latin-1 decodes any bytes. Bytes of
+    unknown origin decode without raising under latin-1 only. Returns the decoded value, or None when not modeled."""
+    codec = _codec_name(a[0]) if a else "utf-8"
+    handler = _codec_handler(a[1]) if len(a) >= 2 else "strict"
+    if codec is None or handler is None or len(a) > 2:
+        return None
+    if not isinstance(b, _Encoded) or b.handler != "strict":
+        if codec == "latin-1":                                # every byte is a latin-1 character
+            r = z3.FreshConst(_SS, "decoded")
+            if ctx.facts is not None:
+                ctx.facts.append(z3.Length(r) == _container_len(b, ctx))
+            _note_overapprox(ctx, "the text bytes.decode() produces")
+            return r
+        return None
+    src, enc = b.src, b.codec
+    if enc == codec or enc == "ascii" and codec in ("utf-8", "latin-1"):
+        return src                                            # the round trip: the source itself
+    if codec == "ascii" and enc in ("utf-8", "latin-1"):
+        if handler == "strict" and ctx.traps is not None:
+            _exact_trap(ctx, _str_has(src, 0x80, 0x2FFFF), ("ValueError", "UnicodeDecodeError", "UnicodeError"))
+        return src if handler == "strict" else z3.FreshConst(_SS, "decoded")
+    if codec == "latin-1":                                   # never raises; the text differs from the source
+        _note_overapprox(ctx, "the text bytes.decode() produces")
+        r = z3.FreshConst(_SS, "decoded")
+        if ctx.facts is not None:
+            ctx.facts.append(z3.Length(r) == b.length)
+        return r
     return None
 
 
@@ -1945,6 +3688,10 @@ def _as_bool(x, ctx=None):
     trap withholds REFUTED (the opaque truth has no concrete witness)."""
     if isinstance(x, tuple):
         return z3.BoolVal(len(x) > 0)
+    if isinstance(x, _MaybeNone):                            # falsy where it is None, else its value's truth
+        return z3.And(z3.Not(x.cond), _as_bool(x.val, ctx))
+    if isinstance(x, (_MatchObj, _RePattern)):               # a Match / Pattern object is always truthy
+        return z3.BoolVal(True)
     if isinstance(x, _NoneVal):                              # None is always falsy: `if d.get(k):` / `x or default`
         return z3.BoolVal(False)                             # guard a possibly-None value (the value engine's own None,
         #                                                       beyond the literal-None cases the None engine catches)
@@ -2017,6 +3764,252 @@ def _term_neq(a, b):
     return z3.Not(_term_eq(a, b))
 
 
+_EXACT_INT_FLOAT = 2 ** 53                                 # every integer of at most this magnitude is a double
+
+
+def _fp_const_value(x):
+    """The Python float a Float64 numeral denotes (NaN / +-inf / signed zero included), or None for a symbolic term."""
+    xs = z3.simplify(x)
+    if not z3.is_fp_value(xs):
+        return None
+    return _fp_to_py(xs)
+
+
+def _int_fp_compare(op, n, x):
+    """Python's exact comparison `n OP x` for an int-valued term n and a float x (CPython compares an int and a float
+    mathematically, without rounding the int: 2**53 + 1 > 2.0**53). A float literal reduces it to integer arithmetic,
+    an int literal of at most 2**53 to an exact float comparison; two symbolic operands use the exact real-valued
+    comparison, an int / float bridge the solver decides through its bitvector image or cvc5 (_solve_fp_bridge)."""
+    import math as _m
+    from fractions import Fraction as _Fr
+    real = _is_real(n)                                     # a Fraction compares exactly too (Fraction._richcmp)
+    n = n if real else _as_int(n)
+    xv = _fp_const_value(x)
+    if xv is not None:                                     # a float literal: compare against its exact value
+        if xv != xv:
+            return z3.BoolVal(op is ast.NotEq)             # NaN equals nothing and orders against nothing
+        if xv in (float("inf"), float("-inf")):
+            big = xv > 0
+            return z3.BoolVal({ast.Lt: big, ast.LtE: big, ast.Gt: not big, ast.GtE: not big,
+                               ast.Eq: False, ast.NotEq: True}[op])
+        if real:
+            q = _Fr(xv)
+            return _CMP[op](n, z3.Q(q.numerator, q.denominator))
+        fl, ce = _m.floor(xv), _m.ceil(xv)
+        integral = fl == ce
+        if op is ast.Eq:
+            return n == fl if integral else z3.BoolVal(False)
+        if op is ast.NotEq:
+            return n != fl if integral else z3.BoolVal(True)
+        return {ast.Lt: n < ce, ast.LtE: n <= fl, ast.Gt: n > fl, ast.GtE: n >= ce}[op]
+    ns = z3.simplify(n)
+    if not real and z3.is_int_value(ns) and abs(ns.as_long()) <= _EXACT_INT_FLOAT:   # an int literal converts exactly
+        return _FP_CMP[op](z3.FPVal(float(ns.as_long()), _F64), x)
+    nan, inf = z3.fpIsNaN(x), z3.fpIsInf(x)
+    fin = z3.And(z3.Not(nan), z3.Not(inf))
+    rn, rx = (n if real else z3.ToReal(n)), z3.fpToReal(x)
+    pos_inf, neg_inf = z3.And(inf, z3.Not(z3.fpIsNegative(x))), z3.And(inf, z3.fpIsNegative(x))
+    if op is ast.Eq:
+        return z3.And(fin, rn == rx)
+    if op is ast.NotEq:
+        return z3.Not(z3.And(fin, rn == rx))
+    if op is ast.Lt:
+        return z3.Or(pos_inf, z3.And(fin, rn < rx))
+    if op is ast.LtE:
+        return z3.Or(pos_inf, z3.And(fin, rn <= rx))
+    if op is ast.Gt:
+        return z3.Or(neg_inf, z3.And(fin, rn > rx))
+    return z3.Or(neg_inf, z3.And(fin, rn >= rx))         # GtE
+
+
+_SWAP_CMP = {ast.Lt: ast.Gt, ast.LtE: ast.GtE, ast.Gt: ast.Lt, ast.GtE: ast.LtE, ast.Eq: ast.Eq, ast.NotEq: ast.NotEq}
+
+
+def _num_compare(op, l, r):
+    """Python's comparison of two numeric terms (int / bool / float / Fraction), exact across the types."""
+    lf, rf = _is_fp(l), _is_fp(r)
+    if lf and rf:
+        return _FP_CMP[op](l, r)
+    if lf:                                                 # x OP n  ==  n SWAP(OP) x
+        return _int_fp_compare(_SWAP_CMP[op], r, l)
+    if rf:
+        return _int_fp_compare(op, l, r)
+    if _is_real(l) or _is_real(r):
+        return _CMP[op](_to_real(l), _to_real(r))
+    return _CMP[op](_as_int(l), _as_int(r))
+
+
+def _is_num_term(v):
+    return z3.is_expr(v) and (z3.is_int(v) or z3.is_bool(v) or _is_fp(v) or _is_real(v))
+
+
+# CPython float arithmetic and int -> float conversion always allocate a new float object (never return an operand),
+# so such a result is identical to no other value. min / max / a branch merge / a passed-through argument may return
+# an existing object, so their terms carry no such guarantee.
+_FRESH_FP_OPS = frozenset({z3.Z3_OP_FPA_ADD, z3.Z3_OP_FPA_SUB, z3.Z3_OP_FPA_MUL, z3.Z3_OP_FPA_DIV, z3.Z3_OP_FPA_REM,
+                           z3.Z3_OP_FPA_FMA, z3.Z3_OP_FPA_SQRT, z3.Z3_OP_FPA_NEG, z3.Z3_OP_FPA_ABS,
+                           z3.Z3_OP_FPA_ROUND_TO_INTEGRAL})
+
+
+def _fresh_float_object(t):
+    try:
+        if not z3.is_app(t):
+            return False
+        k = t.decl().kind()
+        if k in _FRESH_FP_OPS:
+            return True
+        return k == z3.Z3_OP_FPA_TO_FP and not any(z3.is_fp(c) for c in t.children())   # int / Fraction -> float
+    except z3.Z3Exception:
+        return False
+
+
+def _fp_maybe_nan(x):
+    v = _fp_const_value(x)
+    return v is None or v != v
+
+
+# The fresh `a is b` Bools introduced for two float values whose identity the engine cannot decide (two parameters
+# the caller may alias, a value passed through a call or a branch merge), each mapped to the condition -- both a NaN
+# -- under which that identity changes what `in` / a tuple comparison / a dict lookup returns. Every alias choice is
+# a behavior the property must hold for, so a PROVED covers them all; a counterexample is accepted only when it
+# holds with each such condition false (_solve), since the witness cannot express object identity.
+_NAN_ALIAS = {}
+
+
+def _float_identity(a, b, ctx):
+    """The Bool `a is b` for two distinct float terms, shared with an explicit `a is b` on the same operands."""
+    isc = getattr(ctx, "is_cache", None) if ctx is not None else None
+    key = (id(a), id(b)) if id(a) <= id(b) else (id(b), id(a))
+    if isc is not None and key in isc:
+        res = isc[key]
+    else:
+        res = z3.FreshConst(z3.BoolSort(), "is")
+        if isc is not None:
+            isc[key] = res
+    _NAN_ALIAS[res.decl().name()] = z3.And(z3.fpIsNaN(a), z3.fpIsNaN(b))
+    return res
+
+
+def _unknown_eq(ctx, why):
+    """A comparison the engine cannot decide: under the trap-freedom engine a fresh Bool (both outcomes stay live)
+    on an over-approximated path; otherwise Unsupported."""
+    if _TRAPFREE:
+        if ctx is not None:
+            _note_overapprox(ctx, why)
+        return z3.FreshConst(z3.BoolSort(), "eq")
+    raise Unsupported(why)
+
+
+def _container_eq(l, r, ctx):
+    """Python's == where a side is an opaque value, as far as it is decided here: a container equals itself and never
+    a number, a string, None or a complex; a bytes never equals a list, a set never a sequence; two sized containers of
+    different constant lengths differ, and two constant-length array-backed ones (bytes literals) compare element-wise.
+    Two sized sequence containers of one kind otherwise compare as a fresh Bool that implies equal lengths and holds
+    when both are empty, registered as a read of both element pools (_elem_read), so a model's answer is realizable
+    by some contents. None when undecided here (an opaque object, a dict, an iterator)."""
+    conts = (_SafeContainer, _DictParam, _DictLit, _MapVal, _DefaultDict)
+    if l is r and isinstance(l, conts):
+        return z3.BoolVal(True)
+
+    def _scalar(v):
+        return isinstance(v, (_NoneVal, _Complex)) or (z3.is_expr(v) and (
+            z3.is_int(v) or z3.is_bool(v) or _is_fp(v) or _is_real(v) or _is_str(v)))
+    if (isinstance(l, conts) and _scalar(r)) or (isinstance(r, conts) and _scalar(l)):
+        return z3.BoolVal(False)
+    if not (isinstance(l, _SafeContainer) and isinstance(r, _SafeContainer)):
+        return None
+    if l.byteslike != r.byteslike or l.unindexable != r.unindexable:
+        return z3.BoolVal(False)
+    if l.unsized or r.unsized or type(l) is not _SafeContainer or type(r) is not _SafeContainer:
+        return None
+    ln, rn = _container_len(l, ctx), _container_len(r, ctx)
+    lc, rc = z3.simplify(ln), z3.simplify(rn)
+    if z3.is_int_value(lc) and z3.is_int_value(rc):
+        if lc.as_long() != rc.as_long():
+            return z3.BoolVal(False)
+        if l.arr is not None and r.arr is not None:
+            n = lc.as_long()
+            return z3.And(*[z3.Select(l.arr, z3.IntVal(k)) == z3.Select(r.arr, z3.IntVal(k))
+                            for k in range(n)]) if n else z3.BoolVal(True)
+    if ctx is None or ctx.facts is None:
+        return None
+    eq = z3.FreshConst(z3.BoolSort(), "ceq")
+    ctx.facts.append(z3.Implies(eq, ln == rn))                   # equal sequences have equal lengths
+    ctx.facts.append(z3.Implies(z3.And(ln == 0, rn == 0), eq))   # two empty sequences are equal
+    for c in (l, r):                                             # the answer depends on both contents; a literal's
+        if c.arr is None:                                        # (array-backed) contents are known, so only a
+            _elem_read(ctx, c, ("any",))                         # container read freshly registers
+    return eq
+
+
+def _unhashable(v):
+    """Whether a value is definitely unhashable (a list, a dict, a set literal, or a tuple holding one); hashing it
+    -- a set element, a dict key -- is a TypeError."""
+    if isinstance(v, (_ListLit, _MapVal, _DictLit, _DefaultDict, _DictParam)):
+        return True
+    if isinstance(v, tuple):
+        return any(_unhashable(x) for x in v)
+    return type(v) is _Opaque and v.name == "set"
+
+
+def _py_eq(a, b, identity=False, ctx=None):
+    """Python's a == b as a z3 Bool -- with identity=True the `a is b or a == b` test a container membership, a tuple
+    comparison, and a dict lookup make. Numbers compare by exact value across int / bool / float / Fraction / complex
+    (1 == 1.0 == True; 2**53 + 1 != 2.0**53; NaN equals nothing; +0.0 == -0.0); strings by content; a tuple or list
+    element-wise under the identity rule (a list never equals a tuple); None only None; two values of different
+    modeled kinds are unequal. The same engine value is the same object (a name read twice), so identity holds for it
+    even when it is a NaN; a freshly computed float is identical to nothing else; any other pair of floats has an
+    undecided identity (_float_identity). A value whose equality is not modeled raises Unsupported (a fresh Bool on
+    an over-approximated path when only traps matter)."""
+    if identity and a is b:
+        return z3.BoolVal(True)
+    if isinstance(a, _NoneVal) or isinstance(b, _NoneVal):
+        if isinstance(a, _NoneVal) and isinstance(b, _NoneVal):
+            return z3.BoolVal(True)
+        other = b if isinstance(a, _NoneVal) else a
+        if z3.is_expr(other) or isinstance(other, (_Complex, tuple)):
+            return z3.BoolVal(False)
+        return _unknown_eq(ctx, "equality of None with an unmodeled value")
+    if isinstance(a, tuple) or isinstance(b, tuple):
+        if not (isinstance(a, tuple) and isinstance(b, tuple)):
+            other = b if isinstance(a, tuple) else a
+            if isinstance(other, _Opaque) or not z3.is_expr(other):
+                return _unknown_eq(ctx, "equality of a sequence literal with an unmodeled value")
+            return z3.BoolVal(False)                      # a tuple / list never equals a number or a string
+        if isinstance(a, _ListLit) != isinstance(b, _ListLit) or len(a) != len(b):
+            return z3.BoolVal(False)                      # list vs tuple, or different lengths
+        return z3.And(*[_py_eq(x, y, identity=True, ctx=ctx) for x, y in zip(a, b)]) if a else z3.BoolVal(True)
+    if isinstance(a, _Complex) or isinstance(b, _Complex):
+        ca = a if isinstance(a, _Complex) else None
+        cb = b if isinstance(b, _Complex) else None
+        if ca is not None and cb is not None:
+            return z3.And(z3.fpEQ(ca.re, cb.re), z3.fpEQ(ca.im, cb.im))
+        c, other = (ca, b) if ca is not None else (cb, a)
+        if not z3.is_expr(other):
+            return _unknown_eq(ctx, "equality of a complex with an unmodeled value")
+        if not _is_num_term(other):
+            return z3.BoolVal(False)
+        return z3.And(_num_compare(ast.Eq, other, c.re), z3.fpIsZero(c.im))
+    if not (z3.is_expr(a) and z3.is_expr(b)):
+        return _unknown_eq(ctx, "equality of an unmodeled value")
+    an, bn = _is_num_term(a), _is_num_term(b)
+    if an and bn:
+        if z3.is_bool(a) and z3.is_bool(b):
+            return a == b
+        if _is_fp(a) and _is_fp(b):
+            eq = z3.fpEQ(a, b)                            # IEEE equality: NaN != NaN, +0.0 == -0.0
+            if identity and _fp_maybe_nan(a) and _fp_maybe_nan(b) \
+                    and not (_fresh_float_object(a) or _fresh_float_object(b)):
+                return z3.Or(eq, z3.And(_float_identity(a, b, ctx), z3.fpIsNaN(a), z3.fpIsNaN(b)))
+            return eq
+        return _num_compare(ast.Eq, a, b)
+    if an != bn:
+        return z3.BoolVal(False)                          # a number never equals a string / sequence
+    if a.sort() != b.sort():
+        return z3.BoolVal(False)
+    return a == b
+
+
 _NUMERIC_SORTS = (z3.Z3_INT_SORT, z3.Z3_REAL_SORT, z3.Z3_FLOATING_POINT_SORT)
 
 
@@ -2033,26 +4026,55 @@ def _map_key(t):
     return _as_int(t) if (z3.is_expr(t) and z3.is_bool(t)) else t
 
 
+def _scalar_value(t):
+    """The Python value of an int / bool / float / string numeral (a float NaN, inf, or signed zero included), or
+    None for a symbolic term."""
+    try:
+        s = z3.simplify(t)
+    except z3.Z3Exception:
+        return None
+    if z3.is_int_value(s):
+        return s.as_long()
+    if z3.is_true(s) or z3.is_false(s):
+        return z3.is_true(s)
+    if z3.is_fp_value(s):
+        return _fp_to_py(s)
+    if z3.is_string_value(s):
+        return _z3_str_value(s)
+    return None
+
+
 def _key_match(q, k):
-    """Whether dict-key term q provably equals stored key k (True), provably differs (False), or cannot be
-    decided syntactically (None). Concrete int / string / bool values compare by value; otherwise only the
-    syntactically-identical case is decided (so a stored key that is the same term as q matches)."""
+    """Whether dict-key value q is the stored key k (True), provably is not (False), or cannot be decided here
+    (None). The same engine value is the same object, which a lookup finds by identity (a NaN key included); two
+    numerals compare by Python's == (1, 1.0 and True are one key, +0.0 and -0.0 are one key, a NaN numeral matches
+    nothing it is not identical to); otherwise only an identical non-float term is decided."""
+    if q is k:
+        return True
     if not (z3.is_expr(q) and z3.is_expr(k)):
         return None                                          # a tuple / complex / opaque key: undecided here
-    if z3.is_int_value(q) and z3.is_int_value(k):
-        return q.as_long() == k.as_long()
-    if z3.is_string_value(q) and z3.is_string_value(k):
-        return q.as_string() == k.as_string()
-    if z3.eq(q, k):
+    qv, kv = _scalar_value(q), _scalar_value(k)
+    if qv is not None and kv is not None:
+        if isinstance(qv, float) and qv != qv or isinstance(kv, float) and kv != kv:
+            return None                                      # a NaN: equal only by identity, which is open here
+        if isinstance(qv, str) != isinstance(kv, str):
+            return False
+        return qv == kv
+    if z3.eq(q, k) and not _is_fp(q):
         return True
     return None
 
 
 def _map_get(m, q, ctx):
-    """The value dict `m` yields at key term `q`, with a KeyError trap (on ctx.traps) when q matches no
-    stored key. Newest-first, so the last write to a key wins; a read whose key is provably a stored key
-    returns that value with no trap. Defers (Unsupported) on a dict whose value types differ across keys
-    or whose keys mix numeric types (Python conflates 1, 1.0, True), which the engine cannot resolve."""
+    """The value dict `m` yields at key q, with a KeyError trap (on ctx.traps) when q matches no stored key, and a
+    TypeError trap when q is unhashable. Newest-first, so the last write to a key wins; a read whose key is
+    provably a stored key returns that value with no trap. Keys compare as a dict lookup does (identity, then
+    Python's ==, exact across int / bool / float). Defers (Unsupported) on a dict whose value types differ across
+    keys."""
+    if _unhashable(q):
+        if ctx.traps is not None:
+            _trap_add(ctx, ctx.pc, ("TypeError",))           # d[[1]]: unhashable type
+        return _Opaque("unhashable")
     q = _map_key(q)
     keys = [_map_key(k) for k in m.keys]
     for k, v in zip(reversed(keys), reversed(m.vals)):       # the most recent provably-equal key wins
@@ -2069,32 +4091,42 @@ def _map_get(m, q, ctx):
         raise Unsupported("dict value is not a modeled scalar")
     if len({v.sort() for v in m.vals}) != 1:
         raise Unsupported("dict with heterogeneous value types")
-    if z3.is_expr(q) and _is_numeric_sort(q.sort()) and any(
-            z3.is_expr(k) and k.sort() != q.sort() and _is_numeric_sort(k.sort()) for k in keys):
-        raise Unsupported("dict with mixed numeric key types")   # 1 / 1.0 / True conflate; not resolved here
-    contains = z3.Or(*[_term_eq(q, k) for k in keys])
+    matches = [_py_eq(q, k, identity=True, ctx=ctx) for k in keys]
+    contains = z3.Or(*matches)
     if ctx.traps is not None:
         _trap_add(ctx, z3.And(ctx.pc, z3.Not(contains)), ("KeyError",))   # KeyError when q is none of the keys
     res = z3.FreshConst(m.vals[0].sort(), "kdef")           # never trusted: a matching branch always wins
-    for k, v in zip(keys, m.vals):                          # oldest first, so the newest entry is outermost
-        res = z3.If(_term_eq(q, k), v, res)
+    for mt, v in zip(matches, m.vals):                      # oldest first, so the newest entry is outermost
+        res = z3.If(mt, v, res)
     return res
 
 
 def _subst(v, subs):
-    """z3.substitute lifted over tuple and complex values (substitutes each component)."""
+    """z3.substitute lifted over tuple, list and complex values (substitutes each component). A value that IS one of
+    the substituted terms (a callee returning its argument) becomes the argument value itself, so the caller's
+    object identity survives the call (`g(x) is x` for `def g(a): return a`)."""
     if isinstance(v, tuple):
-        return tuple(_subst(x, subs) for x in v)
+        return (_ListLit if isinstance(v, _ListLit) else tuple)(_subst(x, subs) for x in v)
     if isinstance(v, _Complex):
         return _Complex(_subst(v.re, subs), _subst(v.im, subs))
     if not z3.is_expr(v):                                    # _Opaque / _Closure / _FuncRef / _Lambda: nothing to substitute
         return v
+    for f, a in subs:
+        if z3.eq(v, f):
+            return a
     return z3.substitute(v, *subs) if subs else v
 
 
 def _pow_expand(base, expnode):
     """Integer base ** k for a constant non-negative integer k (<= 64), expanded to exact repeated
     multiplication. A float base, or a variable/negative/large exponent, is not modeled."""
+    bs = z3.simplify(base) if z3.is_expr(base) and (z3.is_int(base) or z3.is_bool(base)) else None
+    if (bs is not None and (z3.is_int_value(bs) or z3.is_true(bs) or z3.is_false(bs))
+            and isinstance(expnode, ast.Constant) and isinstance(expnode.value, int)
+            and not isinstance(expnode.value, bool) and expnode.value >= 0):
+        b = bs.as_long() if z3.is_int_value(bs) else int(z3.is_true(bs))
+        if b in (0, 1, -1) or expnode.value * max(abs(b).bit_length(), 1) <= 1 << 20:
+            return z3.IntVal(b ** expnode.value)                  # a constant power folds to its exact value
     if not (isinstance(expnode, ast.Constant) and isinstance(expnode.value, int)
             and not isinstance(expnode.value, bool) and 0 <= expnode.value <= 64):
         raise Unsupported("** requires a constant non-negative integer exponent <= 64")
@@ -2322,6 +4354,70 @@ def _fp_to_py(mv):
     return None
 
 
+def _int_from_decimal(s):
+    """int(s) for a decimal numeral of any length (z3 prints numerals in decimal; CPython's int-from-str digit
+    limit would reject a large one), the limit restored afterwards."""
+    lim = sys.get_int_max_str_digits() if hasattr(sys, "get_int_max_str_digits") else 0
+    if not lim or len(s) <= lim:
+        return int(s)
+    sys.set_int_max_str_digits(0)
+    try:
+        return int(s)
+    finally:
+        sys.set_int_max_str_digits(lim)
+
+
+def _decimal_of_int(v):
+    """str(v) for an int of any size, the str digit limit lifted for the conversion and restored afterwards."""
+    lim = sys.get_int_max_str_digits() if hasattr(sys, "get_int_max_str_digits") else 0
+    if not lim or v.bit_length() < 3.3 * lim - 8:
+        return str(v)
+    sys.set_int_max_str_digits(0)
+    try:
+        return str(v)
+    finally:
+        sys.set_int_max_str_digits(lim)
+
+
+z3.IntNumRef.as_long = lambda self: _int_from_decimal(self.as_string())   # z3 numerals beyond the str digit limit
+z3.BitVecNumRef.as_long = lambda self: _int_from_decimal(self.as_string())
+_z3_to_int_str = z3.z3._to_int_str
+z3.z3._to_int_str = lambda val: (_decimal_of_int(val) if isinstance(val, int) and not isinstance(val, bool)
+                                 else _z3_to_int_str(val))
+
+
+def _fmt_int(v):
+    """A replayable rendering of an int witness: decimal when short, else a power of two or ten (with a small
+    offset) or hex -- never a decimal past the str digit limit."""
+    if abs(v) < 10 ** 30:
+        return str(v)
+    sign, m = ("-" if v < 0 else ""), abs(v)
+    for base in (10, 2):
+        k = round(m.bit_length() / (3.321928094887362 if base == 10 else 1))
+        for kk in (k - 1, k, k + 1):
+            if kk > 0:
+                d = m - base ** kk
+                if abs(d) < 10 ** 6:
+                    body = "%d**%d" % (base, kk) if d == 0 else "%d**%d %s %d" % (base, kk, "+" if d > 0 else "-", abs(d))
+                    return body if not sign else ("-" + body if d == 0 else "-(%s)" % body)
+    return "%s%s" % (sign, hex(m))
+
+
+def _z3_str_value(mv):
+    """The Python str a z3 string numeral denotes, character by character from its code points (z3 renders a
+    surrogate, a control character or a NUL as a \\u{...} escape in as_string)."""
+    n = z3.simplify(z3.Length(mv))
+    if not z3.is_int_value(n):
+        return mv.as_string()
+    out = []
+    for i in range(n.as_long()):
+        c = z3.simplify(z3.StrToCode(z3.SubString(mv, i, 1)))
+        if not z3.is_int_value(c):
+            return mv.as_string()
+        out.append(chr(c.as_long()))
+    return "".join(out)
+
+
 def _model_cex(model, z3args, args):
     """Format a counterexample over possibly-typed parameters and return a replayable {name: value}
     dict. Integers, booleans, strings, and floats are extracted as the Python value with matching
@@ -2332,6 +4428,22 @@ def _model_cex(model, z3args, args):
         if not z3.is_expr(z3args[a]):                            # a container / opaque parameter has no scalar
             continue                                             # model value: skip it rather than crash
         mv = model.eval(z3args[a], model_completion=True)
+        if z3.is_int_value(mv):
+            vals[a] = mv.as_long()
+            parts.append(f"{a}={_fmt_int(vals[a])}")
+            continue
+        if z3.is_fp_value(mv):
+            f = _fp_to_py(mv)
+            if f is None and z3.is_true(z3.simplify(z3.fpIsNaN(mv))):
+                f = float("nan")                                  # a NaN's bits are unspecified in the model
+            if f is not None:
+                vals[a] = f
+                parts.append(f"{a}={f!r}")
+                continue
+        if z3.is_string_value(mv):
+            vals[a] = _z3_str_value(mv)
+            parts.append(f"{a}={vals[a]!r}")
+            continue
         parts.append(f"{a}={mv}")
         if z3.is_int_value(mv):
             vals[a] = mv.as_long()
@@ -2339,8 +4451,6 @@ def _model_cex(model, z3args, args):
             vals[a] = True
         elif z3.is_false(mv):
             vals[a] = False
-        elif z3.is_string_value(mv):
-            vals[a] = mv.as_string()
         elif z3.is_fp_value(mv):
             f = _fp_to_py(mv)
             if f is not None:
@@ -2428,6 +4538,24 @@ def _callee_contract(src):
     return conj(enss), (conj(reqs) if reqs else None), [a.arg for a in fn.args.args]
 
 
+_CONTRACT_IH = set()     # recursive callees whose contract proof is in progress (their self-calls use the contract)
+
+
+def _strip_contract_decorators(src):
+    """The function source with its @require / @ensure contract decorators removed."""
+    tree = ast.parse(textwrap.dedent(src))
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            keep = []
+            for d in n.decorator_list:
+                f = d.func if isinstance(d, ast.Call) else d
+                nm = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else None)
+                if nm not in _CONTRACT_DECOS:
+                    keep.append(d)
+            n.decorator_list = keep
+    return ast.unparse(tree)
+
+
 def _callee_recursive(src, name):
     """Whether function `src` calls `name` (direct self-recursion -- the inliner bails on it)."""
     try:
@@ -2496,74 +4624,193 @@ class Ctx:
         self.trapfree_callees: frozenset = frozenset()       # recursive callees verified trap free standalone: the
         #                  inliner cannot unfold them, so a call is modeled as a fresh result with no imported trap
         #                  (the orchestration sets this only after proving each callee trap free, so it is sound)
+        self.callee_readings: dict = {}                      # {trap-free callee: (parameter readings, return sort)}:
+        #                  the argument types it was verified for, and the sort of every value it returns
+        self.strict_reading: bool = False                    # no unannotated parameter's type is a guess: verifying a
+        #                  function a caller will pass real arguments to, so a type error on one is a real trap
+        self._spec_cache: dict = {}                          # call-site-specialized callee summaries, by argument reading
         self.func_aliases: frozenset = frozenset()           # names the module binds to torch.nn.functional (per symexec)
         self.nn_aliases: frozenset = frozenset()             # names the module binds to torch.nn (per symexec)
+        self.elem_reads: dict = {}                           # element pool -> (pool, [read tokens], rearranged): a
+        #                  container's elements are fresh per read, so a second read that may name an element already
+        #                  read marks the over-approximation (_elem_read) instead of fabricating an independent value
 
     def summary(self, name: str):
         if name in self._summary:
             return self._summary[name]
         if name in self.trapfree_callees:
-            # a recursive callee the orchestration verified trap free standalone: inline it as a fresh,
-            # unconstrained result with no imported trap, so a caller's check proceeds symbolically instead of
-            # bailing on the recursion. Sound for trap freedom (the callee adds no trap); the result value is an
-            # over-approximation (its range is not modeled), so overapprox is set -- a trap-free use still PROVES,
-            # while a trap that rests on the unknown result (a division by it) withholds REFUTED rather than
-            # fabricating a non-replayable counterexample.
-            self.overapprox = True
-            fn = _fndef(self.repo[name])
-            formals = [a.arg for a in fn.args.args]
-            z3args = {f: z3.FreshInt("rc_" + f) for f in formals}
-            s = (formals, z3args, [(z3.BoolVal(True), z3.FreshInt("rcret_" + name))], [], z3.BoolVal(False))
-            self._summary[name] = s
-            return s
+            # a recursive callee the orchestration verified trap free standalone: callers reach it through
+            # inline(), which checks the arguments against the types it was verified for; a bare summary has no
+            # arguments to check
+            raise Unsupported(f"summary of the trap-free recursive callee {name} without its arguments")
+        s, side = self._run_callee(name)
+        self._summary[name] = s
+        self.__dict__.setdefault("_summary_side", {})[name] = side
+        return s
+
+    def _run_callee(self, name, argvals=None):
+        """symexec of the callee `name` on this context, its fact, exact-trap and hard-trap channels captured apart:
+        what the callee records there is stated over its own parameters and its own path, so the caller imports it
+        (_import_side) with the arguments substituted, under the call site's path condition."""
         if name in self._stack:
             raise Unsupported(f"recursion through {name}")
+        saved = (self.facts, self.exact_traps, self.hard_traps)
+        side = tuple([] if c is not None else None for c in saved)
+        self.facts, self.exact_traps, self.hard_traps = side
         self._stack.append(name)
         try:
-            s = symexec(self.repo[name], self)
+            s = symexec(self.repo[name], self, argvals=argvals)
         finally:
             self._stack.pop()
-        self._summary[name] = s
-        return s
+            self.facts, self.exact_traps, self.hard_traps = saved
+        return s, side
+
+    def _import_side(self, side, subs):
+        """Import a callee's captured facts and exact / hard traps at this call site (see _run_callee)."""
+        if side is None:
+            return
+        facts, exact, hard = side
+        sub = (lambda t: z3.substitute(t, *subs)) if subs else (lambda t: t)
+        if facts and self.facts is not None:
+            self.facts.extend(sub(f) for f in facts)
+        if exact and self.exact_traps is not None:
+            self.exact_traps.extend(z3.And(self.pc, sub(t)) for t in exact)
+        if hard and self.hard_traps is not None and not self.overapprox and not self.havoc:
+            self.hard_traps.extend(z3.And(self.pc, sub(t)) for t in hard)
+
+    def _call_result(self, name, rets, none_pc, subs):
+        """The value a call returns: the callee's returns folded, None exactly where its none-path holds."""
+        if any(z3.is_expr(v) and z3.is_fp(v) for _, v in rets) and any(
+                z3.is_expr(v) and (z3.is_int(v) or z3.is_bool(v)) for _, v in rets):
+            _note_overapprox(self, f"{name}() returning an int or a float by path")   # one float stands for both:
+            #                                                 the caller's int-only operations on it are not exact
+        nc = z3.substitute(none_pc, *subs) if subs else none_pc
+        if not rets:
+            return _NoneVal() if not z3.is_false(z3.simplify(nc)) else z3.IntVal(0)
+        val = fold(rets)
+        val = _subst(val, subs) if subs else val     # _subst lifts over tuple (generator) values
+        return _maybe_none(nc, val)
+
+    def _specialized(self, name, argvals):
+        """The value of a call the callee's generic summary would not read faithfully -- a parameter left
+        unannotated (the summary reads it as an int and exempts its type errors as a guess, but the argument is
+        the caller's real value) or an argument whose type is not the annotation's -- from the callee's body run on
+        the arguments themselves, where a type error is a real trap (a guessed parameter of the caller passed
+        through stays a guess). Cached by argument sort when every argument is a z3 term; None when the generic
+        summary reads every argument faithfully."""
+        src = self.repo.get(name)
+        if src is None:
+            return None
+        fn = next((n for n in _parse(src).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+        if fn is None:                                       # the callee's def, past any leading import
+            return None
+        params = list(fn.args.args) + list(fn.args.kwonlyargs)
+        if fn.args.vararg or fn.args.kwarg or len(params) != len(argvals):
+            return None
+        if all(a.annotation is not None and _value_reading(v) is not None
+               and _value_reading(_param_term(a)) == _value_reading(v) for a, v in zip(params, argvals)):
+            return None
+        gp = getattr(self, "guessed_params", frozenset())
+        if all(z3.is_expr(v) for v in argvals):
+            key = (name, tuple((v.sort().sexpr(), v.decl().name() if (z3.is_const(v) and v.decl().name() in gp)
+                                else None) for v in argvals))
+            hit = self._spec_cache.get(key)
+            if hit is None:
+                protos = [v if k[1] is not None else z3.FreshConst(v.sort(), "sa_" + a.arg)
+                          for a, v, k in zip(params, argvals, key[1])]
+                (_a, _z, rets, ctraps, none_pc), side = self._run_callee(name, argvals=protos)
+                hit = (protos, rets, list(ctraps), none_pc, side)
+                self._spec_cache[key] = hit
+            protos, rets, ctraps, none_pc, side = hit
+            subs = [(p, v) for p, v in zip(protos, argvals) if not p.eq(v)]
+        else:
+            (_a, _z, rets, ctraps, none_pc), side = self._run_callee(name, argvals=list(argvals))
+            subs = []
+        if self.traps is not None:
+            for t in ctraps:
+                self.traps.append(z3.And(self.pc, z3.substitute(t, *subs) if subs else t))
+        self._import_side(side, subs)
+        return self._call_result(name, rets, none_pc, subs)
 
     def _contract_for(self, name):
         if name not in self._contract:
             self._contract[name] = (_callee_contract(self.repo[name]) if name in self.repo else None)
         return self._contract[name]
 
+    def _contract_verified(self, name, cc):
+        """Whether the recursive callee `name` is proved, on its own, to be trap free and to establish its @ensure
+        under its @require (total over the recursion: the recursion engine unfolds its self-calls exactly), so
+        the contract can stand for the body at a call site. Memoized per callee."""
+        if name in _CONTRACT_IH:                     # inside name's own proof its self-calls use the contract: the
+            return True                              # induction hypothesis (a trap or a broken @ensure at some depth
+        #                                              would be one at a shallower call, so the induction is sound)
+        cache = self.__dict__.setdefault("_contract_ok", {})
+        if name not in cache:
+            ens, req, _formals = cc
+            ok = False
+            _CONTRACT_IH.add(name)
+            try:
+                from . import engines as _eng
+                body = _strip_contract_decorators(self.repo[name])   # the body's own semantics, its contract the goal
+                v = _eng.prove(body, ast.unparse(ens),
+                               requires=ast.unparse(req) if req is not None else "True",
+                               repo={**self.repo, name: body}, target=name)
+                ok = v.status == PROVED
+            except Exception:
+                ok = False
+            finally:
+                _CONTRACT_IH.discard(name)
+            cache[name] = ok
+        return cache[name]
+
     def _contract_summary(self, name, cc, argvals):
         """Summarize a recursive callee by its @ensure contract instead of unfolding it: a fresh result the
         contract constrains (require(args) -> ensure(args, result)), so a property following from the contract is
-        PROVED modularly. The result is not pinned (overapprox), so a REFUTED resting on it is withheld; trap
-        freedom is unaffected (a contract callee adds no modeled trap of its own here)."""
+        PROVED modularly. Used only once the callee is proved to meet its contract trap free (_contract_verified);
+        a call whose arguments may violate the @require may trap inside the callee, a possible trap at the call
+        site. The result is not pinned (overapprox), so a REFUTED resting on it is withheld."""
         ens, req, formals = cc
         if len(formals) != len(argvals):
             raise Unsupported(f"arity mismatch calling {name}")
         env = dict(zip(formals, argvals))
         r = z3.FreshInt("csum_" + name)
         self.overapprox = True
+        req_t = ev_bool(req, env, self) if req is not None else None
+        if req_t is not None and self.traps is not None:      # outside its @require the callee was not verified
+            _trap_add(self, z3.And(self.pc, z3.Not(req_t)), None)
         if self.facts is not None:
             env2 = dict(env); env2["result"] = r
             post = ev_bool(ens, env2, self)
-            self.facts.append(z3.Implies(ev_bool(req, env, self), post) if req is not None else post)
+            self.facts.append(z3.Implies(req_t, post) if req_t is not None else post)
         return r
 
     def inline(self, name: str, argvals: List[z3.ExprRef]) -> z3.ExprRef:
-        if name in self.trapfree_callees:            # a recursive callee verified trap free standalone: a fresh,
-            self.overapprox = True                   # arg-independent result with no imported trap. Returned directly
-            return z3.FreshInt("rcret_" + name)      # (the args are already trap-checked at the call site); no
-        #                                              substitution, whose pairs a container formal cannot satisfy.
+        if name in self.trapfree_callees:            # a recursive callee verified trap free standalone, for arguments
+            reading = self.callee_readings.get(name)   # of the types it was verified for: a fresh result of the sort
+            if reading is None:                        # it returns, with no imported trap. The result's range is not
+                raise Unsupported(f"no verified reading of the recursive callee {name}")   # modeled (overapprox);
+            params, ret_sort = reading                 # an argument of another type may trap inside it (abstain)
+            if len(params) != len(argvals) or any(_value_reading(v) != r for v, r in zip(argvals, params)):
+                raise Unsupported(f"{name}() called with an argument of a type it was not verified for")
+            self.overapprox = True
+            return z3.FreshConst(ret_sort, "rcret_" + name)
         cc = self._contract_for(name)                # a recursive callee the inliner cannot unfold: summarize it by
-        if cc is not None and _callee_recursive(self.repo.get(name, ""), name):   # its @ensure contract (modular)
+        if cc is not None and _callee_recursive(self.repo.get(name, ""), name):   # its @ensure contract (modular),
+            if not self._contract_verified(name, cc):                             # once the body is proved to meet it
+                raise Unsupported(f"the @ensure contract of {name} is not proved (its body may trap or break it)")
             return self._contract_summary(name, cc, argvals)
-        formals, z3args, rets, callee_traps, _none = self.summary(name)
+        spec = self._specialized(name, argvals)      # a callee whose parameter reading the arguments do not match
+        if spec is not None:                         # (an unannotated parameter, a str passed for an int): its body
+            return spec                              # under the arguments' own types
+        formals, z3args, rets, callee_traps, none_pc = self.summary(name)
         if len(formals) != len(argvals):
             raise Unsupported(f"arity mismatch calling {name}")
         subs = [(z3args[f], v) for f, v in zip(formals, argvals)]
         if self.traps is not None:
             for t in callee_traps:               # import the callee's traps,
                 self.traps.append(z3.And(self.pc, z3.substitute(t, *subs)))
-        return _subst(fold(rets), subs)          # _subst lifts over tuple (generator) values
+        self._import_side(self.__dict__.get("_summary_side", {}).get(name), subs)
+        return self._call_result(name, rets, none_pc, subs)
 
 
 # --------------------------------------------------------------------------- #
@@ -2587,6 +4834,21 @@ _STDLIB = {
 # the imported bare name (`from math import fabs`) resolves to the same model
 for _qn in list(_STDLIB):
     _STDLIB.setdefault(_qn.split(".")[-1], _STDLIB[_qn])
+
+
+_STDLIB_FLOAT_ARGS = frozenset({"fabs", "copysign", "isnan", "isinf", "isfinite"})   # math functions whose int
+#                                                     arguments CPython converts to a double (an OverflowError past it)
+
+
+def _stdlib_apply(qual, args, ctx):
+    """Apply a _STDLIB model, first emitting the OverflowError a math function's int-to-double argument
+    conversion raises."""
+    base = qual.split(".")[-1]
+    if base in _STDLIB_FLOAT_ARGS and not qual.startswith(("np.", "numpy.")):
+        for a in args:
+            if z3.is_expr(a) and z3.is_int(a):
+                _to_fp(a, ctx)
+    return _STDLIB[qual](args)
 
 
 # numpy scalar functions: the same value contracts as the math models, plus numpy's own, so code calling
@@ -3838,10 +6100,47 @@ def _collections_ctor(name, node, env, ctx):
     is trap-checked as it is evaluated. Returns None when `name` is not a modeled collections constructor."""
     if name not in _COLLECTIONS_CTORS:
         return None
-    for a in node.args:                                       # the default_factory / iterable / field list, etc.
-        ev(a.value if isinstance(a, ast.Starred) else a, env, ctx)
+    vals = [ev(a.value if isinstance(a, ast.Starred) else a, env, ctx) for a in node.args]   # the default_factory
+    kws = {kw.arg: ev(kw.value, env, ctx) for kw in node.keywords if kw.arg is not None}  # / iterable / fields
     for kw in node.keywords:
-        ev(kw.value, env, ctx)
+        if kw.arg is None:
+            ev(kw.value, env, ctx)
+    if (vals or kws) and not _TRAPFREE:                       # the argument traps need the arguments' real types,
+        raise Unsupported("collections.%s with arguments (the value engine decides)" % name)   # which only the
+    if (vals or kws) and ctx.traps is not None:               # value engine carries
+        if any(isinstance(a, ast.Starred) for a in node.args) or any(kw.arg is None for kw in node.keywords):
+            raise Unsupported("collections.%s with unpacked arguments" % name)
+        if name == "OrderedDict":                             # an int is not iterable, a non-pair element, ...
+            _TF_TRAP_MODELS["collections.OrderedDict"](_TFCall("collections.OrderedDict", vals, kws, ctx, False))
+        elif name == "defaultdict":                           # the factory must be callable or None; a second
+            f0 = vals[0] if vals else kws.get("default_factory")   # argument is the initial mapping / pairs
+            if f0 is not None and _tf_kind(f0) in _NUMERIC_KINDS + ("str", "list", "tuple", "dict", "bytes"):
+                _exact_trap(ctx, z3.BoolVal(True), ("TypeError",))
+            if len(vals) > 1 or set(kws) - {"default_factory"}:
+                raise Unsupported("collections.defaultdict with an initial mapping")
+        elif name == "Counter":                               # an iterable or a mapping; a number is a TypeError
+            src_ = vals[0] if vals else None
+            if src_ is not None:
+                k = _tf_kind(src_)
+                if k in _NUMERIC_KINDS + ("none",):
+                    _exact_trap(ctx, z3.BoolVal(True), ("TypeError",))
+                elif not (k == "str" or (isinstance(src_, _SafeContainer) and src_.elem is None
+                                          and src_.tuple_arity is None) or isinstance(src_, (_DictParam, _MapVal))):
+                    raise Unsupported("collections.Counter of an iterable whose elements may be unhashable")
+            if len(vals) > 1:
+                raise Unsupported("collections.Counter with more than one positional argument")
+        elif name == "namedtuple":                            # the spec is checked by CPython itself when constant
+            try:
+                consts = [ast.literal_eval(a) for a in node.args]
+            except (ValueError, SyntaxError, TypeError):
+                consts = None
+            if consts is None or node.keywords:
+                raise Unsupported("collections.namedtuple with a non-constant specification")
+            import collections as _co
+            try:
+                _co.namedtuple(*consts)
+            except (ValueError, TypeError):
+                _exact_trap(ctx, z3.BoolVal(True), ("ValueError", "TypeError"))
     if name in ("defaultdict", "Counter"):
         return _DefaultDict(name)
     if name == "OrderedDict":
@@ -4010,39 +6309,56 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
     if isinstance(node, ast.Constant) and node.value is None:   # None is a distinct value: arithmetic on it traps
         return _NoneVal()
     if isinstance(node, ast.Constant) and isinstance(node.value, bytes):   # a bytes literal: a byteslike container of
-        return _SafeContainer("bytelit", byteslike=True, immutable=True,   # the known length (so b"" + b concatenates,
-                              length=z3.IntVal(len(node.value)))            # b"abc"[i] bounds-checks against 3)
+        arr = z3.K(z3.IntSort(), z3.IntVal(0))                              # the known length (so b"" + b concatenates,
+        for k, bv in enumerate(node.value):                                 # b"abc"[i] bounds-checks against 3) holding
+            arr = z3.Store(arr, z3.IntVal(k), z3.IntVal(bv))                # its own bytes, so b"abc"[i] and an
+        return _SafeContainer("bytelit", byteslike=True, immutable=True,   # iteration read the literal's values
+                              length=z3.IntVal(len(node.value)), arr=arr)
     if _TRAPFREE and isinstance(node, ast.Constant):         # Ellipsis / other: opaque, trap free to produce
         return _Opaque("const")
     if isinstance(node, ast.JoinedStr):                      # f-string: concat of parts
         out = z3.StringVal("")
-        for part in node.values:
-            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+        opaque = False                                        # some field's text is not modeled: the result is a
+        for part in node.values:                              # fresh str, but every field is still evaluated and
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):   # trap-checked, in order
                 out = z3.Concat(out, z3.StringVal(part.value))
             elif isinstance(part, ast.FormattedValue):
-                if part.conversion not in (-1, 115, 114, 97):   # allow !s / !r / !a: str/repr/ascii never trap
+                if part.conversion not in (-1, 115, 114, 97):   # !s / !r / !a
                     raise Unsupported("f-string conversion")
                 v = ev(part.value, env, ctx)                # trap-check the interpolated expression
+                conv = {115: "str", 114: "repr", 97: "repr"}.get(part.conversion, None)
+                if conv is not None:
+                    _text_conv_traps(v, ctx, conv)          # !s / !r / !a render the value first
                 if part.format_spec is not None:
+                    if conv is not None:
+                        v = z3.FreshConst(_SS, "conv")      # the spec then applies to that string
+                    spec_txt = _alignment_only_spec(part.format_spec) if not _TRAPFREE else None
                     scalar = z3.is_expr(v) and (z3.is_int(v) or z3.is_bool(v) or _is_fp(v) or _is_str(v))
                     if _TRAPFREE:                            # the value engine: the term's sort is the value's real type,
                         if not (scalar and _const_format_spec_safe(part.format_spec, v)):   # so a type-compatible spec is safe
                             raise Unsupported("f-string format spec")
-                        return z3.FreshConst(_SS, "fstr")    # the whole f-string is a string (opaque value, str type)
+                        _text_conv_traps(v, ctx, "format", _const_spec_text(part.format_spec))
+                        opaque = True                        # the field is a str of unknown content
+                        continue
                     # the CHC / equivalence engines model every parameter as Int, so only a type-independent
                     # alignment / width spec (safe for any scalar) is sound here; a typed spec abstains.
-                    if not (scalar and _alignment_only_spec(part.format_spec) is not None):
+                    if not (scalar and spec_txt is not None):
                         raise Unsupported("f-string format spec")
+                    _text_conv_traps(v, ctx, "format", spec_txt)
                     _note_overapprox(ctx, "an f-string format spec")
-                    return z3.FreshConst(_SS, "fstr")
+                    opaque = True
+                    continue
+                if conv is None:
+                    _text_conv_traps(v, ctx, "str")         # format(v, '') is str(v)
                 if part.conversion in (114, 97) or not _is_str(v):   # !r / !a, or str() of a non-string: a string of
                     if _TRAPFREE:                                     # unknown content, but definitely str-typed
-                        return z3.FreshConst(_SS, "fstr")
+                        opaque = True
+                        continue
                     raise Unsupported("f-string interpolation of a non-string value")
                 out = z3.Concat(out, v)                      # a plain str field (or !s on a str): the string itself
             else:
                 raise Unsupported("f-string part")
-        return out
+        return z3.FreshConst(_SS, "fstr") if opaque else out
     if isinstance(node, ast.NamedExpr):                      # walrus (x := e): bind the target, yield the value
         val = ev(node.value, env, ctx)
         if isinstance(node.target, ast.Name):
@@ -4066,18 +6382,27 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
     if _TRAPFREE and isinstance(node, ast.List):             # [*a, *b, x]: a NEW list of length sum(len(*list)) + the
         return _SafeContainer("listunpack", length=_star_seq_len(node.elts, env, ctx))   # plain-element count
     if isinstance(node, ast.Set):                            # set literal: evaluate the elements for their
-        for e in node.elts:                                  # traps, then an opaque value
-            ev(e.value if isinstance(e, ast.Starred) else e, env, ctx)
+        for e in node.elts:                                  # traps, then an opaque value; an unhashable element
+            sv = ev(e.value if isinstance(e, ast.Starred) else e, env, ctx)   # (a list, a dict) is a TypeError
+            if not isinstance(e, ast.Starred) and _unhashable(sv) and ctx.traps is not None:
+                _trap_add(ctx, ctx.pc, ("TypeError",))
         return _Opaque("set")
     if isinstance(node, ast.Dict):
         if any(k is None for k in node.keys):                # {**other}: keys not enumerable -> opaque dict
             for k, v in zip(node.keys, node.values):
                 if k is not None:
-                    ev(k, env, ctx)
+                    kv = ev(k, env, ctx)
+                    if _unhashable(kv) and ctx.traps is not None:
+                        _trap_add(ctx, ctx.pc, ("TypeError",))
                 ev(v, env, ctx)
             return _DictLit("dict")
-        keys = [_map_key(ev(k, env, ctx)) for k in node.keys]   # a tracked dict literal: its keyed entries,
-        vals = [ev(v, env, ctx) for v in node.values]           # so d[k] reads the value (or KeyErrors)
+        keys, vals = [], []                                  # a tracked dict literal: its keyed entries, so d[k]
+        for k, v in zip(node.keys, node.values):             # reads the value (or KeyErrors); CPython evaluates
+            kv = ev(k, env, ctx)                             # each key, then its value, and an unhashable key
+            vals.append(ev(v, env, ctx))                     # (a list, a dict) is a TypeError
+            if _unhashable(kv) and ctx.traps is not None:
+                _trap_add(ctx, ctx.pc, ("TypeError",))
+            keys.append(_map_key(kv))
         return _MapVal(keys, vals)
 
     if isinstance(node, ast.Lambda):                         # lambda as a first-class value (a closure)
@@ -4103,9 +6428,12 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         op = type(node.op)
         l = ev(node.left, env, ctx)
         r = ev(node.right, env, ctx)
-        if isinstance(l, _NoneVal) or isinstance(r, _NoneVal):   # None + x and every arithmetic/bitwise op on None
-            if ctx.traps is not None:                            # raise TypeError: a reachable trap
-                _trap_add(ctx, ctx.pc, ("TypeError",))
+        if isinstance(l, _MaybeNone) or (isinstance(r, _MaybeNone) and not (op is ast.Mod and _is_str(l))):
+            l, r = _unwrap_none(l, ctx), _unwrap_none(r, ctx)   # an operand that may be None: TypeError where it is
+        if (isinstance(l, _NoneVal) or isinstance(r, _NoneVal)) and not (
+                op is ast.Mod and _is_str(l)):                   # None + x and every arithmetic/bitwise op on None
+            if ctx.traps is not None:                            # raise TypeError: a reachable trap ('%s' % None
+                _trap_add(ctx, ctx.pc, ("TypeError",))           # formats it: str's own %)
             return _Opaque("noneop")
         if op in (ast.BitOr, ast.BitAnd, ast.Sub, ast.BitXor) and _is_set_like(l) and _is_set_like(r):
             return _set_binop({ast.BitOr: "|", ast.BitAnd: "&", ast.Sub: "-", ast.BitXor: "^"}[op], l, r, ctx)
@@ -4126,10 +6454,11 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         if op is ast.Mod and _is_str(l):                     # str % args -- printf formatting, even when args is a
             if not z3.is_string_value(l) and _TRAPFREE and not BEST_EFFORT:   # tuple (which would look like a tuple op)
                 # a NON-constant format string can mismatch its args at runtime (a TypeError / ValueError the engine
-                # does not model), so trap freedom abstains rather than claim the % cannot raise; a CONSTANT format
-                # string stays the assume-the-args-match over-approximation (trap free, with the args trap-checked).
+                # does not model), so trap freedom abstains rather than claim the % cannot raise
                 raise Unsupported("string formatting with a non-constant format string may raise (not modeled)")
-            _note_overapprox(ctx, "string % formatting")     # a trap-free string, the args already trap-checked
+            if z3.is_string_value(l) and ctx.traps is not None:   # a constant format: CPython's own checks, as traps
+                _printf_traps(_z3_str_value(l), r, ctx)
+            _note_overapprox(ctx, "string % formatting")     # the text itself is not modeled
             return z3.FreshConst(_SS, "strmod")
         if isinstance(l, tuple) or isinstance(r, tuple):
             if op is ast.Add:
@@ -4234,14 +6563,14 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             return _Opaque("strop")
         if op is ast.Div:                                    # true division -> float
             if _is_fp(l) or _is_fp(r):
+                lf, rf = _to_fp(l, ctx), _to_fp(r, ctx)             # a float operand: CPython coerces, then divides
                 if ctx.traps is not None:
                     _trap_add(ctx, z3.And(ctx.pc, _is_zero(r)), ("ZeroDivisionError",))   # ZeroDivisionError
-                return z3.fpDiv(_RM, _to_fp(l), _to_fp(r))          # a float operand: CPython coerces, then divides
+                return z3.fpDiv(_RM, lf, rf)
             la, lb = _as_int(l), _as_int(r)                         # int / int: correctly rounded, signed
             if ctx.traps is not None:
                 _trap_add(ctx, z3.And(ctx.pc, lb == 0), ("ZeroDivisionError",))   # ZeroDivisionError
-            mag = z3.fpToFP(_RM, z3.ToReal(z3.If(la < 0, -la, la)) / z3.ToReal(z3.If(lb < 0, -lb, lb)), _F64)
-            return z3.If(z3.Xor(la < 0, lb < 0), z3.fpNeg(mag), mag)          # sign = sign(a) xor sign(b)
+            return _int_truediv(la, lb, ctx)
         if op is ast.Pow:
             if _is_fp(l):
                 return _fp_pow(l, node.right, ctx)        # x ** 0 / x ** 1 exact; x ** n (n>=2) over-approximated
@@ -4293,12 +6622,12 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     return r2
                 raise
         if op in (ast.FloorDiv, ast.Mod) and (_is_fp(l) or _is_fp(r)):
-            lf, rf = _to_fp(l), _to_fp(r)
+            lf, rf = _to_fp(l, ctx), _to_fp(r, ctx)
             if ctx.traps is not None:
                 _trap_add(ctx, z3.And(ctx.pc, z3.fpIsZero(rf)), ("ZeroDivisionError",))   # float // 0.0 / % 0.0: ZeroDivisionError
             return _fp_arith(op, lf, rf)
         if _is_fp(l) or _is_fp(r):
-            return _fp_arith(op, l, r)
+            return _fp_arith(op, l, r, ctx)
         if op is ast.MatMult:
             raise Unsupported("matrix multiply @ is outside the scalar subset")
         l, r = _as_int(l), _as_int(r)                        # bool operands -> their 0/1 value
@@ -4355,10 +6684,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 return q if op is ast.FloorDiv else (l - r * q)
         return _BINOPS[op](l, r)
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-        v = ev(node.operand, env, ctx)
+        v = _unwrap_none(ev(node.operand, env, ctx), ctx)
         return z3.fpNeg(v) if _is_fp(v) else -_as_int(v)
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
-        v = ev(node.operand, env, ctx)
+        v = _unwrap_none(ev(node.operand, env, ctx), ctx)
         if _is_fp(v):
             raise Unsupported("~ on a float")
         return -_as_int(v) - 1                               # Python: ~a == -(a + 1)
@@ -4378,6 +6707,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             cond = _as_bool(v, ctx)
             nxt = z3.And(guard, cond) if is_and else z3.And(guard, z3.Not(cond))
             rest = fold(i + 1, nxt)
+            if isinstance(v, _MaybeNone):                    # `v or d`: a truthy v is not None, so its value; `v and
+                if is_and:                                   # d` yields v itself when falsy -- None or a falsy value
+                    raise Unsupported("`and` yielding a possibly-None operand")
+                return z3.If(cond, _as_int(v.val), rest)
             return z3.If(cond, rest, _as_int(v)) if is_and else z3.If(cond, _as_int(v), rest)
 
         result = fold(0, old)
@@ -4391,10 +6724,25 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         if (op is ast.In or op is ast.NotIn) and isinstance(node.comparators[0], ast.Set) \
                 and all(not isinstance(e, ast.Starred) for e in node.comparators[0].elts):
             elems = [ev(e, env, ctx) for e in node.comparators[0].elts]   # x in {literal set}: membership is
-            if all(not isinstance(e, (_Opaque, _Closure)) and not isinstance(e, tuple) for e in elems):
-                c = z3.Or(*[_term_eq(l, e) for e in elems]) if elems else z3.BoolVal(False)   # a disjunction of ==
-                return c if op is ast.In else z3.Not(c)
+            if any(_unhashable(v) for v in [l] + elems):                # a hash lookup, so an unhashable element
+                if ctx.traps is not None:                               # or probe is a TypeError
+                    _trap_add(ctx, ctx.pc, ("TypeError",))
+                return z3.BoolVal(False)                                # poison: never trusted once the trap fires
+            if all(not isinstance(e, (_Opaque, _Closure)) for e in elems):
+                c = z3.Or(*[_py_eq(l, e, identity=True, ctx=ctx) for e in elems]) if elems else z3.BoolVal(False)
+                return c if op is ast.In else z3.Not(c)                 # a disjunction of (identity or ==)
         r = ev(node.comparators[0], env, ctx)
+        if isinstance(l, _MaybeNone) or isinstance(r, _MaybeNone):
+            mn, other = (l, r) if isinstance(l, _MaybeNone) else (r, l)
+            if op in (ast.Is, ast.IsNot, ast.Eq, ast.NotEq) and type(other) is _NoneVal:
+                return mn.cond if op in (ast.Is, ast.Eq) else z3.Not(mn.cond)   # x is None: exactly its condition
+            if op in (ast.Eq, ast.NotEq) and not isinstance(other, _MaybeNone):
+                c = z3.And(z3.Not(mn.cond), _py_eq(mn.val, other, ctx=ctx))    # None equals no other value
+                return c if op is ast.Eq else z3.Not(c)
+            if op in (ast.Lt, ast.LtE, ast.Gt, ast.GtE) or ((op is ast.In or op is ast.NotIn) and mn is r):
+                l, r = _unwrap_none(l, ctx), _unwrap_none(r, ctx)  # ordering None, or `in` None: TypeError
+            else:
+                raise Unsupported("comparison of a possibly-None value")
         if (op is ast.In or op is ast.NotIn) and isinstance(r, _DictParam):
             mem = _dict_member(r, l)                          # k in d : the dict's stable membership predicate
             if mem is not None:
@@ -4442,16 +6790,23 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if ln and rn:
                 li = _as_int(l) if isinstance(l, _FieldVal) else l
                 ri = _as_int(r) if isinstance(r, _FieldVal) else r
-                if _is_fp(li) or _is_fp(ri):
-                    return _FP_CMP[op](_to_fp(li), _to_fp(ri))
-                return _CMP[op](li, ri)
+                return _num_compare(op, li, ri)
+        if op in (ast.Eq, ast.NotEq) and (isinstance(l, _NoneVal) or isinstance(r, _NoneVal)) \
+                and all(isinstance(v, (_NoneVal, tuple, _Complex)) or z3.is_expr(v) for v in (l, r)):
+            c = _py_eq(l, r, ctx=ctx)                         # x == None: None equals only None
+            return c if op is ast.Eq else z3.Not(c)
         if isinstance(l, (_Opaque, _Closure)) or isinstance(r, (_Opaque, _Closure)):
+            if op in (ast.Eq, ast.NotEq):
+                ceq = _container_eq(l, r, ctx)                # decided where the values are known (the same object,
+                if ceq is not None:                           # a container against a scalar, two literals), else a
+                    return ceq if op is ast.Eq else z3.Not(ceq)   # realizable fresh Bool over two sequences
             if _TRAPFREE:                                     # comparison / membership of an opaque value, assuming
-                return z3.FreshConst(z3.BoolSort(), "hc")     # the program compares compatible values: arbitrary bool
+                _note_overapprox(ctx, "comparison of an unmodeled value")   # the program compares compatible values:
+                return z3.FreshConst(z3.BoolSort(), "hc")     # an arbitrary bool, an over-approximation
             raise Unsupported("comparison of an unmodeled value")
-        if op is ast.In or op is ast.NotIn:                  # membership in a tuple or substring
-            if isinstance(r, tuple):
-                c = z3.Or(*[_term_eq(l, e) for e in r]) if r else z3.BoolVal(False)
+        if op is ast.In or op is ast.NotIn:                  # membership in a tuple / list literal or substring
+            if isinstance(r, tuple):                         # (each element tested by identity, then ==)
+                c = z3.Or(*[_py_eq(l, e, identity=True, ctx=ctx) for e in r]) if r else z3.BoolVal(False)
             elif _is_str(l) and _is_str(r):
                 c = z3.Contains(r, l)
             elif BEST_EFFORT:                                # membership in an unmodeled container: a bool (lower trust)
@@ -4462,15 +6817,15 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             return c if op is ast.In else z3.Not(c)
         if isinstance(l, tuple) or isinstance(r, tuple):
             if op is ast.Eq:
-                return _term_eq(l, r)
+                return _py_eq(l, r, ctx=ctx)
             if op is ast.NotEq:
-                return _term_neq(l, r)
+                return z3.Not(_py_eq(l, r, ctx=ctx))
             raise Unsupported("tuple ordering comparison")
         if isinstance(l, _Complex) or isinstance(r, _Complex):
             if op is ast.Eq:
-                return _term_eq(l, r)
+                return _py_eq(l, r, ctx=ctx)
             if op is ast.NotEq:
-                return _term_neq(l, r)
+                return z3.Not(_py_eq(l, r, ctx=ctx))
             raise Unsupported("complex ordering comparison")
         if _is_str(l) != _is_str(r):                         # one string, one number: a type mismatch
             if op is ast.Eq:
@@ -4492,6 +6847,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 if _k is not None:
                     _isc[_k] = res
             return res if op is ast.Is else z3.Not(res)
+        if _is_num_term(l) and _is_num_term(r):              # int / bool / float / Fraction: exact across the types
+            return _num_compare(op, l, r)                    # (2**53 + 1 > 2.0**53; NaN orders against nothing)
         if _is_fp(l) or _is_fp(r):
             return _FP_CMP[op](_to_fp(l), _to_fp(r))
         return _CMP[op](l, r)
@@ -4535,18 +6892,22 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 return z3.FreshConst(_SS, name)
             raise Unsupported(f"{name}() of a non-integer value")
         if name in ("ascii", "format") and name not in ctx.repo and 1 <= len(node.args) <= 2:
-            v = ev(node.args[0], env, ctx)                    # ascii(x) / format(x): a string, never traps;
-            if name == "format" and len(node.args) == 2:      # format(x, spec) raises on an incompatible spec
-                spec = ev(node.args[1], env, ctx)
+            v = ev(node.args[0], env, ctx)                    # ascii(x) / format(x): a string; an int past the
+            if name == "format" and len(node.args) == 2:      # str digit limit raises; format(x, spec) raises on
+                spec = ev(node.args[1], env, ctx)             # an incompatible spec
                 scalar = z3.is_expr(v) and (z3.is_int(v) or z3.is_bool(v) or _is_fp(v) or _is_str(v))
                 ok = (isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str)
                       and scalar and _format_spec_safe(node.args[1].value, v))
                 if not ok:
                     if _TRAPFREE and not (isinstance(node.args[1], ast.Constant)
                                           and isinstance(node.args[1].value, str)):
-                        ctx.overapprox = True                 # a dynamic spec: assume well-formed (over-approx)
+                        _note_overapprox(ctx, "format() with a dynamic spec")   # assume well-formed (over-approx)
+                        _trap_add(ctx, z3.And(ctx.pc, z3.FreshConst(z3.BoolSort(), "fmtspec")), ("ValueError",))
                         return z3.FreshConst(_SS, "format")
                     raise Unsupported("format() with a spec that may raise on this value")
+                _text_conv_traps(v, ctx, "format", node.args[1].value)
+            else:
+                _text_conv_traps(v, ctx, "repr" if name == "ascii" else "str")
             _note_overapprox(ctx, name)
             return z3.FreshConst(_SS, name)
         if name == "chr" and "chr" not in ctx.repo and len(node.args) == 1:
@@ -4572,8 +6933,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             a = ev(node.args[0], env, ctx)                    # ord(s): TypeError unless s is a length-1 string
             if _is_str(a):
                 am = z3.simplify(a)
-                if z3.is_string_value(am) and len(am.as_string()) == 1:   # a constant character folds to its codepoint
-                    return z3.IntVal(ord(am.as_string()))
+                if z3.is_string_value(am) and len(_z3_str_value(am)) == 1:   # a constant character folds to its
+                    return z3.IntVal(ord(_z3_str_value(am)))                # codepoint
                 if ctx.traps is not None:
                     _trap_add(ctx, z3.And(ctx.pc, z3.Length(a) != 1), ("TypeError",))
                 if not _TRAPFREE:                            # the length trap is exact; the codepoint is over-approximated
@@ -4586,8 +6947,19 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             raise Unsupported("ord() of a non-string value")
         if name == "hash" and "hash" not in ctx.repo and len(node.args) == 1:
             a = ev(node.args[0], env, ctx)                    # hash of a hashable scalar / string / tuple -> int
+            if _unhashable(a):
+                if ctx.traps is not None:                     # hash([1]): unhashable type
+                    _trap_add(ctx, ctx.pc, ("TypeError",))
+                return z3.FreshInt("hash")
+            if z3.is_expr(a) and (z3.is_int(a) or z3.is_bool(a)):
+                # CPython's int hash: the residue modulo the Mersenne prime 2**61 - 1 (2**31 - 1 on a 32-bit build),
+                # signed like the int, with -1 (the C-level error code) remapped to -2; a bool hashes as its int
+                P = 2 ** 61 - 1 if sys.hash_info.width == 64 else 2 ** 31 - 1
+                n = _as_int(a)
+                h = z3.If(n >= 0, n % P, -((-n) % P))
+                return z3.If(h == -1, z3.IntVal(-2), h)
             if z3.is_expr(a) or isinstance(a, tuple):
-                _note_overapprox(ctx, "hash")
+                _note_overapprox(ctx, "hash")                 # a float / str / tuple hash: not modeled exactly
                 return z3.FreshInt("hash")
             raise Unsupported("hash() of a possibly-unhashable value")
         if name == "int" and "int" not in ctx.repo:
@@ -4614,12 +6986,16 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 a = ev(args[0], env, ctx)                      # the argument is trap-checked as it is evaluated
                 if z3.is_expr(a) and (z3.is_int(a) or z3.is_bool(a)):
                     return _as_int(a)                         # int(int) / int(bool): exact, never traps
+                if _is_str(a):                                # int(s): the base-10 literal grammar and the digit
+                    return _int_of_str(a, ctx)                # limit, exactly
                 if _is_fp(a) or (_TRAPFREE and isinstance(a, _Opaque)
                                  and not isinstance(a, (_SafeContainer, _DictParam, _DictLit, _MapVal))):
-                    if _is_fp(a) and _TRAPFREE and ctx.traps is not None:
+                    if _is_fp(a) and ctx.traps is not None:
                         _trap_add(ctx, z3.And(ctx.pc, z3.Or(z3.fpIsInf(a), z3.fpIsNaN(a))), ("OverflowError", "ValueError"))   # int(inf) OverflowError, int(nan) ValueError
-                    _note_overapprox(ctx, "int() of a float")    # truncation toward zero of a finite float --
-                    return z3.FreshInt("int")                    # some int (REFUTED withheld; PROVED still sound)
+                    if _is_fp(a) and ctx.facts is not None:      # truncation toward zero of a finite float, exactly
+                        return _float_to_int(a, "trunc", ctx)
+                    _note_overapprox(ctx, "int() of a float")    # no fact channel (or an opaque number): some int
+                    return z3.FreshInt("int")                    # (REFUTED withheld; PROVED still sound)
                 raise Unsupported("int() of a string, container, or unmodeled value (may raise ValueError/TypeError)")
             raise Unsupported("int() with an unmodeled signature (a non-constant base, or extra arguments)")
         if name == "float" and "float" not in ctx.repo and len(node.args) <= 1:
@@ -4637,12 +7013,11 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             a = ev(node.args[0], env, ctx)                    # the argument is trap-checked as it is evaluated
             if _is_fp(a):
                 return a                                      # float(float): identity
+            if _is_str(a):
+                return _float_of_str(a, ctx)                  # float(s): the float literal grammar, exactly
             if z3.is_expr(a) and (z3.is_int(a) or z3.is_bool(a)):
-                ai = _as_int(a)
-                if _TRAPFREE and ctx.traps is not None:       # float(n) OverflowErrors when |n| exceeds the largest int
-                    m = z3.IntVal(_float_int_max())           # with a finite double value (the CHC engine cannot carry
-                    _trap_add(ctx, z3.And(ctx.pc, z3.Or(ai > m, ai < -m)), ("OverflowError",))   # this 2**1024 constant, so it abstains to here)
-                return _to_fp(a)                              # float(int) / float(bool): the exact IEEE-754 value
+                return _to_fp(a, ctx)                         # float(int) / float(bool): the correctly rounded value,
+                #                                               an OverflowError past the largest double
             raise Unsupported("float() of a non-literal string or unmodeled value (may raise ValueError)")
         if name in ("bytes", "bytearray") and name not in ctx.repo and len(node.args) <= 1:
             # bytes(n) / bytearray(n) is n zero bytes -- ValueError on a negative count -- so the result is a byteslike
@@ -4681,6 +7056,9 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             a = ev(node.args[0], env, ctx)                    # the argument is trap-checked as it is evaluated
             if type(a) is _Opaque:
                 raise Unsupported("str() of an opaque object whose __str__ may raise")
+            if _is_str(a):
+                return a                                      # str(s) is s
+            _text_conv_traps(a, ctx, "str")                   # an int past the decimal digit limit: ValueError
             _note_overapprox(ctx, "str()")
             return z3.FreshConst(_SS, "str")
         if name == "range" and "range" not in ctx.repo and 1 <= len(node.args) <= 3 and not node.keywords:
@@ -4715,7 +7093,9 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             length = z3.If(length > 0, length, z3.IntVal(0))
             _st = z3.simplify(start)                          # every element >= start (increasing) when step > 0, so a
             _ne = s > 0 and z3.is_int_value(_st) and _st.as_long() >= 0   # non-negative start gives non-negative elements
-            return _SafeContainer("range", immutable=True, length=length, nonneg=_ne)
+            rc = _SafeContainer("range", immutable=True, length=length, nonneg=_ne)
+            rc.rng = (start, stop, s)                         # its elements: start + k * s for 0 <= k < length
+            return rc
         if name in ("set", "frozenset") and name not in ctx.repo and len(node.args) <= 1 and not node.keywords:
             # set(it) / frozenset(it): a sized, iterable, membership-queryable container that is not subscriptable.
             # Empty with no argument; an iterable argument is trap-checked; a non-iterable scalar abstains.
@@ -4736,10 +7116,12 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             x = ev(node.args[0], env, ctx)
             if isinstance(x, tuple):
                 return x
-            if isinstance(x, _SafeContainer):
-                return _SafeContainer("tuple", immutable=True, length=_container_len(x, ctx))
+            if isinstance(x, _SafeContainer):                # the same elements, read on the source's pool
+                return _SafeContainer("tuple", immutable=True, length=_container_len(x, ctx), scalar=x.scalar,
+                                      tuple_arity=x.tuple_arity, elem=x.elem, byteslike=x.byteslike,
+                                      rkey=x.rkey if x.rkey is not None else x, related=x.related)
             if _is_str(x):
-                return _SafeContainer("tuple", immutable=True, length=z3.Length(x))
+                return _SafeContainer("tuple", immutable=True, length=z3.Length(x), scalar="str")
             if isinstance(x, (_DictParam, _DictLit, _MapVal, _DefaultDict, _Opaque)):
                 return _SafeContainer("tuple", immutable=True)
             if BEST_EFFORT:                                  # assume the argument is iterable (lower trust)
@@ -4755,11 +7137,14 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 if ctx.traps is not None:
                     _trap_add(ctx, ctx.pc, ("TypeError",))        # set / frozenset: reversed() raises TypeError
                 return _Opaque("reversed")                        # poison: never trusted once the trap fires
-            if isinstance(x, _SafeContainer):                     # list / bytes / range: a reversed sized sequence
-                return _SafeContainer("reversed", byteslike=x.byteslike, length=_container_len(x, ctx), unsized=True)
+            if isinstance(x, _SafeContainer):                     # list / bytes / range: a reversed sized sequence --
+                return _SafeContainer("reversed", byteslike=x.byteslike, length=_container_len(x, ctx), unsized=True,
+                                      scalar=x.scalar, tuple_arity=x.tuple_arity, elem=x.elem,   # the source's
+                                      rkey=x.rkey if x.rkey is not None else x, related=True)    # elements, rearranged
             if _is_str(x):
-                return _SafeContainer("reversed", length=z3.Length(x), unsized=True)
-            if isinstance(x, tuple):                              # a list / tuple literal of known length
+                return _SafeContainer("reversed", length=z3.Length(x), unsized=True, scalar="str")
+            if isinstance(x, tuple):                              # a list / tuple literal of known length, its values
+                _note_overapprox(ctx, "reversed() of a literal")  # rearranged: a read of them is over-approximated
                 return _SafeContainer("reversed", length=z3.IntVal(len(x)), unsized=True)
             if isinstance(x, (_DictParam, _DictLit, _MapVal, _DefaultDict, _Opaque)):
                 return _Opaque("reversed")                        # dict (3.8+) / opaque iterable: lazy, trap free
@@ -4775,7 +7160,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             for a in node.args[1:]:
                 ev(a, env, ctx)
             if name == "enumerate" and isinstance(x, _SafeContainer) and not x.unindexable and not x.unsized:
-                return _SafeContainer("enumerate", length=_container_len(x, ctx), unsized=True, tuple_arity=2)
+                return _SafeContainer("enumerate", length=_container_len(x, ctx), unsized=True, tuple_arity=2,
+                                      tuple_protos=("int", _seq_elem_proto(x)))
             if name == "iter" and isinstance(x, _SafeContainer) and not x.unsized:
                 return _Opaque("iter", src_len=_container_len(x, ctx))   # single-shot iterator carrying its source length
             if (isinstance(x, (_SafeContainer, tuple, _DictParam, _DictLit, _MapVal, _DefaultDict, _Opaque))
@@ -4816,7 +7202,13 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 # list(s) / sorted(s) of a string is a list of 1-char STRINGS (not ints): a _StrSeq, so an element is a
                 # string (s[i].upper() works, s[i] + 1 is a refutable TypeError) and ''.join(sorted(s)) proves.
                 return _StrSeq(name, length=z3.Length(x))
-            elif isinstance(x, tuple):
+            elif isinstance(x, tuple):                       # a literal sequence: list() is the same values; sorted()
+                if name == "list":                           # of numeric constants is CPython's own order; otherwise
+                    return x                                 # the elements are a rearrangement the engine does not
+                srt = _sorted_literal(x, node.keywords)      # track, so a read of them is over-approximated
+                if srt is not None:
+                    return srt
+                _note_overapprox(ctx, "sorted() of a literal with symbolic elements")
                 n = z3.IntVal(len(x))
             elif isinstance(x, (_DictParam, _DictLit, _MapVal)):
                 n = z3.FreshInt("itlen")
@@ -4829,14 +7221,24 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     ctx.facts.append(n >= 0)
             else:
                 raise Unsupported(f"{name}() of a possibly non-iterable value")
-            ta = x.tuple_arity if isinstance(x, _SafeContainer) else None   # list(zip / enumerate / items) keeps the
-            return _SafeContainer(name, length=n, tuple_arity=ta)            # fixed-arity tuple element
+            src_c = x if isinstance(x, _SafeContainer) else None
+            ta = src_c.tuple_arity if src_c is not None else None          # list(zip / enumerate / items) keeps the
+            return _SafeContainer(name, length=n, tuple_arity=ta,          # fixed-arity tuple element, and the
+                                  scalar=src_c.scalar if src_c is not None else None,   # annotated element type;
+                                  elem=src_c.elem if src_c is not None else None,       # the elements are the
+                                  rkey=(src_c.rkey if src_c.rkey is not None else src_c) if src_c is not None else None,
+                                  related=name == "sorted" or (src_c is not None and src_c.related))   # source's,
+            #                                                                    rearranged by sorted() (_elem_read)
         if name == "print" and "print" not in ctx.repo:
-            # print(...) writes str() of each argument and returns None, raising no modeled trap (the same
-            # assume-str-safe over-approximation an f-string interpolation already makes). Each argument and
-            # keyword (sep / end / file / flush) is trap-checked as it is evaluated; the result is None.
+            # print(...) writes str() of each argument and returns None: an int past the str digit limit raises
+            # (ValueError), as str() does; nothing else it renders can. Each argument and keyword (sep / end /
+            # file / flush) is trap-checked as it is evaluated; the result is None.
             for a in node.args:
-                ev(a.value if isinstance(a, ast.Starred) else a, env, ctx)
+                pv = ev(a.value if isinstance(a, ast.Starred) else a, env, ctx)
+                if isinstance(a, ast.Starred):
+                    _elements_text_traps(pv, ctx, "str")
+                else:
+                    _text_conv_traps(pv, ctx, "str")
             for kw in node.keywords:
                 ev(kw.value, env, ctx)
             return _NoneVal()
@@ -4850,24 +7252,26 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             seq = ev(node.args[0], env, ctx)
             start = ev(node.args[1], env, ctx) if len(node.args) == 2 else z3.IntVal(0)
             if isinstance(seq, tuple):                       # sum of a constant-length sequence: exact
-                vals = [start, *seq]
-                if any(_is_fp(v) for v in vals):
-                    acc = _to_fp(vals[0])
-                    for v in vals[1:]:
-                        acc = acc + _to_fp(v)
-                else:
-                    acc = _as_int(vals[0])
-                    for v in vals[1:]:
-                        acc = acc + _as_int(v)
-                return acc
+                return _py_sum(start, list(seq), ctx)
+            _sk = getattr(seq, "scalar", None) if isinstance(seq, _SafeContainer) else None
+            if _TRAPFREE and _sk == "float" and len(node.args) == 1:   # list[float]: 0 + floats is a float (an
+                _elem_read(ctx, seq, ("sum", id(seq)))                # overflow is inf, never a raise)
+                return z3.FP("__sum_%s_%x" % (seq.name, id(seq)), _F64)
+            if _TRAPFREE and _sk in ("str", "bytes") and ctx.traps is not None:   # 0 + 'a': TypeError once non-empty
+                _trap_add(ctx, z3.And(ctx.pc, _container_len(seq, ctx) >= 1), ("TypeError",))
+                return z3.FreshInt("sum")
             if _TRAPFREE and isinstance(seq, _SafeContainer):   # the sum of an arbitrary container is an arbitrary int
-                _sm = z3.Int("__sum_" + seq.name)               # that never traps; a stable named int (not a withheld
-                #                                                 over-approximation) so a guard `if sum(xs): ...`
-                #                                                 constrains it, and a division by it or by an
-                #                                                 independent len(xs) refutes -- both sound, since the
-                #                                                 sum can be zero (the empty list, or [1, -1])
+                _elem_read(ctx, seq, ("sum", id(seq)))          # that never traps; a stable named int per container
+                _sm = z3.Int("__sum_%s_%x" % (seq.name, id(seq)))   # (not a withheld over-approximation) so a guard
+                #                                                 `if sum(xs): ...` constrains it, and a division by it
+                #                                                 or by an independent len(xs) refutes -- both sound,
+                #                                                 since the sum can be zero (the empty list, or [1, -1])
                 if getattr(seq, "nonneg", False) and ctx.facts is not None:
                     ctx.facts.append(_sm >= 0)                  # a sum of provably non-negative elements is >= 0
+                if len(node.args) == 2:                         # sum(xs, start): start + the elements' sum
+                    if not (z3.is_expr(start) and (z3.is_int(start) or z3.is_bool(start))):
+                        raise Unsupported("sum() over a container with a non-integer start")
+                    return _as_int(start) + _sm
                 return _sm
             raise Unsupported("sum() over an unmodeled iterable")
         _math_vis = not getattr(node.func, "_ts_freename", False)   # the bare math reading needs its from-import
@@ -4911,11 +7315,20 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                         _apply_key_callable(keynode, seq, env, ctx)   # zero element); a bare builtin key declines
                     if "default" not in _kw:
                         ctx.traps.append(z3.And(ctx.pc, _container_len(seq, ctx) <= 0))
-                    return z3.FreshInt(name)                 # an arbitrary element of the sequence (or the default)
+                    _elem_read(ctx, seq, (name, id(seq)))    # an arbitrary element of the sequence (or the default): one
+                    return z3.Int("__%s%s_%s_%x" % (name, "k" if keynode is not None else "", seq.name, id(seq)))
+                    #                                          stable symbol per container, related to its other reads
                 else:                                        # an empty or otherwise opaque iterable may be empty
                     raise Unsupported(f"{name}() over a possibly-empty iterable is not modeled (empty raises ValueError)")
             else:
                 vals = [ev(a, env, ctx) for a in node.args]
+            if any(_is_fp(v) for v in vals) and not all(_is_fp(v) for v in vals):
+                # Python compares an int with a float exactly and returns the original object, so mixing them
+                # is modeled only when every int is a literal the double represents exactly (value-preserving)
+                if not all(_is_fp(v) or (z3.is_expr(v) and (z3.is_bool(v) or (
+                        z3.is_int_value(z3.simplify(v)) and abs(z3.simplify(v).as_long()) <= _EXACT_INT_FLOAT)))
+                        for v in vals):
+                    raise Unsupported(f"{name}() mixing an int and a float")
             vals = [_to_fp(v) for v in vals] if any(_is_fp(v) for v in vals) else [_as_int(v) for v in vals]
             acc = vals[0]
             for x in vals[1:]:
@@ -4946,8 +7359,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if len(node.args) == 2:
                 _note_overapprox(ctx, "round")
                 return z3.FreshConst(_F64, "round")          # round(float, n) returns a float; inf/nan pass through
-            if _TRAPFREE and ctx.traps is not None:          # round(inf) OverflowError, round(nan) ValueError (int result)
+            if ctx.traps is not None:                        # round(inf) OverflowError, round(nan) ValueError (int result)
                 _trap_add(ctx, z3.And(ctx.pc, z3.Or(z3.fpIsInf(x), z3.fpIsNaN(x))), ("OverflowError", "ValueError"))
+            if ctx.facts is not None:                        # the nearest int, a tie to the even one, exactly
+                return _float_to_int(x, "round", ctx)
             _note_overapprox(ctx, "round")
             return z3.FreshInt("round")
         if name == "divmod" and len(node.args) == 2:         # divmod(a, b) == (a // b, a % b), same zero-divisor trap
@@ -4990,12 +7405,17 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                         _trap_add(ctx, ctx.pc, ("TypeError",))
                     return z3.FreshInt("ndlen")
                 return a.shape[0]
+            if isinstance(a, _SafeContainer) and a.arr is not None:   # an array-backed list: its length variable
+                return _container_len(a, ctx)
             if _TRAPFREE and isinstance(a, _SafeContainer):  # a container parameter: a stable nonneg length,
                 if a.unsized:                                # a lazy iterator (zip / chain / ...) has no len(): the
                     if ctx.traps is not None:                # an iterator has no len(): TypeError
                         _trap_add(ctx, ctx.pc, ("TypeError",))
                     return z3.FreshInt("iterlen")
-                return _container_len(a, ctx)                # shared with the bounds check on a[i]
+                n = _container_len(a, ctx)                   # shared with the bounds check on a[i]
+                if getattr(a, "rng", None) is not None and ctx.traps is not None:   # len(range(10**20)): its
+                    _exact_trap(ctx, n > sys.maxsize, ("OverflowError",))           # length is no Py_ssize_t
+                return n
             if _TRAPFREE and isinstance(a, _DictParam):       # len(d) for a dict parameter: a stable by-name nonneg
                 return _container_len(a, ctx)                 # length, shared with its d.keys() / d.values() view
             if _TRAPFREE and isinstance(a, _Opaque):         # other opaque container (view / attribute / call result):
@@ -5051,8 +7471,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 fn = node.args[0]                            # map(str, X) / map(repr, X) over a known iterable yields a
                 if (isinstance(fn, ast.Name) and fn.id in ("str", "repr") and fn.id not in env and fn.id not in ctx.repo
                         and (isinstance(seq, (_SafeContainer, _StrSeq, _DictParam, _DictLit, _MapVal)) or _is_str(seq))):
-                    return _StrSeq("map", unsized=True)      # lazy iterator of strings (str / repr is total), so
-                    #                                          sep.join(map(str, X)) is a trap-free string
+                    _elements_text_traps(seq, ctx, fn.id)    # an int element past the str digit limit raises once
+                    return _StrSeq("map", unsized=True)      # the lazy iterator of strings is consumed
                 if BEST_EFFORT:                              # map over an unmodeled iterable: opaque (lower trust)
                     ev(node.args[0], env, ctx)
                     _best_effort_assume()
@@ -5088,7 +7508,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 m = lens[0]
                 for ln in lens[1:]:
                     m = z3.If(ln < m, ln, m)
-                return _SafeContainer("zip", length=m, unsized=True, tuple_arity=len(parts))   # elements are k-tuples
+                return _SafeContainer("zip", length=m, unsized=True, tuple_arity=len(parts),   # elements are k-tuples
+                                      tuple_protos=tuple(_seq_elem_proto(p) for p in parts))
             if any(_definitely_not_iterable(p) for p in parts) and not BEST_EFFORT:
                 raise Unsupported("zip() of a possibly non-iterable value")   # a scalar argument raises TypeError,
                 #                                                               as enumerate() over a scalar declines
@@ -5102,8 +7523,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 _trap_add(ctx, z3.And(ctx.pc, den == 0), ("ZeroDivisionError",))
             return num / den
         if name == "complex" and 1 <= len(node.args) <= 2:
-            re = _to_fp(ev(node.args[0], env, ctx))
-            im = _to_fp(ev(node.args[1], env, ctx)) if len(node.args) == 2 else z3.FPVal(0.0, _F64)
+            re = _to_fp(ev(node.args[0], env, ctx), ctx)
+            im = _to_fp(ev(node.args[1], env, ctx), ctx) if len(node.args) == 2 else z3.FPVal(0.0, _F64)
             return _Complex(re, im)
         if name == "dict" and not node.args and not node.keywords and "dict" not in ctx.repo:
             return _MapVal()                                 # dict() -> an empty tracked dict
@@ -5117,7 +7538,9 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             ctx.callsub.append(ctx.summaries[name](*argvals, r))
             return r
         if name in ctx.repo:
-            _node0 = _parse(ctx.repo[name]).body[0]
+            _body0 = _parse(ctx.repo[name]).body                 # the callee's def or class, past any leading import
+            _node0 = next((n for n in _body0 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))),
+                          _body0[0])
             if isinstance(_node0, ast.ClassDef):                 # a repo class: model its constructor (an opaque
                 _eval_args(node.args, env, ctx)                  # instance), with the arguments trap-checked and
                 for kw in node.keywords:                         # __init__ confirmed trap free (a dataclass-style
@@ -5128,7 +7551,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 return _Opaque(name.lower())
             return _call_repo(name, _bind_call(_node0, node, env, ctx), ctx)
         if name in _STDLIB:                                  # imported stdlib function (bare name)
-            return _STDLIB[name](_eval_args(node.args, env, ctx))
+            return _stdlib_apply(name, _eval_args(node.args, env, ctx), ctx)
         if _TRAPFREE and name == "getattr" and 2 <= len(node.args) <= 3 \
                 and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
             obj = ev(node.args[0], env, ctx)                 # getattr(o, "x"[, default]) with a constant name: model as
@@ -5137,15 +7560,22 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             b = getattr(obj, "name", None)
             return _FieldVal(b + "." + node.args[1].value) if b is not None else _Opaque("getattr")
         if _TRAPFREE and name in _SAFE_BUILTINS_TF:          # getattr / type / print / ... raise no modeled trap
-            _eval_args(node.args, env, ctx)                  # arguments are still trap-checked
+            _sargs = _eval_args(node.args, env, ctx)         # arguments are still trap-checked
             for kw in node.keywords:
                 ev(kw.value, env, ctx)
+            if name == "repr" and len(_sargs) == 1:          # repr of an int past the str digit limit: ValueError
+                _text_conv_traps(_sargs[0], ctx, "repr")
             return _Opaque("call")
-        if _TRAPFREE and name in _STDLIB_TF_BARE and name not in env:   # a bare-imported trap-free stdlib function
-            _eval_args(node.args, env, ctx)                  # (from os.path import dirname); arguments trap-checked
+        _bq = getattr(node.func, "_ts_stdlib", None)         # a bare name bound by `from <module> import <name>`
+        if _TRAPFREE and _bq is not None and name not in env:   # to an allowlisted trap-free stdlib function
+            _bargs = _eval_args(node.args, env, ctx)         # (from os.path import dirname); arguments trap-checked
+            _bkw = {kw.arg: ev(kw.value, env, ctx) for kw in node.keywords if kw.arg is not None}
             for kw in node.keywords:
-                ev(kw.value, env, ctx)
-            return _safe_stdlib_result(next(q for q in _STDLIB_TF if q.split(".")[-1] == name))
+                if kw.arg is None:
+                    ev(kw.value, env, ctx)
+            _res = _stdlib_tf_call(_bq, _bargs, _bkw, ctx, starred=any(kw.arg is None for kw in node.keywords))
+            if _res is not None:
+                return _res
         if BEST_EFFORT:                                      # assume the unmodeled call is well-behaved (tainted)
             _eval_args(node.args, env, ctx)
             for kw in node.keywords:
@@ -5166,21 +7596,22 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             return _SafeContainer("chainfi", length=n, unsized=True)
         if (isinstance(node.func.value, ast.Attribute) and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id == "os" and node.func.value.attr == "path" and "os" not in env):
-            # os.path string functions never raise on str input. split / splitext / splitdrive return a 2-tuple of
-            # strings; basename / dirname / join / normpath / normcase / commonprefix return a string; isabs / exists /
-            # isfile / isdir / islink / lexists / ismount return a bool. Filesystem-raising ones (getsize, ...) decline.
+            # os.path string functions never raise on str input, a NUL included. split / splitext / splitdrive return
+            # a 2-tuple of strings; basename / dirname / join / normpath / normcase return a string; isabs / exists /
+            # isfile / isdir / islink / lexists return a bool. One str argument (join: one or more); any other
+            # argument or arity takes the general path below (the trap-free models' TypeError, or abstention).
             ospm = node.func.attr
-            if ospm in ("split", "splitext", "splitdrive", "basename", "dirname", "join", "normpath", "normcase",
-                        "commonprefix", "isabs", "exists", "isfile", "isdir", "islink", "lexists", "ismount"):
-                for a in node.args:
-                    ev(a.value if isinstance(a, ast.Starred) else a, env, ctx)   # trap-check arguments
-                for kw in node.keywords:
-                    ev(kw.value, env, ctx)
-                if ospm in ("split", "splitext", "splitdrive"):
-                    return (z3.FreshConst(z3.StringSort(), "osp_a"), z3.FreshConst(z3.StringSort(), "osp_b"))
-                if ospm in ("isabs", "exists", "isfile", "isdir", "islink", "lexists", "ismount"):
-                    return z3.FreshConst(z3.BoolSort(), "osp_b")
-                return z3.FreshConst(z3.StringSort(), "osp")
+            if (ospm in ("split", "splitext", "splitdrive", "basename", "dirname", "join", "normpath", "normcase",
+                         "isabs", "exists", "isfile", "isdir", "islink", "lexists")
+                    and not node.keywords and not any(isinstance(a, ast.Starred) for a in node.args)
+                    and (len(node.args) == 1 or (ospm == "join" and len(node.args) >= 1))):
+                _ospv = [ev(a, env, ctx) for a in node.args]   # trap-check the arguments
+                if all(_is_str(v) for v in _ospv):
+                    if ospm in ("split", "splitext", "splitdrive"):
+                        return (z3.FreshConst(z3.StringSort(), "osp_a"), z3.FreshConst(z3.StringSort(), "osp_b"))
+                    if ospm in ("isabs", "exists", "isfile", "isdir", "islink", "lexists"):
+                        return z3.FreshConst(z3.BoolSort(), "osp_b")
+                    return z3.FreshConst(z3.StringSort(), "osp")
         if isinstance(node.func.value, ast.Name):            # module function: math.fabs(x), ...
             qual = node.func.value.id + "." + node.func.attr
             if qual == "math.sqrt" and len(node.args) == 1:
@@ -5300,6 +7731,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 parts = [ev(a, env, ctx) for a in node.args]
                 for kw in node.keywords:
                     ev(kw.value, env, ctx)                     # fillvalue is trap-checked
+                if any(_definitely_not_iterable(p) or _is_fp(p) or isinstance(p, _NoneVal) for p in parts):
+                    if ctx.traps is not None:                  # zip_longest calls iter() on each argument at once
+                        _trap_add(ctx, ctx.pc, ("TypeError",))
+                    return _Opaque("zip_longest")
                 if parts and all(isinstance(p, _SafeContainer) or _is_str(p) or isinstance(p, tuple) for p in parts):
                     m = None
                     for p in parts:
@@ -5314,6 +7749,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 # PRODUCT of the argument lengths (trap free; product() with no args is the single empty tuple, length
                 # 1). A non-sized argument keeps it an opaque, lazily-consumed iterable.
                 parts = [ev(a, env, ctx) for a in node.args]
+                if any(_definitely_not_iterable(p) or _is_fp(p) or isinstance(p, _NoneVal) for p in parts):
+                    if ctx.traps is not None:                  # product consumes each argument at once
+                        _trap_add(ctx, ctx.pc, ("TypeError",))
+                    return _Opaque("product")
                 if all(isinstance(p, _SafeContainer) or _is_str(p) or isinstance(p, tuple) for p in parts):
                     total = z3.IntVal(1)
                     for p in parts:
@@ -5333,7 +7772,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 else:
                     raise Unsupported("itertools.pairwise of a non-sized iterable")
                 return _SafeContainer("pairwise", length=z3.If(n - 1 >= 0, n - 1, z3.IntVal(0)),
-                                      unsized=True, tuple_arity=2)
+                                      unsized=True, tuple_arity=2, tuple_protos=(_seq_elem_proto(it),) * 2)
             if (node.func.value.id == "itertools" and node.func.attr == "accumulate"
                     and "itertools" not in env and 1 <= len(node.args) <= 2 and not node.keywords):
                 # itertools.accumulate(it[, func]) yields len(it) running accumulations (a lazy iterator). The default
@@ -5343,8 +7782,8 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 if isinstance(it, _SafeContainer):
                     if len(node.args) == 2:
                         fn = node.args[1]
-                        acc = _container_element(it, ctx)
-                        elem = _container_element(it, ctx)
+                        acc = _container_element(it, ctx, tok=("i", 0))     # the first step folds elements 0 and 1:
+                        elem = _container_element(it, ctx, tok=("i", 1))    # two distinct elements, so independent
                         saved = ctx.pc
                         ctx.pc = z3.And(ctx.pc, _container_len(it, ctx) >= 2)   # func runs only on >= 2 elements
                         try:
@@ -5362,10 +7801,11 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 init = ev(node.args[2], env, ctx) if len(node.args) == 3 else None
                 fn = node.args[0]
                 if isinstance(seq, _SafeContainer):
-                    acc = init if init is not None else _container_element(seq, ctx)
-                    elem = _container_element(seq, ctx)
-                    saved = ctx.pc
-                    ctx.pc = z3.And(ctx.pc, _container_len(seq, ctx) >= 1)   # f runs only on a non-empty iterable
+                    acc = init if init is not None else _container_element(seq, ctx, tok=("i", 0))   # the first step
+                    elem = _container_element(seq, ctx, tok=("i", 1) if init is None else None)      # folds elements
+                    saved = ctx.pc                                                                   # 0 and 1 (or
+                    ctx.pc = z3.And(ctx.pc, _container_len(seq, ctx) >= 1)   # f runs only on a non-empty iterable;
+                    #                                                          init and an arbitrary element)
                     try:
                         _apply_fold_fn(fn, acc, elem, env, ctx)   # surface a per-step trap (a // b on a zero element)
                     finally:
@@ -5529,26 +7969,52 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     return _SafeContainer("fromhex", byteslike=True, immutable=_imm, length=z3.IntVal(0))
                 return _SafeContainer("fromhex", byteslike=True, immutable=_imm, length=z3.IntVal(len(_parsed)))
             if (node.func.value.id == "re" and "re" not in env and node.func.attr in
-                    ("match", "search", "fullmatch", "findall", "sub", "subn", "split", "finditer")):
+                    ("match", "search", "fullmatch", "findall", "sub", "subn", "split", "finditer", "compile")):
                 # a CONSTANT compilable pattern makes the call total; a non-constant pattern can raise re.error
-                # (UNKNOWN). match/search/fullmatch return Optional[Match] (None); findall/split a list;
-                # sub/subn/finditer an opaque value.
+                # (UNKNOWN). match / search / fullmatch return a Match exactly when the translated pattern matches
+                # (_re_call), else None; findall / split a sequence of strings; compile a pattern object.
                 if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
-                    import re as _re_runtime
-                    try:
-                        _re_runtime.compile(node.args[0].value)
-                    except _re_runtime.error:
+                    fa = node.func.attr
+                    pat = node.args[0].value
+                    rest = [ev(a, env, ctx) for a in node.args[1:]]   # trap-check the remaining arguments
+                    kw = {k.arg: ev(k.value, env, ctx) for k in node.keywords if k.arg is not None}
+                    if any(k.arg is None for k in node.keywords):
+                        raise Unsupported("re.%s(**kwargs)" % fa)
+                    fpos = {"match": 2, "search": 2, "fullmatch": 2, "findall": 2, "finditer": 2, "compile": 1,
+                            "split": 3, "sub": 4, "subn": 4}[fa]
+                    fl = rest[fpos - 1] if len(rest) >= fpos else kw.get("flags", z3.IntVal(0))
+                    fls = z3.simplify(_as_int(fl)) if z3.is_expr(fl) else None
+                    if fls is None or not z3.is_int_value(fls):
+                        raise Unsupported("re.%s with non-constant flags" % fa)
+                    flags = fls.as_long()
+                    if _re_groups(pat, flags) is None:
                         raise Unsupported("re pattern does not compile (re.error)")
-                    for a in node.args[1:]:
-                        ev(a, env, ctx)                        # trap-check the remaining arguments
-                    if node.func.attr in ("match", "search", "fullmatch"):
-                        return _NoneVal()
-                    if node.func.attr in ("findall", "split"):
-                        return _SafeContainer(node.func.attr)
-                    return _Opaque(node.func.attr)
+                    if fa == "compile":
+                        return _RePattern(pat, flags, _re_groups(pat, flags)[0])
+                    subj = rest[0] if rest else kw.get("string")
+                    if fa in ("sub", "subn"):
+                        subj = rest[1] if len(rest) >= 2 else kw.get("string")
+                        repl = node.args[1] if len(node.args) >= 2 else None
+                        if not (isinstance(repl, ast.Constant) and isinstance(repl.value, str)):
+                            raise Unsupported("re.%s with a non-constant replacement (a callable runs per match)" % fa)
+                    if subj is None:
+                        raise Unsupported("re.%s without a subject" % fa)
+                    if fa in ("match", "search", "fullmatch", "findall", "split"):
+                        exact = not (fa == "split" and (len(rest) >= 2 or "maxsplit" in kw))   # a maxsplit bound
+                        return _re_call(fa, pat, subj, ctx, flags, exact=exact)   # leaves the part count open
+                    if not _is_str(subj):
+                        raise Unsupported("re.%s on a subject of unmodeled type" % fa)
+                    _note_overapprox(ctx, "the text re.%s() produces" % fa)
+                    out = z3.FreshConst(_SS, "resub")
+                    if fa == "sub":
+                        return out
+                    n = z3.FreshInt("resubn")
+                    if ctx.facts is not None:
+                        ctx.facts.append(n >= 0)
+                    return (out, n)
                 raise Unsupported("re with a non-constant pattern (may raise re.error)")
             if qual in _STDLIB:
-                return _STDLIB[qual](_eval_args(node.args, env, ctx))
+                return _stdlib_apply(qual, _eval_args(node.args, env, ctx), ctx)
         # torch.nn.functional.X(t, ...), or F.X(t, ...) where the module binds F to torch.nn.functional
         if ((isinstance(node.func.value, ast.Name) and node.func.value.id in ctx.func_aliases
              and node.func.value.id not in env)
@@ -5560,7 +8026,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             res = _nn_module_ctor(node.func.attr, node, env, ctx)   # the dotted torch.nn.Linear(...) form
             if res is not None:
                 return res
-        recv = ev(node.func.value, env, ctx)
+        recv = _unwrap_none(ev(node.func.value, env, ctx), ctx, "AttributeError")   # None.m(): AttributeError
         meth = node.func.attr
         a = [ev(x, env, ctx) for x in node.args]
         if _TRAPFREE:                                        # a pure trap-free stdlib call (os.path.join, time.time, ...)
@@ -5568,16 +8034,26 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             _root = node.func.value
             while isinstance(_root, ast.Attribute):
                 _root = _root.value
-            if _dotted is not None and isinstance(_root, ast.Name) and _root.id not in env:
-                _res = _safe_stdlib_result(_dotted)
-                if _res is not None:
-                    for kw in node.keywords:                 # keyword arguments are trap-checked too
+            _dotted = getattr(node.func, "_ts_stdlib", None) or _dotted   # resolved through `import m as alias`
+            if _dotted is not None and isinstance(_root, ast.Name) and _root.id not in env and _dotted in _STDLIB_TF:
+                _dkw = {kw.arg: ev(kw.value, env, ctx) for kw in node.keywords if kw.arg is not None}
+                for kw in node.keywords:                     # keyword arguments are trap-checked too
+                    if kw.arg is None:
                         ev(kw.value, env, ctx)
+                _res = _stdlib_tf_call(_dotted, a, _dkw, ctx, starred=any(kw.arg is None for kw in node.keywords))
+                if _res is not None:
                     return _res
+                raise Unsupported("%s is not provided by this interpreter" % _dotted)
         if isinstance(recv, _NoneVal):                       # None.method() raises AttributeError: a reachable trap
             if ctx.traps is not None:                        # (the arguments above are still trap-checked first)
                 _trap_add(ctx, ctx.pc, ("AttributeError",))
             return _Opaque("nonemethod")
+        if isinstance(recv, _MatchObj):                      # a Match object's group / start / end / span
+            return _match_method(recv, meth, a, node, ctx)
+        if isinstance(recv, _RePattern):                     # a compiled pattern's match / search / ... on a subject
+            if meth in ("match", "search", "fullmatch", "findall", "split") and len(a) == 1 and not node.keywords:
+                return _re_call(meth, recv.pattern, a[0], ctx, recv.flags)
+            raise Unsupported("Pattern.%s with this signature" % meth)
         if isinstance(recv, _NdArray):                       # ndarray / tensor methods: reshape, reductions, ...
             res = _nd_method(recv, meth, a, node, env, ctx)
             if res is not None:                              # (an unmodeled ndarray method falls through to the
@@ -5669,17 +8145,31 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         # an index, or any None-trapping operation is a TypeError (modeled by the None machinery): a default
         # argument, an `is None` / truthiness guard, or an `x or default` makes it safe. With a default the
         # result is the value or that default, never None. (A locally-built dict keeps its tracked-key semantics.)
-        if meth == "get" and isinstance(recv, _DictParam) and not BEST_EFFORT:
-            if len(a) >= 2:
-                return z3.FreshInt("getdef")                  # d.get(k, default): the value or the default, never None
-            if len(a) == 1:
-                return _NoneVal()                             # d.get(k): None when k is absent
+        if meth == "get" and isinstance(recv, _DictParam) and not BEST_EFFORT and 1 <= len(a) <= 2:
+            mem = _dict_member(recv, a[0])                    # d.get(k[, default]): the value when k is present, else
+            if mem is None:                                   # the default (None when omitted)
+                _note_overapprox(ctx, "dict.get() with a key of an unmodeled type")
+                mem = z3.FreshConst(z3.BoolSort(), "getmem")
+            val = _dparam_value(recv, a[0], node.func.value.id if isinstance(node.func.value, ast.Name) else None, ctx)
+            dflt = a[1] if len(a) == 2 else _NoneVal()
+            if type(dflt) is _NoneVal:
+                return _maybe_none(z3.Not(mem), val)
+            if z3.is_expr(dflt) and z3.is_expr(val) and dflt.sort() == val.sort():
+                return z3.If(mem, val, dflt)
+            return _Opaque("getdef")                          # a default of another type: either one, unmodeled
         if meth in ("keys", "values", "items") and isinstance(recv, _DictParam) and not a:
             # a dict view (d.keys() / d.values() / d.items()) is sized and iterable but NOT subscriptable (like a set):
             # its length is len(d), so list(view) / sorted(view) / sum(view) decide and max(view) is the empty-dict
             # ValueError; a len(d) guard proves a guarded max. view[i] is a TypeError. items() yields (k, v) 2-tuples.
-            return _SafeContainer(meth, unindexable=True, length=_container_len(recv, ctx),
-                                  tuple_arity=2 if meth == "items" else None)
+            vp = recv.valproto                                # the views carry the key / value types
+            if meth == "keys":
+                return _SafeContainer(meth, unindexable=True, length=_container_len(recv, ctx), scalar=recv.keyproto)
+            if meth == "values":
+                return _SafeContainer(meth, unindexable=True, length=_container_len(recv, ctx),
+                                      scalar=_valproto_scalar(vp),
+                                      elem=vp if isinstance(vp, _SafeContainer) else None)
+            return _SafeContainer(meth, unindexable=True, length=_container_len(recv, ctx), tuple_arity=2,
+                                  tuple_protos=(recv.keyproto, vp))
         # a.union(b) / a.intersection(b) / a.difference(b) / a.symmetric_difference(b) between two set-like
         # containers is the matching set operation, modeled with the operand-defined content (like | & - ^).
         if (meth in ("union", "intersection", "difference", "symmetric_difference")
@@ -5704,6 +8194,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         if isinstance(recv, _SafeContainer) and recv.byteslike and not recv.unindexable:
             if meth == "hex" and not a:                       # bytes.hex() -> a str of hex digits, never raises
                 return z3.FreshConst(z3.StringSort(), "hex")
+            if meth == "decode" and not node.keywords:
+                res = _bytes_decode(recv, a, ctx)
+                if res is not None:
+                    return res
             if (meth in ("startswith", "endswith") and len(a) >= 1 and ctx.facts is not None
                     and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, bytes)):
                 sw = z3.FreshConst(z3.BoolSort(), meth)       # b.startswith(const_prefix): a bool whose truth implies b
@@ -5777,7 +8271,9 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             return ev(callee.body, callenv, ctx)
         return _Opaque("call")
     if isinstance(node, ast.Subscript):
-        base = ev(node.value, env, ctx)
+        base = _unwrap_none(ev(node.value, env, ctx), ctx)   # a possibly-None base: TypeError where it is None
+        if isinstance(base, _MatchObj) and not isinstance(node.slice, ast.Slice):   # m[g] is m.group(g)
+            return _match_group_value(base, _match_group_index(base, ev(node.slice, env, ctx), ctx), ctx)
         if isinstance(base, _NoneVal):                       # None[k] raises TypeError (not subscriptable): a trap
             if ctx.traps is not None:
                 ctx.traps.append(ctx.pc)
@@ -5867,7 +8363,7 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if z3.is_expr(idx) and idx.sort() == z3.IntSort():
                 if ctx.traps is not None:
                     _trap_add(ctx, z3.And(ctx.pc, z3.Or(idx < -base.length, idx >= base.length)), ("IndexError",))   # IndexError
-                return z3.FreshConst(z3.StringSort(), "splitelem")
+                return _strseq_element(base, z3.If(idx < 0, idx + base.length, idx), ctx)
             raise Unsupported("split-result index is not an integer")
         if _TRAPFREE and isinstance(base, _DefaultDict):
             if isinstance(node.slice, ast.Slice):
@@ -5881,17 +8377,10 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             mem = _dict_member(base, kt)
             if mem is not None and ctx.traps is not None:
                 _trap_add(ctx, z3.And(ctx.pc, z3.Not(mem)), ("KeyError",))   # KeyError when the key is not present
-                if (isinstance(node.value, ast.Name) and node.value.id in getattr(ctx, "readonly_dicts", ())):
-                    # a read-only dict's d[k] is a fixed function of k -- memoize it so re-reading the same key gives
-                    # ONE value, making a guard `if d[k] != 0:` protect a later `10 // d[k]` (else the two reads were
-                    # independent fresh values and the division falsely refuted). For dict[K, V], the value is a fresh
-                    # V (named per key, so distinct keys get distinct lengths) -- so d[k][i] / d[k].append / len(d[k])
-                    # decide for dict[str, list].
-                    ck = (node.value.id, str(kt))
-                    if ck not in ctx.dval_cache:
-                        ctx.dval_cache[ck] = _dict_value_term(base.valproto, "dval_%d" % len(ctx.dval_cache))
-                    return ctx.dval_cache[ck]
-                return z3.FreshInt("dval")
+                # a read-only dict's d[k] is a fixed function of k -- memoized, so re-reading the same key gives ONE
+                # value and a guard `if d[k] != 0:` protects a later `10 // d[k]`. For dict[K, V] the value is a fresh
+                # V, so d[k][i] / d[k].append / len(d[k]) decide for dict[str, list].
+                return _dparam_value(base, kt, node.value.id if isinstance(node.value, ast.Name) else None, ctx)
             raise Unsupported("dict subscript with an unmodeled key type")
         if _TRAPFREE and isinstance(base, _SafeContainer) and base.unsized:
             # a lazy iterator (zip / itertools.chain / ...) is not subscriptable: it[i] / it[a:b] are TypeErrors.
@@ -5905,11 +8394,23 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
             if ctx.traps is not None:
                 _trap_add(ctx, ctx.pc, ("TypeError",))
             return _Opaque("itersub")
+        if isinstance(base, _SafeContainer) and base.arr is not None and not isinstance(node.slice, ast.Slice):
+            idx = ev(node.slice, env, ctx)                   # an array-backed list (a loop engine's read-only list
+            if z3.is_expr(idx) and (z3.is_int(idx) or z3.is_bool(idx)):   # parameter): bounds-checked, the element
+                idx = _as_int(idx)                           # the array holds at the normalized index
+                n = _container_len(base, ctx)
+                if ctx.traps is not None:
+                    _trap_add(ctx, z3.And(ctx.pc, z3.Or(idx < -n, idx >= n)), ("IndexError",))
+                return z3.Select(base.arr, z3.If(idx < 0, idx + n, idx))
+            raise Unsupported("a list indexed by a non-integer")
         if _TRAPFREE and isinstance(base, _Opaque) and not isinstance(base, _DictLit):
             if isinstance(node.slice, ast.Slice):            # a slice of an opaque value never traps (Python clamps),
                 if isinstance(base, _SafeContainer) and not base.unindexable:   # a list / tuple / bytes slice is a
                     L = _slice_len(_container_len(base, ctx), node.slice, env, ctx)   # sequence sized by the slice
-                    return _SafeContainer("slice", immutable=base.immutable, length=L, byteslike=base.byteslike)
+                    return _SafeContainer("slice", immutable=base.immutable, length=L, byteslike=base.byteslike,
+                                          scalar=getattr(base, "scalar", None),   # of the same element type: a
+                                          tuple_arity=base.tuple_arity, elem=base.elem,   # window onto the source's
+                                          rkey=base.rkey if base.rkey is not None else base, related=True)   # elements
                 for b in (node.slice.lower, node.slice.upper, node.slice.step):   # but a bound expression can (10 // k)
                     if b is not None:
                         ev(b, env, ctx)
@@ -5928,19 +8429,21 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                     and z3.is_expr(idx) and idx.sort() == z3.IntSort():
                 n = _container_len(base, ctx)                # bounds VC: IndexError when the index leaves [-len, len)
                 _trap_add(ctx, z3.And(ctx.pc, z3.Or(idx < -n, idx >= n)), ("IndexError",))
+                if base.arr is not None:                     # an array-backed list: the element at the index itself
+                    return z3.Select(base.arr, z3.If(idx < 0, idx + n, idx))
+                _ci = z3.simplify(idx)                       # a fresh element per read: register the read, so a second
+                _elem_read(ctx, base, ("i", _ci.as_long() if z3.is_int_value(_ci) else None))   # read that may name
                 if base.tuple_arity is not None:             # zip / enumerate / items element: a fixed N-tuple
-                    return tuple(z3.FreshInt("telem") for _ in range(base.tuple_arity))
+                    return _container_element(base, ctx, "telem", register=False)   # this element over-approximates
                 if isinstance(base.elem, _SafeContainer):    # list[list[..]] etc.: the element is an inner sequence
                     pr = base.elem                           # whose length is a per-index uninterpreted function, so a
                     ilen = z3.Function("ilen_" + base.name, z3.IntSort(), z3.IntSort())(idx)   # len(c[i]) guard
                     if ctx.facts is not None:                # constrains c[i][j]; nonnegative by construction
                         ctx.facts.append(ilen >= 0)
                     return _SafeContainer(base.name + "_e", immutable=pr.immutable, length=ilen,
-                                          unindexable=pr.unindexable, byteslike=pr.byteslike, elem=pr.elem)
-                elem = z3.FreshInt("helem")
-                if base.byteslike and ctx.facts is not None:   # a bytes / bytearray element is exactly an int in [0, 255]
-                    ctx.facts.append(z3.And(elem >= 0, elem <= 255))
-                return elem
+                                          unindexable=pr.unindexable, byteslike=pr.byteslike, elem=pr.elem,
+                                          scalar=pr.scalar)
+                return _elem_value(base, "helem", ctx)       # an element of the annotated type (an int by default)
             if BEST_EFFORT:                                  # the opaque index is assumed in bounds (lower trust)
                 _best_effort_assume()
                 return z3.FreshInt("be_idx")
@@ -5954,6 +8457,17 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 ev(node.slice, env, ctx)
             _best_effort_assume()
             return _Opaque("be_sub")
+        if (_TRAPFREE and ctx.traps is not None and z3.is_expr(base)
+                and (z3.is_int(base) or z3.is_bool(base) or _is_fp(base))
+                and not (z3.is_const(base) and base.decl().name() in getattr(ctx, "guessed_params", frozenset()))):
+            if isinstance(node.slice, ast.Slice):            # a number is not subscriptable: TypeError (a guessed
+                for b in (node.slice.lower, node.slice.upper, node.slice.step):   # parameter's reading is no fact)
+                    if b is not None:
+                        ev(b, env, ctx)
+            else:
+                ev(node.slice, env, ctx)
+            _exact_trap(ctx, z3.BoolVal(True), ("TypeError",))
+            return _Opaque("numidx")
         raise Unsupported("subscript of a non-string value")
     if isinstance(node, ast.Attribute):
         if (isinstance(node.value, ast.Name) and node.value.id == "math" and "math" not in env
@@ -5962,7 +8476,24 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
         if (isinstance(node.value, ast.Name) and node.value.id == "string" and "string" not in env
                 and node.attr in _STRING_CONSTS):
             return z3.StringVal(_STRING_CONSTS[node.attr])   # string.ascii_lowercase / digits / punctuation / ...
-        v = ev(node.value, env, ctx)
+        v = _unwrap_none(ev(node.value, env, ctx), ctx, "AttributeError")   # None.x: AttributeError where it is None
+        if isinstance(v, _MatchObj):
+            if node.attr == "string":
+                return v.subject
+            if node.attr == "pos":
+                return z3.IntVal(0)
+            if node.attr == "endpos":
+                return z3.Length(v.subject)
+            raise Unsupported("Match.%s" % node.attr)
+        if isinstance(v, _RePattern):
+            if node.attr == "pattern":
+                return z3.StringVal(v.pattern)
+            if node.attr == "groups":
+                return z3.IntVal(v.ngroups)
+            if node.attr == "flags":
+                import re as _re_rt
+                return z3.IntVal(_re_rt.compile(v.pattern, v.flags).flags)
+            raise Unsupported("Pattern.%s" % node.attr)
         if isinstance(v, _Complex):
             if node.attr == "real":
                 return v.re
@@ -5992,12 +8523,22 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 return z3.FreshInt("dirty_" + node.attr)       # (possibly via aliasing): an unconstrained value, not the
             return _FieldVal(base + "." + node.attr)         # stable field. o.x + o.y decides; len / method / subscript opaque
         return _Opaque("attr")                               # attribute access raises at most AttributeError
+    if isinstance(node, ast.GeneratorExp) and getattr(node, "_ts_lazy", False):
+        # a generator its function never consumes (returned / discarded): creating it evaluates only the first
+        # iterable and iter() of it; the element, the conditions and the inner iterables never run here
+        it = ev(node.generators[0].iter, env, ctx)
+        if _definitely_not_iterable(it) and ctx.traps is not None:
+            _trap_add(ctx, ctx.pc, ("TypeError",))
+        return _Opaque("generator")
     if _TRAPFREE and isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
         env2 = dict(env)                                     # a comprehension: trap-check the iterables, element,
-        iters = []                                           # and filters with the targets as arbitrary integers
+        iters = []                                           # and filters with the targets as arbitrary elements
+        old_pc = ctx.pc
         for gen in node.generators:
-            it = ev(gen.iter, env2, ctx)                     # the iterable is evaluated (trap-checked) regardless
-            iters.append(it)
+            it = ev(gen.iter, env2, ctx)                     # the first iterable is evaluated (trap-checked) regardless;
+            iters.append(it)                                 # an inner one only once the outer ones yield an element
+            if isinstance(it, _SafeContainer) and len(node.generators) > 1:
+                ctx.pc = z3.And(ctx.pc, _container_len(it, ctx) >= 1)
             if (isinstance(gen.target, (ast.Tuple, ast.List))
                     and ctx.traps is not None and not BEST_EFFORT):   # `[e for a, b in xs]`: an element of non-k-tuple
                 _k = len(gen.target.elts)                             # shape raises on unpack unless the iterable is a
@@ -6005,27 +8546,17 @@ def ev(node, env: Dict[str, z3.ExprRef], ctx: Ctx) -> z3.ExprRef:
                 if _ar != _k and not _unpack_arity_ok(gen.iter, _k):  # fixed-arity builtin (enumerate/zip/zip_longest)
                     _ne = (_container_len(it, ctx) >= 1) if isinstance(it, _SafeContainer) else z3.BoolVal(True)
                     ctx.traps.append(z3.And(ctx.pc, _ne))
-            if _is_str(it) and isinstance(gen.target, ast.Name):   # iterating a string yields 1-char strings, so the
-                cs = z3.String("hc_" + gen.target.id)              # element's ord(c) / len(c) / c == '?' is modeled
-                if ctx.facts is not None:
-                    ctx.facts.append(z3.Length(cs) == 1)
-                env2[gen.target.id] = cs
-            elif (isinstance(it, _SafeContainer) and it.byteslike and not it.unindexable
-                  and isinstance(gen.target, ast.Name)):           # a bytes / bytearray element is an int in [0, 255]
-                _be = z3.FreshInt("hc_" + gen.target.id)
-                if ctx.facts is not None:
-                    ctx.facts.append(z3.And(_be >= 0, _be <= 255))
-                env2[gen.target.id] = _be
-            else:
-                for t in _target_names(gen.target):
-                    env2[t] = z3.FreshInt("hc_" + t)
+            _bind_iter_target(gen.target, it, env2, ctx, "hc")   # the target(s): an element of the iterable's type
         # the filters and element run only when the iterable yields at least one element; for a single-generator
         # comprehension over a sized container, condition their traps on len(iterable) >= 1, so a trap in the
         # element is not flagged for an input that empties the iterable -- the 10 // n in [.. for i in range(1, n)]
         # is unreachable at n == 0 (range(1, 0) is empty), not a crash (the NormalDist.quantiles(0) false positive).
-        old_pc = ctx.pc
         if len(node.generators) == 1 and isinstance(iters[0], _SafeContainer):
             ctx.pc = z3.And(old_pc, _container_len(iters[0], ctx) >= 1)
+        elif len(node.generators) == 1 and isinstance(iters[0], _StrSeq) and iters[0].length is not None:
+            ctx.pc = z3.And(old_pc, iters[0].length >= 1)
+        elif len(node.generators) == 1 and _is_str(iters[0]):
+            ctx.pc = z3.And(old_pc, z3.Length(iters[0]) >= 1)
         for gen in node.generators:
             for cond in gen.ifs:
                 ev(cond, env2, ctx)
@@ -6097,29 +8628,226 @@ def _container_len(c, ctx):
     if explicit is not None:
         return explicit
     n = z3.Int("len_" + c.name)
-    if ctx.facts is not None:
-        ctx.facts.append(n >= 0)
+    if ctx.facts is not None:                                # a CPython container holds at most sys.maxsize items
+        ctx.facts.append(z3.And(n >= 0, n <= sys.maxsize))   # (its length is a Py_ssize_t)
     return n
 
 
-def _container_element(container, ctx):
-    """A fresh value for an arbitrary element of `container`, the same kind container[i] yields: an inner sequence for
-    list[list]/list[str], a byte in [0,255] for bytes/bytearray, else an int."""
+def _proto_value(p, ctx, nm):
+    """A fresh value described by an element prototype: a scalar kind ('int' / 'str' / 'float' / 'bool'), a sequence
+    or dict prototype, a z3 term (its sort), or None (an int, the default reading)."""
+    if isinstance(p, _SafeContainer):
+        ln = z3.FreshInt(nm + "_len")
+        if ctx is not None and ctx.facts is not None:
+            ctx.facts.append(ln >= 0)
+        return _SafeContainer(z3.FreshInt(nm).decl().name(), immutable=p.immutable, length=ln,
+                              unindexable=p.unindexable, byteslike=p.byteslike, elem=p.elem, scalar=p.scalar,
+                              tuple_arity=p.tuple_arity, tuple_protos=p.tuple_protos)
+    if isinstance(p, _DictParam):
+        return _DictParam(z3.FreshInt(nm).decl().name(), valproto=p.valproto, keyproto=p.keyproto)
+    if isinstance(p, tuple):                                 # a nested fixed tuple: one value per position
+        return tuple(_proto_value(q, ctx, "%s_%d" % (nm, i)) for i, q in enumerate(p))
+    if isinstance(p, str):
+        if p == "bytes":
+            return _SafeContainer(z3.FreshInt(nm).decl().name(), byteslike=True, immutable=True)
+        if p == "opaque":                                    # an element of an iterable the engine does not model
+            return _Opaque(nm)
+        return _fresh_scalar(p, nm)
+    if z3.is_expr(p):                                        # one of a literal's values, read as any of its sort
+        if ctx is not None:
+            _note_overapprox(ctx, "an element of a literal sequence")
+        return z3.FreshConst(p.sort(), nm)
+    return z3.FreshInt(nm)
+
+
+def _proto_key(p):
+    """A comparable descriptor of an element prototype (see _proto_value)."""
+    if p is None or isinstance(p, str):
+        return p
+    if isinstance(p, tuple):
+        return tuple(_proto_key(q) for q in p)
+    if isinstance(p, (_SafeContainer, _DictParam)):
+        return _value_reading(p)
+    if z3.is_expr(p):
+        return ("z3", p.sort().sexpr())
+    return "?"
+
+
+def _seq_elem_proto(c):
+    """The element prototype of a sequence value, for a tuple position that holds its elements (zip / enumerate)."""
+    if _is_str(c):
+        return "str"
+    if isinstance(c, _StrSeq):
+        return "str"
+    if type(c) is _DictParam:
+        return c.keyproto
+    if isinstance(c, _SafeContainer):
+        if c.tuple_arity is not None:
+            return tuple(c.tuple_protos or (None,) * c.tuple_arity)
+        if isinstance(c.elem, _SafeContainer):
+            return c.elem
+        if c.byteslike and not c.unindexable:
+            return None                                      # a byte: an int
+        return c.scalar
+    if isinstance(c, tuple) and c and all(z3.is_expr(v) for v in c) and len({v.sort().sexpr() for v in c}) == 1:
+        return c[0]                                          # a literal of one sort: a term of that sort
+    return "opaque"
+
+
+def _sorted_literal(x, keywords):
+    """sorted() of a literal sequence of integer constants, in CPython's own order: a tuple of z3 int values, or None
+    when an element is symbolic or not an int, or a keyword other than a constant reverse= is given."""
+    rev = False
+    for kw in keywords:
+        if kw.arg != "reverse" or not (isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool)):
+            return None
+        rev = kw.value.value
+    vals = []
+    for v in x:
+        if not (z3.is_expr(v) and z3.is_int_value(v)):
+            return None
+        vals.append(v.as_long())
+    return tuple(z3.IntVal(v) for v in sorted(vals, reverse=rev))
+
+
+def _elem_read(ctx, c, tok):
+    """Register a read of an element of container c and mark the over-approximation when its value may be related to
+    an earlier read's. An element is a fresh value per read, exact for one read and for reads of provably distinct
+    elements; two reads that may name one element (the same or a symbolic index, an arbitrary element, an aggregate)
+    would let a model disagree with itself, so the trap channel is told the state is over-approximated and a
+    refutation is withheld. `tok` is ('i', k) for a read at constant index k, ('i', None) for a symbolic index,
+    ('any',) for an arbitrary element (an iteration, an unpacking, a key= application), or ('sum' / 'min' / 'max',
+    id(c)) for an aggregate, one stable symbol per container, so repeating it reads nothing new. A copy, slice, or
+    sorted / reversed view registers on its source's pool (`rkey`); a rearranged view (`related`) makes every pair of
+    reads dependent. An array-backed list reads exactly and registers nothing, so a fresh value drawn from one (an
+    arbitrary element, a view) is over-approximated outright."""
+    if not isinstance(c, _SafeContainer) or getattr(ctx, "elem_reads", None) is None:
+        return
+    pool = c.rkey if c.rkey is not None else c
+    if c.arr is not None or pool.arr is not None:
+        _note_overapprox(ctx, "a fresh element of an array-backed list")
+        return
+    ent = ctx.elem_reads.get(id(pool))
+    if ent is None:
+        ctx.elem_reads[id(pool)] = (pool, [tok], bool(c.related))
+        return
+    _pool, toks, rel = ent
+    if c.related and not rel:
+        ctx.elem_reads[id(pool)] = (pool, toks, True)
+        rel = True
+    for prev in toks:
+        if prev == tok and tok[0] not in ("i", "any", "rest"):
+            continue                                              # the same stable aggregate symbol again
+        if (not rel and prev[0] == "i" and tok[0] == "i" and prev[1] is not None and tok[1] is not None
+                and prev[1] != tok[1] and (prev[1] >= 0) == (tok[1] >= 0)):
+            continue                                              # distinct constant indexes of one sign: distinct elements
+        first, other = (prev, tok) if prev[0] == "i" else (tok, prev)
+        if not rel and first[0] == "i" and first[1] == 0 and other[0] == "rest":
+            continue                                              # element 0 and an element of a later iteration
+        _note_overapprox(ctx, "a second read of a container's elements")
+        break
+    toks.append(tok)
+
+
+def _container_element(container, ctx, nm="keyelem", register=True, tok=None):
+    """A fresh value for an arbitrary element of `container`, the same kind container[i] yields: a tuple of
+    per-position values for zip / enumerate / dict.items, an inner sequence for list[list] / list[tuple], a byte in
+    [0, 255] for bytes / bytearray, else an element of the annotated scalar type (an int by default). The read is
+    registered on the container's element pool (_elem_read) as an arbitrary element, or as `tok` when the caller
+    knows which element it stands for (a fold's first step reads elements 0 and 1), unless the caller registered it."""
     if isinstance(container, _SafeContainer):
+        if register:
+            _elem_read(ctx, container, tok or ("any",))
         if container.tuple_arity is not None:
-            return tuple(z3.FreshInt("ketelem") for _ in range(container.tuple_arity))
+            protos = container.tuple_protos or (None,) * container.tuple_arity
+            return tuple(_proto_value(p, ctx, "%s_%d" % (nm, i)) for i, p in enumerate(protos))
         if isinstance(container.elem, _SafeContainer):
-            pr = container.elem
-            ln = z3.FreshInt("keyilen")
+            return _proto_value(container.elem, ctx, nm)
+        return _elem_value(container, nm, ctx)
+    return z3.FreshInt(nm)
+
+
+def _iter_element(it, ctx, nm, tok=None):
+    """The value an iteration over `it` binds to its target: a 1-char string for a str, a string for a string
+    sequence (a non-empty one for a whitespace split), a key of the annotated key type for a dict, the element
+    _container_element gives for a sequence (registered as `tok`: the first iteration reads element 0, the havoc'd
+    later ones a later element), one of the values of a literal tuple / list of one sort; for any other iterable an
+    opaque value, whose type the engine does not guess."""
+    known = None                                             # a literal's values: a tuple's, or a constant-length
+    if isinstance(it, tuple) and it and all(z3.is_expr(v) for v in it) and len({v.sort().sexpr() for v in it}) == 1:
+        known = list(it)                                     # array-backed container's (a bytes literal) by Select
+    elif (isinstance(it, _SafeContainer) and it.arr is not None and z3.is_expr(it.length)
+            and z3.is_int_value(it.length) and 0 < it.length.as_long() <= 64):
+        known = [z3.Select(it.arr, z3.IntVal(k)) for k in range(it.length.as_long())]
+    if known is not None:
+        if tok == ("i", 0):                                  # the exact first iteration binds the first value itself
+            return known[0]
+        if tok == ("rest",) and len(known) > 1:              # a later iteration binds one of the later values
+            known = known[1:]
+        x = z3.FreshConst(known[0].sort(), nm)               # otherwise one of the values (any order)
+        if ctx.facts is not None:
+            ctx.facts.append(z3.Or(*[x == v for v in known]))
+        return x
+    if _is_str(it):
+        cs = z3.FreshConst(_SS, nm)
+        if ctx.facts is not None:
+            ctx.facts.append(z3.Length(cs) == 1)
+        return cs
+    if isinstance(it, _StrSeq):
+        if it.part is not None and it.length is not None:    # an element at an arbitrary in-range position
+            k = z3.FreshInt(nm + "_i")
             if ctx.facts is not None:
-                ctx.facts.append(ln >= 0)
-            return _SafeContainer(container.name + "_ke", immutable=pr.immutable, length=ln,
-                                  unindexable=pr.unindexable, byteslike=pr.byteslike, elem=pr.elem)
-        elem = z3.FreshInt("keyelem")
-        if container.byteslike and ctx.facts is not None:
-            ctx.facts.append(z3.And(elem >= 0, elem <= 255))
-        return elem
-    return z3.FreshInt("keyelem")
+                ctx.facts.append(z3.Implies(it.length > 0, z3.And(k >= 0, k < it.length)))
+            return _strseq_element(it, k, ctx)
+        return _strseq_element(it, None, ctx)
+    if type(it) is _DictParam:
+        return _dict_key_term(it, nm)
+    if isinstance(it, _SafeContainer):
+        return _container_element(it, ctx, nm, tok=tok)
+    if isinstance(it, tuple) and it and all(z3.is_expr(v) for v in it) and len({v.sort().sexpr() for v in it}) == 1:
+        x = z3.FreshConst(it[0].sort(), nm)
+        if ctx.facts is not None:
+            ctx.facts.append(z3.Or(*[x == v for v in it]))
+        return x
+    return _Opaque(nm)
+
+
+def _strseq_element(seq, real, ctx):
+    """Element `real` (a normalized index term, or None for an arbitrary one) of string sequence `seq`: the concrete
+    part function's application when the sequence has one (a split), non-empty in range for a whitespace split;
+    otherwise an unconstrained string, an over-approximation."""
+    if seq.part is not None and real is not None:
+        el = seq.part(real)
+        if seq.nonempty and ctx.facts is not None and seq.length is not None:
+            ctx.facts.append(z3.Implies(z3.And(real >= 0, real < seq.length), z3.Length(el) >= 1))
+        return el
+    _note_overapprox(ctx, "an element of a string sequence")
+    w = z3.FreshConst(_SS, "strelem")
+    if seq.nonempty and ctx.facts is not None:
+        ctx.facts.append(z3.Length(w) >= 1)
+    return w
+
+
+def _bind_iter_target(target, it, env, ctx, prefix, tok=None):
+    """Bind a for / comprehension target to an arbitrary element of `it` (_iter_element, the read registered as
+    `tok`): a name to the element, a tuple of names to the element's positions (a fixed-arity tuple element) or to
+    elements of an inner sequence (its arity is a trap the caller checks); any other target shape gets opaque values."""
+    if isinstance(target, ast.Name):
+        env[target.id] = _iter_element(it, ctx, "%s_%s" % (prefix, target.id), tok)
+        return
+    names = _target_names(target)
+    if isinstance(target, (ast.Tuple, ast.List)) and all(isinstance(t, ast.Name) for t in target.elts):
+        el = _iter_element(it, ctx, prefix, tok)
+        if isinstance(el, tuple) and len(el) == len(target.elts):
+            for t, v in zip(target.elts, el):
+                env[t.id] = v
+            return
+        if type(el) is _SafeContainer and el.tuple_arity is None:
+            for t in target.elts:
+                env[t.id] = _container_element(el, ctx, "%s_%s" % (prefix, t.id))
+            return
+    for t in names:
+        env[t] = _Opaque("%s_%s" % (prefix, t))
 
 
 def _apply_key_callable(keynode, container, env, ctx):
@@ -6129,7 +8857,8 @@ def _apply_key_callable(keynode, container, env, ctx):
     declined to UNKNOWN."""
     if (isinstance(keynode, ast.Name) and keynode.id in ("str", "repr")
             and keynode.id not in env and keynode.id not in ctx.repo):
-        return                                               # str(x) / repr(x) is total -- no per-element trap
+        _elements_text_traps(container, ctx, keynode.id)      # str(x) / repr(x): only an int past the digit limit
+        return                                               # raises
     lam = ev(keynode, env, ctx) if isinstance(keynode, ast.Lambda) else \
         (env.get(keynode.id) if isinstance(keynode, ast.Name) else None)
     elem = _container_element(container, ctx)
@@ -6320,13 +9049,23 @@ def _elem_container_proto(elem_ann):
         b = elem_ann.id
     else:
         return None
+    sc = _ann_seq_scalar(elem_ann) if isinstance(elem_ann, ast.Subscript) else None   # the inner element type
     if b in ("list", "List", "Sequence", "MutableSequence"):
-        return _SafeContainer("elem")
+        return _SafeContainer("elem", scalar=sc)
     if b in ("tuple", "Tuple"):
-        return _SafeContainer("elem", immutable=True)
+        return _SafeContainer("elem", immutable=True, scalar=sc)
     if b in ("bytes", "bytearray"):
         return _SafeContainer("elem", immutable=(b == "bytes"), byteslike=True)
     return None
+
+
+def _ann_seq_scalar(ann):
+    """The scalar element kind of a parameterized sequence annotation (list[str] -> 'str'; tuple[int, ...] -> 'int';
+    tuple[int, str] -> None, its elements differing), else None."""
+    sl = ann.slice
+    elts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
+    kinds = {_ann_scalar_kind(e) for e in elts if not (isinstance(e, ast.Constant) and e.value is Ellipsis)}
+    return kinds.pop() if len(kinds) == 1 else None
 
 
 def _ann_value(ann):
@@ -6335,32 +9074,109 @@ def _ann_value(ann):
     or unmodeled type returns None (the read falls back to the fresh-int default)."""
     base = (ann.id if isinstance(ann, ast.Name)
             else ann.value.id if isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name) else None)
+    sub = isinstance(ann, ast.Subscript)
     if base in ("list", "List", "Sequence", "MutableSequence"):
-        return _SafeContainer("dvproto", elem=_elem_container_proto(ann.slice) if isinstance(ann, ast.Subscript) else None)
+        return _SafeContainer("dvproto", elem=_elem_container_proto(ann.slice) if sub else None,
+                              scalar=_ann_seq_scalar(ann) if sub else None)
     if base in ("tuple", "Tuple"):
-        return _SafeContainer("dvproto", immutable=True)
+        return _SafeContainer("dvproto", immutable=True, scalar=_ann_seq_scalar(ann) if sub else None)
     if base in ("set", "frozenset", "Set", "FrozenSet", "MutableSet"):
-        return _SafeContainer("dvproto", unindexable=True)
+        return _SafeContainer("dvproto", unindexable=True, scalar=_ann_seq_scalar(ann) if sub else None)
+    if base == "float":
+        return z3.FP("dvproto", _F64)
+    if base == "bool":
+        return z3.Bool("dvproto")
     if base in ("bytes", "bytearray"):
         return _SafeContainer("dvproto", byteslike=True, immutable=(base == "bytes"))
     if base == "str":
         return z3.String("dvproto")
     if base in ("dict", "Dict", "Mapping", "MutableMapping"):
-        return _DictParam("dvproto")
+        two = sub and isinstance(ann.slice, ast.Tuple) and len(ann.slice.elts) == 2
+        return _DictParam("dvproto", valproto=_ann_value(ann.slice.elts[1]) if two else None,
+                          keyproto=_ann_scalar_kind(ann.slice.elts[0]) if two else None)
     return None
 
 
 def _dict_value_term(valproto, nm):
     """A fresh value of a dict value type's prototype, named `nm` (so its symbolic length is distinct per dict key).
-    None / scalar prototype -> a fresh int (the default), so d[k] arithmetic stays modeled."""
+    None / int prototype -> a fresh int (the default), so d[k] arithmetic stays modeled."""
     if isinstance(valproto, _SafeContainer):
         return _SafeContainer(nm, byteslike=valproto.byteslike, immutable=valproto.immutable,
-                              unindexable=valproto.unindexable, elem=valproto.elem)
+                              unindexable=valproto.unindexable, elem=valproto.elem, scalar=valproto.scalar)
     if _is_str(valproto):
         return z3.String(nm)
     if isinstance(valproto, _DictParam):
-        return _DictParam(nm, valproto=valproto.valproto)
+        return _DictParam(nm, valproto=valproto.valproto, keyproto=valproto.keyproto)
+    if z3.is_expr(valproto) and _is_fp(valproto):
+        return z3.FP(nm, _F64)
+    if z3.is_expr(valproto) and z3.is_bool(valproto):
+        return z3.Bool(nm)
     return z3.FreshInt(nm)
+
+
+def _dparam_value(d, key, dname, ctx):
+    """The value d[key] reads from dict parameter `d` for a present key: for a read-only dict a fixed function of the
+    key (memoized per key, so a guard on one read protects another read of the same key), else a fresh value of the
+    annotated value type. Names are fresh, so reads in different symexec runs never alias."""
+    nm = z3.FreshInt("dval").decl().name()
+    if dname is not None and dname in getattr(ctx, "readonly_dicts", ()):
+        ck = (dname, str(key))
+        if ck not in ctx.dval_cache:
+            ctx.dval_cache[ck] = _dict_value_term(d.valproto, nm)
+        return ctx.dval_cache[ck]
+    return _dict_value_term(d.valproto, nm)
+
+
+def _ann_scalar_kind(ann):
+    """'int' / 'str' / 'float' / 'bool' / 'bytes' for a bare scalar element annotation, else None."""
+    if isinstance(ann, ast.Name) and ann.id in ("int", "str", "float", "bool", "bytes"):
+        return ann.id
+    return None
+
+
+def _scalar_term(name, kind):
+    """A named term of scalar kind 'int' / 'str' / 'float' / 'bool'."""
+    if kind == "str":
+        return z3.String(name)
+    if kind == "float":
+        return z3.FP(name, _F64)
+    if kind == "bool":
+        return z3.Bool(name)
+    return z3.Int(name)
+
+
+def _fresh_scalar(kind, nm):
+    """A fresh term of scalar kind 'int' / 'str' / 'float' / 'bool' (None: an int, the default reading)."""
+    if kind == "str":
+        return z3.FreshConst(_SS, nm)
+    if kind == "float":
+        return z3.FreshConst(_F64, nm)
+    if kind == "bool":
+        return z3.FreshConst(z3.BoolSort(), nm)
+    return z3.FreshInt(nm)
+
+
+def _dict_key_term(d, nm):
+    """A fresh key of dict parameter d: of its annotated key type, else an int (the default reading)."""
+    kp = getattr(d, "keyproto", None)
+    if kp == "bytes":
+        return _SafeContainer(z3.FreshInt(nm).decl().name(), byteslike=True, immutable=True)
+    return _fresh_scalar(kp, nm)
+
+
+def _valproto_scalar(vp):
+    """The scalar element kind a dict view of values carries, from the value prototype."""
+    if vp is None:
+        return None
+    if isinstance(vp, _DictParam):
+        return "opaque"                                      # a dict value: no scalar reading
+    if _is_str(vp):
+        return "str"
+    if z3.is_expr(vp) and _is_fp(vp):
+        return "float"
+    if z3.is_expr(vp) and z3.is_bool(vp):
+        return "bool"
+    return None
 
 
 def _param_term(arg):
@@ -6390,20 +9206,30 @@ def _param_term(arg):
     if isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name):
         base = ann.value.id                                 # a parameterized generic -- list[int], dict[str, int],
         if base in ("list", "List", "Sequence", "MutableSequence"):   # set[T], tuple[...], or a typing alias. A scalar
-            return _SafeContainer(arg.arg, elem=_elem_container_proto(ann.slice))   # element type is still ignored; a
+            return _SafeContainer(arg.arg, elem=_elem_container_proto(ann.slice),   # element type is recorded; a
+                                  scalar=_ann_scalar_kind(ann.slice))
         if base in ("tuple", "Tuple"):                      # *sequence* element type makes c[i] a nested sequence
             sl = ann.slice                                  # tuple[T1, .., Tn] is a fixed-arity tuple of exactly n
             n = z3.IntVal(1)                                 # elements; tuple[T, ...] is variadic; tuple[T] is a 1-tuple
             if isinstance(sl, ast.Tuple):
                 n = None if any(isinstance(e, ast.Constant) and e.value is Ellipsis for e in sl.elts) \
                     else z3.IntVal(len(sl.elts))             # the exact length, so x, y = t (arity n) raises no ValueError
-            return _SafeContainer(arg.arg, immutable=True, length=n, elem=_elem_container_proto(sl))
+            kinds = {_ann_scalar_kind(e) for e in (sl.elts if isinstance(sl, ast.Tuple) else [sl])
+                     if not (isinstance(e, ast.Constant) and e.value is Ellipsis)}
+            if n is not None and len(kinds) > 1 and isinstance(sl, ast.Tuple) \
+                    and all(_ann_scalar_kind(e) in ("int", "str", "float", "bool") for e in sl.elts):
+                # tuple[int, str, ...] of fixed arity and differing scalar types: a tuple of one typed term per
+                # position, so t[1] is the str it is (a sequence would read every element as one type)
+                return tuple(_scalar_term("%s__%d" % (arg.arg, i), _ann_scalar_kind(e)) for i, e in enumerate(sl.elts))
+            return _SafeContainer(arg.arg, immutable=True, length=n, elem=_elem_container_proto(sl),
+                                  scalar=kinds.pop() if len(kinds) == 1 else None)
         if base in ("set", "frozenset", "Set", "FrozenSet", "MutableSet"):
-            return _SafeContainer(arg.arg, unindexable=True)
+            return _SafeContainer(arg.arg, unindexable=True, scalar=_ann_scalar_kind(ann.slice))
         if base in ("dict", "Dict", "Mapping", "MutableMapping"):
-            vp = (_ann_value(ann.slice.elts[1])              # dict[K, V]: carry the value type V so a read-only
-                  if isinstance(ann.slice, ast.Tuple) and len(ann.slice.elts) == 2 else None)   # d[k] models a V
-            return _DictParam(arg.arg, valproto=vp)
+            two = isinstance(ann.slice, ast.Tuple) and len(ann.slice.elts) == 2
+            vp = _ann_value(ann.slice.elts[1]) if two else None   # dict[K, V]: carry the value type V so a read
+            kp = _ann_scalar_kind(ann.slice.elts[0]) if two else None   # d[k] models a V, and the key type K
+            return _DictParam(arg.arg, valproto=vp, keyproto=kp)
     if _is_object_annotation(ann):                           # a class / qualified / union annotation: an opaque
         return _Opaque(arg.arg)                              # receiver, so a scalar op on it is UNKNOWN, not a trap
     return z3.Int(arg.arg)
@@ -6582,6 +9408,29 @@ def _kind_term(name, kind):
     if kind == "float":                                       # usage commits to float (a non-integral float literal,
         return z3.FP(name, _F64)                              # or a float-only method), not the default int
     return z3.Int(name)
+
+
+def _value_reading(v):
+    """A comparable descriptor of the type the engine reads a value as -- a z3 sort, or a sequence's kind and
+    element type, or a dict's value type -- or None for a value whose type the descriptor does not capture (an
+    opaque object, a literal, a callable). Two values with one descriptor take the same operations without a
+    type error."""
+    if type(v) is _SafeContainer:
+        elem = None
+        if v.elem is not None:
+            elem = _value_reading(v.elem)
+            if elem is None:
+                return None
+        return ("seq", bool(v.immutable), bool(v.unindexable), bool(v.byteslike), v.scalar, elem, v.tuple_arity,
+                _proto_key(v.tuple_protos))
+    if type(v) is _DictParam:
+        if v.valproto is None:
+            return ("dict", None, v.keyproto)
+        vp = _value_reading(v.valproto)
+        return None if vp is None else ("dict", vp, v.keyproto)
+    if z3.is_expr(v):
+        return ("z3", v.sort().sexpr())
+    return None
 
 
 _MUTATING_METHODS = frozenset({"pop", "append", "insert", "remove", "extend", "clear", "popitem",
@@ -6901,6 +9750,62 @@ def _loop_counters(body):
     return {nm: c for nm, c in inc.items() if nm not in other}
 
 
+import re as _re_mod
+_FORC_RE = _re_mod.compile(r"__forc(\d+)k(\d+)$")
+_ITERATION_BOUND = 2 ** 63      # the execution model: a single loop runs fewer than 2**63 iterations
+
+
+def _counter_bound_facts(env):
+    """The bounded-execution facts for the hidden range counters in `env`: a `for ... in range(...)` loop runs
+    fewer than 2**63 iterations in any real execution, so its counter stays within 2**63 steps of its start (a
+    state only a longer run reaches -- counting to 10**4300 before str() of the count raises -- is not one)."""
+    out = []
+    for nm, v in env.items():
+        m = _FORC_RE.match(nm) if isinstance(nm, str) else None
+        if not m:
+            continue
+        b = env.get("__forb" + m.group(1))
+        if z3.is_expr(v) and z3.is_expr(b) and z3.is_int(v) and z3.is_int(b):
+            B = _ITERATION_BOUND * max(int(m.group(2)), 1)
+            out.append(z3.And(v - b <= B, b - v <= B))
+    return out
+
+
+def _elem_value(c, nm, ctx):
+    """A fresh element of container c: of the annotated scalar type (list[str] holds strings, list[float] floats,
+    list[bool] bools, list[bytes] bytes), an int in [0, 255] for bytes / bytearray, else an int (the engine's
+    assumption for an element type no annotation gives)."""
+    kind = getattr(c, "scalar", None) if isinstance(c, _SafeContainer) else None
+    if kind == "opaque":                                     # elements of a type the engine does not read
+        return _Opaque(nm)
+    if kind == "str":
+        return z3.FreshConst(_SS, nm)
+    if kind == "float":
+        return z3.FreshConst(_F64, nm)
+    if kind == "bool":
+        return z3.FreshConst(z3.BoolSort(), nm)
+    if kind == "bytes":
+        return _SafeContainer(nm, byteslike=True, immutable=True)
+    e = z3.FreshInt(nm)
+    rng = getattr(c, "rng", None) if isinstance(c, _SafeContainer) else None
+    if rng is not None and ctx is not None and ctx.facts is not None:
+        start, stop, s = rng                                 # an element of range(start, stop, s), reached within the
+        k = z3.FreshInt(nm + "_k")                           # bounded execution's 2**63 steps: start + k * s -- a fact
+        ctx.facts.append(z3.Implies(c.length > 0,            # only of a non-empty range (an empty one has no element,
+                                    z3.And(k >= 0, k < c.length, k < _ITERATION_BOUND, e == start + k * s)))
+        return e                                             # and its index trap must stay satisfiable)
+    if isinstance(c, _SafeContainer) and c.byteslike and not c.unindexable and ctx is not None \
+            and ctx.facts is not None:
+        ctx.facts.append(z3.And(e >= 0, e <= 255))           # a bytes / bytearray element is an int in [0, 255]
+    return e
+
+
+def _unpack_elem(seq, ctx):
+    """A fresh element of sequence `seq` bound by unpacking (a, b = seq): a sequence of the element prototype's kind
+    for a sequence of sequences, else an element of the annotated scalar type (_elem_value)."""
+    return _container_element(seq, ctx, "unpack")
+
+
 def _havoc_val(prev, nm):
     """A fresh value for a loop-havoc'd name, preserving a container kind so a bytes/list accumulator (string = x +
     string) stays a container, not an int -- otherwise a later concat/index on it hits 'arithmetic on an unmodeled
@@ -6965,9 +9870,22 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
     ctx.readonly_dicts = _readonly_dict_names(fn)             # dict params whose reads d[k] memoize to a stable value
     ctx.dval_cache = {}                                       # fresh per symexec run
     ctx.mutate_once = _mutate_once_containers(fn)             # containers whose single .pop()/.remove() is sound to model
-    ctx.numeric_params = frozenset(a.arg for a in _params     # params explicitly typed int/float/bool: a number, so
-                                   if isinstance(a.annotation, ast.Name)   # a method call on one is an AttributeError,
-                                   and a.annotation.id in ("int", "float", "bool"))   # not a duck-typed opaque object
+    if argvals is None:                                       # params explicitly typed int/float/bool: a number, so
+        ctx.numeric_params = frozenset(a.arg for a in _params   # a method call on one is an AttributeError, not a
+                                       if isinstance(a.annotation, ast.Name)   # duck-typed opaque object
+                                       and a.annotation.id in ("int", "float", "bool"))
+    else:                                                     # bound to call-site values: the numeric ones
+        ctx.numeric_params = frozenset(a.arg for a, v in zip(_params, argvals)
+                                       if z3.is_expr(v) and (z3.is_int(v) or z3.is_bool(v) or z3.is_fp(v)))
+    saved_gp = getattr(ctx, "guessed_params", frozenset())
+    if getattr(ctx, "strict_reading", False):                 # verified for callers passing real values: no guess
+        ctx.guessed_params = frozenset()
+    elif argvals is not None:                                 # bound to the caller's values: a guessed parameter of
+        ctx.guessed_params = saved_gp                         # the caller passed through stays a guess, nothing else is
+    else:
+        ctx.guessed_params = frozenset(                       # unannotated params read as an int by default: a
+            a.arg for a in _params if a.annotation is None    # guess, so a wrong-type error on one is not
+            and not (param_kinds and a.arg in param_kinds))   # asserted as a trap
     local_traps = _TrapList(ctx)                              # always kind/line-tracking (a plain list to readers)
     ctx.traps = local_traps
 
@@ -6981,7 +9899,14 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                     if s.value is None or (isinstance(s.value, ast.Constant) and s.value.value is None):
                         none_list.append(p)                       # bare return / return None -> the None-path
                     else:                                         # condition, so a mixed int/None function keeps its
-                        rets.append((p, ev(s.value, e, ctx)))     # int returns foldable and the None path separate
+                        rv = ev(s.value, e, ctx)                  # int returns foldable and the None path separate
+                        if isinstance(rv, _MaybeNone):            # a possibly-None value: None where its condition
+                            none_list.append(z3.And(p, rv.cond))  # holds, the value elsewhere
+                            rets.append((z3.And(p, z3.Not(rv.cond)), rv.val))
+                        elif type(rv) is _NoneVal:
+                            none_list.append(p)
+                        else:
+                            rets.append((p, rv))
                 elif isinstance(s, ast.Assign):
                     if len(s.targets) != 1:
                         if _TRAPFREE and all(isinstance(t, (ast.Name, ast.Subscript, ast.Attribute))
@@ -7015,7 +9940,16 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                             _trap_add(ctx, z3.And(ctx.pc, _container_len(val, ctx) != len(tgt.elts)), ("ValueError",))
                             e2 = dict(e)
                             for nm in tgt.elts:
-                                e2[nm.id] = z3.FreshInt("unpack")
+                                e2[nm.id] = _unpack_elem(val, ctx)
+                            nxt.append((e2, p)); continue
+                        if (_TRAPFREE and isinstance(val, _StrSeq) and not val.unsized and val.length is not None
+                                and ctx.traps is not None and all(isinstance(t, ast.Name) for t in tgt.elts)):
+                            # k, v = s.split('='): ValueError unless the sequence has exactly that many parts; each
+                            # name is the part at its position
+                            _trap_add(ctx, z3.And(ctx.pc, val.length != len(tgt.elts)), ("ValueError",))
+                            e2 = dict(e)
+                            for i, nm in enumerate(tgt.elts):
+                                e2[nm.id] = _strseq_element(val, z3.IntVal(i), ctx)
                             nxt.append((e2, p)); continue
                         _stars = [t for t in tgt.elts if isinstance(t, ast.Starred)]
                         if (_TRAPFREE and isinstance(val, _SafeContainer) and ctx.traps is not None
@@ -7029,11 +9963,13 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                             _trap_add(ctx, z3.And(ctx.pc, L < fixed), ("ValueError",))
                             e2 = dict(e)
                             for t in tgt.elts:
-                                if t is _stars[0]:
-                                    e2[t.value.id] = _SafeContainer("unpack_star", byteslike=val.byteslike,
+                                if t is _stars[0]:                # *b is a list of the sequence's elements
+                                    e2[t.value.id] = _SafeContainer(z3.FreshInt("unpack_star").decl().name(),
+                                                                    byteslike=val.byteslike, scalar=val.scalar,
+                                                                    elem=val.elem,
                                                                     length=z3.If(L >= fixed, L - fixed, z3.IntVal(0)))
                                 else:
-                                    e2[t.id] = z3.FreshInt("unpack")
+                                    e2[t.id] = _unpack_elem(val, ctx)
                             nxt.append((e2, p)); continue
                         e2 = dict(e)
                         _unpack_seq(tgt.elts, val, e2, ctx)   # flat or nested ((a, b), c), with one starred target
@@ -7257,6 +10193,8 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         if (z3.is_expr(_init) and _init.sort() == z3.IntSort() and ctx.facts is not None
                                 and z3.is_expr(he.get(_cn)) and he[_cn].sort() == z3.IntSort()):
                             ctx.facts.append(he[_cn] >= _init if _cs > 0 else he[_cn] <= _init)   # i >= 0: p[i] proves
+                    if ctx.facts is not None:                 # a range counter stays within 2**63 steps of its start
+                        ctx.facts.extend(_counter_bound_facts(he))
                     ctx.pc = p
                     c = ev_bool(s.test, he, ctx)              # the guard is trap-checked and constrains the body
                     walk(s.body, he, z3.And(p, c))            # one arbitrary iteration under the guard
@@ -7288,11 +10226,10 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         first = []; ctx.traps, ctx.exact_traps, ctx.havoc = first, None, False
                         #  reset havoc so `clean` reflects only THIS body's over-approximation, not an enclosing loop's
                         #  -- a nested inner loop's first iteration (first element of an arbitrary row) is itself exact
-                        e1 = dict(e); _fe = z3.FreshInt("fe_" + s.target.id)
-                        if itv.byteslike and not itv.unindexable and ctx.facts is not None:   # a bytes / bytearray
-                            ctx.facts.append(z3.And(_fe >= 0, _fe <= 255))                     # element is an int in
-                        e1[s.target.id] = _fe                          # [0, 255]: the exact first-iteration element is
-                        #                                                a real byte, never -1 (no fabricated trap)
+                        e1 = dict(e)                                   # an element of the iterable's type; a bytes
+                        _bind_iter_target(s.target, itv, e1, ctx, "fe", tok=("i", 0))   # element is an int in
+                        #                                                [0, 255], a real byte, never -1 (no fabricated
+                        #                                                trap); it is element 0, read as such
                         enter = z3.And(p, _container_len(itv, ctx) >= 1)
                         try:
                             walk(s.body, e1, enter)
@@ -7314,31 +10251,16 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
                         if (z3.is_expr(_init) and _init.sort() == z3.IntSort() and ctx.facts is not None
                                 and z3.is_expr(he.get(_cn)) and he[_cn].sort() == z3.IntSort()):
                             ctx.facts.append(he[_cn] >= _init if _cs > 0 else he[_cn] <= _init)   # i >= start: dead guard
-                    if _is_str(itv) and isinstance(s.target, ast.Name):   # iterating a string yields 1-char strings,
-                        cs = z3.String("selem_" + s.target.id)            # so a body doing ord(c) / len(c) / c == '?'
-                        if ctx.facts is not None:                         # decides (an arbitrary char over-approximates
-                            ctx.facts.append(z3.Length(cs) == 1)          # every element); len(c) == 1, no trap
-                        he[s.target.id] = cs
-                    elif isinstance(itv, _SafeContainer) and isinstance(itv.elem, _SafeContainer) \
-                            and isinstance(s.target, ast.Name):           # iterating a nested container (for row in g)
-                        _pr = itv.elem                                    # yields inner sequences -- an arbitrary one of
-                        _il = z3.FreshInt("ielem_" + s.target.id)         # nonnegative length, so for x in row decides
-                        if ctx.facts is not None:
-                            ctx.facts.append(_il >= 0)
-                        he[s.target.id] = _SafeContainer("ielem_" + s.target.id, immutable=_pr.immutable,
-                                                         length=_il, unindexable=_pr.unindexable,
-                                                         byteslike=_pr.byteslike, elem=_pr.elem)
-                    elif isinstance(itv, _SafeContainer) and itv.byteslike and not itv.unindexable \
-                            and isinstance(s.target, ast.Name):           # iterating bytes / bytearray yields ints in
-                        _be = z3.FreshInt("belem_" + s.target.id)         # [0, 255], so an element op -- x % 16, or
-                        if ctx.facts is not None:                         # 1000 // (x + 1), never 0 -- decides over
-                            ctx.facts.append(z3.And(_be >= 0, _be <= 255))   # every byte rather than abstaining
-                        he[s.target.id] = _be
+                    # the loop target: an arbitrary element of the iterable's type (a 1-char string of a str, a byte in
+                    # [0, 255], an inner sequence of a nested one, a key of a dict, a tuple's positions) -- one of the
+                    # iterations after the first, so a read independent of the exact first element's
+                    _bind_iter_target(s.target, itv, he, ctx, "lelem", tok=("rest",))
                     body_p = p
                     if isinstance(itv, _DictParam) and isinstance(s.target, ast.Name):
                         kv = he[s.target.id]                  # iterating a dict yields keys: the loop variable is a member
-                        if z3.is_expr(kv) and kv.sort() == z3.IntSort():
-                            body_p = z3.And(p, _dict_member(itv, kv))
+                        mem = _dict_member(itv, kv)
+                        if mem is not None:
+                            body_p = z3.And(p, mem)
                     walk(s.body, he, body_p)
                     if (isinstance(itv, _SafeContainer) and isinstance(s.target, ast.Name)
                             and not any(isinstance(n, (ast.Break, ast.Continue))
@@ -7432,6 +10354,7 @@ def symexec(src: str, ctx: Ctx, argvals=None, param_kinds=None):
         ctx.numeric_params, ctx.func_aliases = saved_np, saved_fa
         ctx.nn_aliases = saved_nn
         ctx.dirty_attrs = saved_dirty
+        ctx.guessed_params = saved_gp
     none_pc = z3.Or(*none_list) if none_list else z3.BoolVal(False)
     return args, z3args, rets, local_traps, none_pc
 
@@ -7452,12 +10375,22 @@ def fold(rets) -> z3.ExprRef:
         return _Complex(fold([(pc, c.re) for pc, c in cs]), fold([(pc, c.im) for pc, c in cs]))
     if any(isinstance(v, tuple) for _, v in rets):           # multi-value returns: fold each position
         width = len(rets[0][1])
-        return tuple(fold([(pc, v[i]) for pc, v in rets]) for i in range(width))
+        kinds = {isinstance(v, _ListLit) for _, v in rets}
+        if not all(isinstance(v, tuple) and len(v) == width for _, v in rets) or len(kinds) != 1:
+            raise Unsupported("paths return sequences of different lengths or kinds")
+        return (_ListLit if kinds == {True} else tuple)(fold([(pc, v[i]) for pc, v in rets]) for i in range(width))
     if any(_is_str(v) for _, v in rets):
         base, coerce = z3.StringVal(""), (lambda x: x)
     elif any(_is_real(v) for _, v in rets):
         base, coerce = z3.RealVal(0), _to_real
     elif any(z3.is_fp(v) for _, v in rets):
+        # an int returned on one path and a float on another is one value only when every int is a literal the
+        # double holds exactly (return 0 beside return x / 2): a symbolic int would be rounded (2**53 + 1) and lose
+        # its int arithmetic, so it is not folded into a float
+        for _, v in rets:
+            if z3.is_expr(v) and z3.is_int(v) and not (
+                    z3.is_int_value(z3.simplify(v)) and abs(z3.simplify(v).as_long()) <= _EXACT_INT_FLOAT):
+                raise Unsupported("paths return an int on one path and a float on another")
         base, coerce = z3.fpNaN(_F64), _to_fp
     else:
         base, coerce = z3.IntVal(0), _as_int
@@ -8651,11 +11584,83 @@ def _sandbox_worker_typed(q, src, repo, fname, inputs, mem_mb):
         q.put(("setup_error",)); return
     out = []
     for tup in inputs:
-        try:
-            fn(*tup); out.append(("ok",))
-        except Exception as e:
-            out.append(("raise", type(e).__name__))
+        r = _bounded_call(fn, tup)
+        out.append(("ok",) if r[0] == "ok" else r)
     q.put(("results", out))
+
+
+def _sandbox_plain(v, depth=0):
+    """Whether v is plain data (None / bool / int / float / str / bytes, or a list / tuple / set / dict of them),
+    which crosses back to the parent as itself. Kept in sync with _sandbox_child._plain."""
+    if depth > 6:
+        return False
+    if v is None or type(v) in (bool, int, float, str, bytes):
+        return True
+    if type(v) in (list, tuple, set, frozenset):
+        return all(_sandbox_plain(x, depth + 1) for x in v)
+    if type(v) is dict:
+        return all(_sandbox_plain(k, depth + 1) and _sandbox_plain(x, depth + 1) for k, x in v.items())
+    return False
+
+
+_SANDBOX_STEPS = 20000                   # subject lines one sandboxed input may execute before it counts as diverging
+
+
+class _StepBudget(Exception):
+    pass
+
+
+def _bounded_call(fn, tup, max_steps=_SANDBOX_STEPS):
+    """fn(*tup) under a line budget on the subject's own code: ('ok', result), ('raise', exception name), or
+    ('diverge',) once the budget is spent -- so one non-terminating input does not cost the rest of a batch.
+    Kept in sync with _sandbox_child._bounded_call."""
+    steps = [0]
+
+    def tracer(frame, event, arg):
+        if frame.f_code.co_filename != "<string>":
+            return None
+        if event == "line":
+            steps[0] += 1
+            if steps[0] > max_steps:
+                raise _StepBudget()
+        return tracer
+    old = sys.gettrace()
+    sys.settrace(tracer)
+    try:
+        return ("ok", fn(*tup))
+    except _StepBudget:
+        return ("diverge",)
+    except RecursionError:
+        return ("raise", "RecursionError")
+    except Exception as e:
+        return ("raise", type(e).__name__)
+    finally:
+        sys.settrace(old)
+
+
+def _sandbox_worker_values(q, src, repo, fname, inputs, mem_mb):
+    """Like _sandbox_worker_typed, but an input that returns reports ('ok', result) when the result is plain data
+    (('ok_opaque',) otherwise), so the parent can evaluate a postcondition on it."""
+    _apply_rlimits(mem_mb)
+    fn = _sandbox_compile(src, repo, fname)
+    if fn is None:
+        q.put(("setup_error",)); return
+    out = []
+    for tup in inputs:
+        r = _bounded_call(fn, tup)
+        if r[0] == "ok":
+            r = ("ok", r[1]) if _sandbox_plain(r[1]) else ("ok_opaque",)
+        out.append(r)
+    q.put(("results", out))
+
+
+def sandbox_run_batch_values(src, repo, fname, inputs, timeout_s=4.0, mem_mb=512):
+    """Evaluate `fname` on each input tuple in an isolated child process, reporting ('ok', result) for a plain-data
+    result, ('ok_opaque',) for another, or ('raise', exception_name); None if the sandbox could not run."""
+    return _spawn_worker(
+        _sandbox_worker_values, (src, repo, fname, list(inputs), mem_mb), timeout_s,
+        lambda msg: msg[1] if msg[0] == "results" else None,
+        lambda: _run_in_subprocess("values", src, repo, fname, inputs, timeout_s, mem_mb))
 
 
 def sandbox_run_batch_typed(src, repo, fname, inputs, timeout_s=4.0, mem_mb=512):
@@ -8713,6 +11718,933 @@ def _expr_has_fp(e) -> bool:
     return False
 
 
+_FP_BRIDGE_KINDS = frozenset({z3.Z3_OP_FPA_TO_REAL, z3.Z3_OP_FPA_TO_SBV, z3.Z3_OP_FPA_TO_UBV, z3.Z3_OP_BV2INT,
+                              z3.Z3_OP_INT2BV})
+
+
+def _expr_has_fp_bridge(e) -> bool:
+    """True if the term converts between the floating-point sort and Int / Real: an int or Fraction promoted to a
+    float (fp.to_fp of a Real), fp.to_real, or an fp / bitvector / int bridge. z3's fpa2bv bit-blasting chain decides
+    such a conversion of a non-numeral as if it were unconstrained, so it can answer sat or unsat wrongly; a query
+    carrying one is decided by the default solver, which combines the float and arithmetic theories soundly."""
+    seen, stack = set(), [e]
+    while stack:
+        n = stack.pop()
+        if not z3.is_app(n):
+            continue
+        k = n.get_id()
+        if k in seen:
+            continue
+        seen.add(k)
+        try:
+            dk = n.decl().kind()
+        except z3.Z3Exception:
+            continue
+        if dk in _FP_BRIDGE_KINDS:
+            return True
+        ch = n.children()
+        if dk == z3.Z3_OP_FPA_TO_FP and any((z3.is_real(c) or z3.is_int(c)) and not _is_numeral_term(c) for c in ch):
+            return True
+        stack.extend(ch)
+    return False
+
+
+def _is_numeral_term(t) -> bool:
+    """Whether an Int / Real term simplifies to a numeral (a literal promoted to a float folds to a constant)."""
+    try:
+        s = z3.simplify(t)
+    except z3.Z3Exception:
+        return False
+    return z3.is_int_value(s) or z3.is_rational_value(s)
+
+
+# --------------------------------------------------------------------------- #
+# Int / float bridge queries. z3 4.16 decides a symbolic Int -> float conversion unsoundly in every solver path    #
+# (`n > 2**53 and float(n) == 2.0**53` comes back unsat; `float(n) == 0.5` comes back sat), so a query carrying     #
+# one is never decided by z3 directly. When the query's own top-level conjuncts bound every Int variable, the     #
+# integer part is re-expressed as fixed-width two's-complement bitvectors wide enough that no intermediate value   #
+# leaves the width, which makes the conversion exact (fpSignedToFP) and the query pure bitvector / float; that is  #
+# decided by the bit-blasting chain. Otherwise cvc5 decides it. A counterexample is accepted only after the        #
+# original query, with the witness values pinned, is re-solved and satisfied.                                     #
+# --------------------------------------------------------------------------- #
+_BV_BRIDGE_MAX_WIDTH = 1088
+_LAST_SOLVE_ROUTE = None                 # "bv" / "cvc5" when the last _solve went through the bridge path, else None
+_LAST_BV_CLAIM = None                    # the bitvector image of the last bridge claim PROVED on the "bv" route
+
+
+class _NoBV(Exception):
+    """The term has no exact fixed-width bitvector image."""
+
+
+def _free_consts(e):
+    """{name: const} of the uninterpreted 0-ary constants in e, or None when e carries a quantifier."""
+    out, seen, stack = {}, set(), [e]
+    while stack:
+        n = stack.pop()
+        if not z3.is_ast(n):
+            continue
+        if z3.is_quantifier(n):
+            return None
+        k = n.get_id()
+        if k in seen:
+            continue
+        seen.add(k)
+        if z3.is_app(n):
+            if n.num_args() == 0 and n.decl().kind() == z3.Z3_OP_UNINTERPRETED:
+                out[n.decl().name()] = n
+            stack.extend(n.children())
+    return out
+
+
+def _top_conjuncts(e):
+    out, stack = [], [e]
+    while stack:
+        n = stack.pop()
+        if z3.is_and(n):
+            stack.extend(n.children())
+        else:
+            out.append(n)
+    return out
+
+
+_FLIP_CMP = {z3.Z3_OP_LE: z3.Z3_OP_GE, z3.Z3_OP_LT: z3.Z3_OP_GT, z3.Z3_OP_GE: z3.Z3_OP_LE,
+             z3.Z3_OP_GT: z3.Z3_OP_LT, z3.Z3_OP_EQ: z3.Z3_OP_EQ}
+
+
+def _int_var_bounds(claim, names):
+    """{name: [lo, hi]} for the Int variables, read from the claim's top-level conjuncts v OP c / c OP v; a bound
+    absent from them stays None. Every model of the claim satisfies these bounds."""
+    b = {n: [None, None] for n in names}
+    for a in _top_conjuncts(claim):
+        if not (z3.is_app(a) and a.num_args() == 2):
+            continue
+        k = a.decl().kind()
+        if k not in _FLIP_CMP:
+            continue
+        x, y = a.arg(0), a.arg(1)
+        if not (z3.is_int(x) and z3.is_int(y)):
+            continue
+        for v, c, flip in ((x, y, False), (y, x, True)):
+            if not (z3.is_const(v) and v.decl().kind() == z3.Z3_OP_UNINTERPRETED and v.decl().name() in b):
+                continue
+            cs = z3.simplify(c)
+            if not z3.is_int_value(cs):
+                continue
+            cv, kk, cur = cs.as_long(), (_FLIP_CMP[k] if flip else k), b[v.decl().name()]
+            lo, hi = {z3.Z3_OP_LE: (None, cv), z3.Z3_OP_LT: (None, cv - 1), z3.Z3_OP_GE: (cv, None),
+                      z3.Z3_OP_GT: (cv + 1, None), z3.Z3_OP_EQ: (cv, cv)}[kk]
+            if lo is not None and (cur[0] is None or lo > cur[0]):
+                cur[0] = lo
+            if hi is not None and (cur[1] is None or hi < cur[1]):
+                cur[1] = hi
+    return b
+
+
+def _int_interval(t, bounds, memo):
+    """(lo, hi) containing every value Int term t takes under the variable bounds; raises _NoBV when unbounded."""
+    k = t.get_id()
+    if k in memo:
+        return memo[k]
+    if z3.is_int_value(t):
+        v = t.as_long()
+        r = (v, v)
+    elif z3.is_const(t) and t.decl().kind() == z3.Z3_OP_UNINTERPRETED:
+        lo, hi = bounds.get(t.decl().name(), (None, None))
+        if lo is None or hi is None:
+            raise _NoBV("unbounded integer %s" % t.decl().name())
+        r = (lo, hi)
+    else:
+        dk = t.decl().kind()
+        ch = t.children()
+        if dk == z3.Z3_OP_ITE:
+            a, b = _int_interval(ch[1], bounds, memo), _int_interval(ch[2], bounds, memo)
+            r = (min(a[0], b[0]), max(a[1], b[1]))
+        elif dk == z3.Z3_OP_BV2INT:
+            w = ch[0].size()
+            r = (0, 2 ** w - 1)
+        else:
+            iv = [_int_interval(c, bounds, memo) for c in ch]
+            if dk == z3.Z3_OP_ADD:
+                r = (sum(x[0] for x in iv), sum(x[1] for x in iv))
+            elif dk == z3.Z3_OP_SUB:
+                lo, hi = iv[0]
+                for x in iv[1:]:
+                    lo, hi = lo - x[1], hi - x[0]
+                r = (lo, hi)
+            elif dk == z3.Z3_OP_UMINUS:
+                r = (-iv[0][1], -iv[0][0])
+            elif dk == z3.Z3_OP_MUL:
+                lo, hi = iv[0]
+                for x in iv[1:]:
+                    ps = [lo * x[0], lo * x[1], hi * x[0], hi * x[1]]
+                    lo, hi = min(ps), max(ps)
+                r = (lo, hi)
+            elif dk == z3.Z3_OP_IDIV:
+                m = max(abs(iv[0][0]), abs(iv[0][1]))
+                r = (-m - 1, m + 1)
+            elif dk == z3.Z3_OP_MOD:
+                m = max(abs(iv[1][0]), abs(iv[1][1]))
+                r = (0, max(m - 1, 0))
+            else:
+                raise _NoBV("integer operator %s" % t.decl().name())
+    memo[k] = r
+    return r
+
+
+def _bv_translate(claim, assume=None):
+    """(bitvector claim, {name: (int const, bv const)}) re-expressing every Int term at a fixed width W wide enough
+    for every intermediate value, exact under the bounds the claim itself imposes; None when an Int variable is
+    unbounded, the claim is quantified, or a construct (a Real outside a float conversion, a string or array over
+    integers) has no exact image. `assume` (lo, hi) bounds every Int variable the claim leaves unbounded on a side,
+    and the bitvector claim then carries those bounds: it decides that region only (a model of it is a model of
+    the claim; its unsatisfiability says nothing outside the region)."""
+    consts = _free_consts(claim)
+    if consts is None:
+        return None
+    ints = {n: c for n, c in consts.items() if z3.is_int(c)}
+    bounds = _int_var_bounds(claim, ints)
+    if assume is not None:
+        for b in bounds.values():
+            b[0] = assume[0] if b[0] is None else b[0]
+            b[1] = assume[1] if b[1] is None else b[1]
+    memo_iv = {}
+    claim = _fold_int_cmps(claim, bounds, memo_iv)   # comparisons the bounds decide (a rounding threshold far
+    widest = 1                                       # outside a term's range) drop out before the width is chosen
+    try:
+        stack, seen = [claim], set()
+        while stack:
+            n = stack.pop()
+            if not z3.is_app(n) or n.get_id() in seen:
+                continue
+            seen.add(n.get_id())
+            if z3.is_int(n):
+                lo, hi = _int_interval(n, bounds, memo_iv)
+                widest = max(widest, abs(lo).bit_length(), abs(hi).bit_length())
+            stack.extend(n.children())
+    except _NoBV:
+        return None
+    W = (widest + 2 + 7) // 8 * 8
+    if W > _BV_BRIDGE_MAX_WIDTH:
+        return None
+    bvs = {n: (c, z3.BitVec(n + "!bv", W)) for n, c in ints.items()}
+    memo = {}
+    zero = z3.BitVecVal(0, W)
+
+    def tr(t):
+        k = t.get_id()
+        if k in memo:
+            return memo[k]
+        r = _tr(t)
+        memo[k] = r
+        return r
+
+    def _tr(t):
+        if not z3.is_app(t):
+            raise _NoBV("non-application")
+        if z3.is_int(t):
+            if z3.is_int_value(t):
+                return z3.BitVecVal(t.as_long(), W)
+            dk = t.decl().kind()
+            if t.num_args() == 0 and dk == z3.Z3_OP_UNINTERPRETED:
+                return bvs[t.decl().name()][1]
+            ch = t.children()
+            if dk == z3.Z3_OP_ITE:
+                return z3.If(tr(ch[0]), tr(ch[1]), tr(ch[2]))
+            if dk == z3.Z3_OP_ADD:
+                acc = tr(ch[0])
+                for c in ch[1:]:
+                    acc = acc + tr(c)
+                return acc
+            if dk == z3.Z3_OP_SUB:
+                acc = tr(ch[0])
+                for c in ch[1:]:
+                    acc = acc - tr(c)
+                return acc
+            if dk == z3.Z3_OP_UMINUS:
+                return -tr(ch[0])
+            if dk == z3.Z3_OP_MUL:
+                acc = tr(ch[0])
+                for c in ch[1:]:
+                    acc = acc * tr(c)
+                return acc
+            if dk in (z3.Z3_OP_IDIV, z3.Z3_OP_MOD):        # SMT-LIB Euclidean div / mod; a zero divisor is unspecified
+                a, b = tr(ch[0]), tr(ch[1])                # (a fresh value per occurrence: more models, never fewer)
+                qt, rt = a / b, z3.SRem(a, b)              # truncating quotient, remainder with the dividend's sign
+                if dk == z3.Z3_OP_IDIV:
+                    exact = z3.If(rt < zero, z3.If(b > zero, qt - 1, qt + 1), qt)
+                else:
+                    exact = z3.If(rt < zero, z3.If(b > zero, rt + b, rt - b), rt)
+                return z3.If(b == zero, z3.FreshConst(z3.BitVecSort(W), "bvdiv0"), exact)
+            if dk == z3.Z3_OP_BV2INT:
+                x = tr(ch[0])
+                return z3.ZeroExt(W - x.size(), x) if x.size() < W else z3.Extract(W - 1, 0, x)
+            raise _NoBV("integer operator %s" % t.decl().name())
+        if z3.is_real(t):
+            raise _NoBV("a real-valued term")
+        dk = t.decl().kind()
+        ch = t.children()
+        if dk == z3.Z3_OP_FPA_TO_FP and len(ch) == 2 and (z3.is_real(ch[1]) or z3.is_int(ch[1])):
+            arg = ch[1]
+            if _is_numeral_term(arg):
+                return t
+            if z3.is_real(arg) and z3.is_app(arg) and arg.decl().kind() == z3.Z3_OP_TO_REAL:
+                return z3.fpSignedToFP(ch[0], tr(arg.arg(0)), t.sort())
+            if (z3.is_real(arg) and z3.is_app(arg) and arg.decl().kind() == z3.Z3_OP_DIV
+                    and all(z3.is_app(c) and c.decl().kind() == z3.Z3_OP_TO_REAL for c in arg.children())):
+                # int / int true division: CPython rounds the exact quotient once; with both operands within
+                # +-2**53 each converts exactly, so IEEE division of the converted operands is that same rounding
+                num, den = arg.arg(0).arg(0), arg.arg(1).arg(0)
+                dv = z3.simplify(den)
+                if z3.is_int_value(dv) and dv.as_long() > 0 and dv.as_long() & (dv.as_long() - 1) == 0 \
+                        and dv.as_long() <= 2 ** 900 \
+                        and all(abs(v) <= 2 ** 1000 for v in _int_interval(num, bounds, memo_iv)):
+                    # a power-of-two divisor only shifts the exponent: RNE(a / 2**k) == RNE(a) * 2**-k exactly
+                    # while neither side leaves the normal range (|a| <= 2**1000, k <= 900)
+                    k = dv.as_long().bit_length() - 1
+                    conv = z3.fpSignedToFP(z3.RNE(), tr(num), t.sort())
+                    return conv if k == 0 else z3.fpMul(z3.RNE(), conv, z3.FPVal(2.0 ** -k, t.sort()))
+                if all(-2 ** 53 <= v <= 2 ** 53 for x in (num, den) for v in _int_interval(x, bounds, memo_iv)):
+                    return z3.fpDiv(ch[0], z3.fpSignedToFP(z3.RNE(), tr(num), t.sort()),
+                                    z3.fpSignedToFP(z3.RNE(), tr(den), t.sort()))
+            raise _NoBV("a float conversion of a non-integer real")
+        if dk in (z3.Z3_OP_LE, z3.Z3_OP_LT, z3.Z3_OP_GE, z3.Z3_OP_GT, z3.Z3_OP_EQ) and len(ch) == 2 \
+                and z3.is_real(ch[0]):
+            return _bv_exact_cmp(dk, ch[0], ch[1], tr, W)
+        if dk in (z3.Z3_OP_LE, z3.Z3_OP_LT, z3.Z3_OP_GE, z3.Z3_OP_GT) and z3.is_int(ch[0]):
+            a, b = tr(ch[0]), tr(ch[1])
+            return {z3.Z3_OP_LE: a <= b, z3.Z3_OP_LT: a < b, z3.Z3_OP_GE: a >= b, z3.Z3_OP_GT: a > b}[dk]
+        if dk == z3.Z3_OP_EQ and z3.is_int(ch[0]):
+            return tr(ch[0]) == tr(ch[1])
+        if dk == z3.Z3_OP_DISTINCT and z3.is_int(ch[0]):
+            return z3.Distinct(*[tr(c) for c in ch])
+        if not ch:
+            return t
+        if dk in (z3.Z3_OP_UNINTERPRETED,) and any(z3.is_int(c) for c in ch):
+            raise _NoBV("an uninterpreted function over integers")
+        if t.sort().kind() in (z3.Z3_SEQ_SORT, z3.Z3_ARRAY_SORT, z3.Z3_DATATYPE_SORT, z3.Z3_RE_SORT) \
+                and any(_term_mentions_int(c) for c in ch):
+            raise _NoBV("a string / array / datatype over integers")
+        nch = [tr(c) for c in ch]
+        if all(a.get_id() == b.get_id() for a, b in zip(ch, nch)):
+            return t
+        try:
+            return t.decl()(*nch)
+        except (z3.Z3Exception, AttributeError, TypeError):
+            raise _NoBV("rebuild of %s" % t.decl().name())
+
+    try:
+        out = tr(claim)
+        # every variable's bounds, conjoined explicitly: the width is only faithful inside them, and the folding
+        # above may have dropped the very conjuncts they were read from
+        rng = [z3.And(bvs[nm][1] >= z3.BitVecVal(b[0], W), bvs[nm][1] <= z3.BitVecVal(b[1], W))
+               for nm, b in bounds.items()]
+        return z3.And(out, *rng), bvs
+    except (_NoBV, z3.Z3Exception, AttributeError, TypeError):
+        return None
+
+
+def _fold_int_cmps(claim, bounds, memo_iv):
+    """claim with every integer comparison whose operands' intervals (under the variable bounds) already decide it
+    replaced by True / False; an operand without a finite interval leaves its comparison as it is."""
+    memo = {}
+    cmp_kinds = (z3.Z3_OP_LE, z3.Z3_OP_LT, z3.Z3_OP_GE, z3.Z3_OP_GT, z3.Z3_OP_EQ, z3.Z3_OP_DISTINCT)
+
+    def decided(dk, a, b):
+        (al, ah), (bl, bh) = a, b
+        if dk == z3.Z3_OP_LE:
+            return True if ah <= bl else (False if al > bh else None)
+        if dk == z3.Z3_OP_LT:
+            return True if ah < bl else (False if al >= bh else None)
+        if dk == z3.Z3_OP_GE:
+            return True if al >= bh else (False if ah < bl else None)
+        if dk == z3.Z3_OP_GT:
+            return True if al > bh else (False if ah <= bl else None)
+        eq = True if (al == ah == bl == bh) else (False if (ah < bl or bh < al) else None)
+        return eq if dk == z3.Z3_OP_EQ or eq is None else not eq
+
+    def fold(t):
+        k = t.get_id()
+        if k in memo:
+            return memo[k]
+        r = t
+        if z3.is_app(t):
+            ch = t.children()
+            dk = t.decl().kind()
+            if dk in cmp_kinds and len(ch) == 2 and z3.is_int(ch[0]) and z3.is_int(ch[1]):
+                try:
+                    d = decided(dk, _int_interval(ch[0], bounds, memo_iv), _int_interval(ch[1], bounds, memo_iv))
+                except (_NoBV, z3.Z3Exception, AttributeError):
+                    d = None
+                if d is not None:
+                    memo[k] = z3.BoolVal(d)
+                    return memo[k]
+            if ch:
+                nch = [fold(c) for c in ch]
+                if not all(a.get_id() == b.get_id() for a, b in zip(ch, nch)):
+                    try:
+                        r = t.decl()(*nch)
+                    except (z3.Z3Exception, AttributeError, TypeError):
+                        r = t
+        memo[k] = r
+        return r
+    return fold(claim)
+
+
+def _bv_exact_cmp(dk, lhs, rhs, tr, W):
+    """The bitvector image of an exact comparison to_real(u) OP fp.to_real(x) (_int_fp_compare's symbolic case) at
+    width W, where every value of u lies within +-2**(W-2): against a finite x, u OP x is u OP floor(x) / ceil(x)
+    (u < x iff u < ceil(x); u <= x iff u <= floor(x); u == x iff x is integral and u == x), with a finite x beyond
+    the width deciding by its sign. A non-finite x leaves the comparison unconstrained (fp.to_real is unspecified
+    there, and every producer guards it)."""
+    flip = {z3.Z3_OP_LE: z3.Z3_OP_GE, z3.Z3_OP_LT: z3.Z3_OP_GT, z3.Z3_OP_GE: z3.Z3_OP_LE,
+            z3.Z3_OP_GT: z3.Z3_OP_LT, z3.Z3_OP_EQ: z3.Z3_OP_EQ}
+    def kind(t):
+        return t.decl().kind() if z3.is_app(t) else None
+    if kind(lhs) == z3.Z3_OP_FPA_TO_REAL and kind(rhs) == z3.Z3_OP_TO_REAL:
+        lhs, rhs, dk = rhs, lhs, flip[dk]
+    if not (kind(lhs) == z3.Z3_OP_TO_REAL and kind(rhs) == z3.Z3_OP_FPA_TO_REAL and z3.is_int(lhs.arg(0))):
+        raise _NoBV("a real-valued comparison")
+    u, x = tr(lhs.arg(0)), tr(rhs.arg(0))
+    fin = z3.And(z3.Not(z3.fpIsNaN(x)), z3.Not(z3.fpIsInf(x)))
+    S = z3.BitVecSort(W)
+    if W - 2 <= 1023:
+        big = z3.fpGEQ(z3.fpAbs(x), z3.FPVal(2.0 ** (W - 2), x.sort()))
+    else:
+        big = z3.BoolVal(False)                            # every finite double is below 2**1024 <= 2**(W-2)
+    pos = z3.Not(z3.fpIsNegative(x))
+    fl, ce = z3.fpToSBV(z3.RTN(), x, S), z3.fpToSBV(z3.RTP(), x, S)
+    integral = z3.fpEQ(z3.fpRoundToIntegral(z3.RNE(), x), x)
+    if dk == z3.Z3_OP_LT:
+        small, bigv = u < ce, pos
+    elif dk == z3.Z3_OP_LE:
+        small, bigv = u <= fl, pos
+    elif dk == z3.Z3_OP_GT:
+        small, bigv = u > fl, z3.Not(pos)
+    elif dk == z3.Z3_OP_GE:
+        small, bigv = u >= ce, z3.Not(pos)
+    else:
+        small, bigv = z3.And(integral, u == fl), z3.BoolVal(False)
+    return z3.If(fin, z3.If(big, bigv, small), z3.FreshConst(z3.BoolSort(), "toreal_nf"))
+
+
+def _term_mentions_int(t):
+    seen, stack = set(), [t]
+    while stack:
+        n = stack.pop()
+        if not z3.is_ast(n) or n.get_id() in seen:
+            continue
+        seen.add(n.get_id())
+        if z3.is_expr(n) and z3.is_int(n):
+            return True
+        if z3.is_app(n):
+            stack.extend(n.children())
+    return False
+
+
+def _pinned_model(claim, pins):
+    """A model of `claim` with the given [(const, value-term)] pins, or None if the pinned claim is not satisfied
+    (the candidate witness does not violate the original query) or still carries an int / float conversion of a
+    non-numeral after the pins are substituted (z3 decides only constant conversions soundly)."""
+    try:
+        pinned = z3.simplify(z3.substitute(claim, *pins)) if pins else z3.simplify(claim)
+    except z3.Z3Exception:
+        return None
+    if _expr_has_fp_bridge(pinned):
+        return None
+    s = z3.Solver()
+    s.set("rlimit", FP_SOLVE_RLIMIT or SOLVE_RLIMIT)
+    s.add(pinned, *[c == v for c, v in pins])
+    try:
+        if s.check() == z3.sat:
+            return s.model()
+    except z3.Z3Exception:
+        pass
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Exact rounding thresholds. Round-to-nearest-even is monotone, so for a double c the reals r with RNE(r) == c    #
+# form one interval whose ends are the midpoints to c's neighbours (a tie goes to the even mantissa); comparing a #
+# conversion float(r) against a numeral is therefore a comparison of r against a rational constant, which for an  #
+# int r (or an int over a constant divisor) is plain integer arithmetic. CPython's int -> float and int / int     #
+# round exactly this way (correctly rounded), so the rewrite is exact.                                            #
+# --------------------------------------------------------------------------- #
+def _rne_bounds(c):
+    """(lo, lo_incl, hi, hi_incl) with lo <(=) r <(=) hi exactly the reals r that round-to-nearest-even to the
+    double c (+0.0 and -0.0 as one value; None for an unbounded side). c is a non-NaN float."""
+    from fractions import Fraction as _Fr
+    big = _Fr(2) ** 1024                                   # the virtual next value above the largest double
+    ovf = big - _Fr(2) ** 970                              # |r| >= ovf rounds to infinity (the tie goes to 2**1024)
+    if c == float("inf"):
+        return ovf, True, None, False
+    if c == float("-inf"):
+        return None, False, -ovf, True
+    if c == 0:
+        c = 0.0
+    even = (struct.unpack("<Q", struct.pack("<d", c))[0] & 1) == 0
+    if c == 0:
+        below, above = -5e-324, 5e-324
+    else:
+        below, above = _math.nextafter(c, float("-inf")), _math.nextafter(c, float("inf"))
+    lo_v = -big if below == float("-inf") else _Fr(below)
+    hi_v = big if above == float("inf") else _Fr(above)
+    return (lo_v + _Fr(c)) / 2, even, (_Fr(c) + hi_v) / 2, even
+
+
+def _real_cmp_const(R, m, strict, ctx_fresh):
+    """R > m (strict) or R >= m for the argument R of a float conversion and a rational m, in integer arithmetic
+    when R is to_real(int) or to_real(int) / to_real(int); a zero divisor leaves it unconstrained (SMT's x / 0)."""
+    import math as _m
+    from fractions import Fraction as _Fr
+    m = _Fr(m)
+    def int_ge(t, q):                                      # t >= q (strict: t > q) for an int t and rational q
+        if strict:
+            return t >= _m.floor(q) + 1
+        return t >= _m.ceil(q)
+    def kind(t):
+        return t.decl().kind() if z3.is_app(t) else None
+    if kind(R) == z3.Z3_OP_TO_REAL and z3.is_int(R.arg(0)):
+        return int_ge(R.arg(0), m)
+    if kind(R) == z3.Z3_OP_DIV and all(kind(c) == z3.Z3_OP_TO_REAL and z3.is_int(c.arg(0)) for c in R.children()):
+        a, b = R.arg(0).arg(0), R.arg(1).arg(0)
+        bs = z3.simplify(b)
+        if z3.is_int_value(bs):
+            bv = bs.as_long()
+            if bv == 0:
+                return ctx_fresh()
+            if bv > 0:
+                return int_ge(a, m * bv)
+            q = m * bv                                     # a / bv >= m  iff  a <= m * bv  (bv < 0)
+            return a <= (_m.ceil(q) - 1 if strict else _m.floor(q))
+        p, qd = m.numerator, m.denominator                 # a / b >= p / qd  iff  qd*a >= p*b (b > 0), <= (b < 0)
+        pos = (qd * a > p * b) if strict else (qd * a >= p * b)
+        neg = (qd * a < p * b) if strict else (qd * a <= p * b)
+        return z3.If(b == 0, ctx_fresh(), z3.If(b > 0, pos, neg))
+    rv = z3.Q(m.numerator, m.denominator)
+    return R > rv if strict else R >= rv
+
+
+def _conv_arg(X):
+    """The Real argument R of a float conversion to_fp(RNE, R) of a non-numeral, or None."""
+    try:
+        if (z3.is_app(X) and X.decl().kind() == z3.Z3_OP_FPA_TO_FP and X.num_args() == 2
+                and z3.is_real(X.arg(1)) and not _is_numeral_term(X.arg(1))
+                and z3.is_app(X.arg(0)) and X.arg(0).decl().kind() == z3.Z3_OP_FPA_RM_NEAREST_TIES_TO_EVEN
+                and X.sort() == _F64):
+            return X.arg(1)
+    except z3.Z3Exception:
+        pass
+    return None
+
+
+_NEG_KIND = {"ge": "le", "gt": "lt", "le": "ge", "lt": "gt", "eq": "eq", "seq": "seq", "isnan": "isnan",
+             "isinf": "isinf", "iszero": "iszero", "isnormal": "isnormal", "issub": "issub", "isneg": "ispos",
+             "ispos": "isneg"}
+
+
+def _conv_atom(kind, X, c, fresh, rw=lambda t: t):
+    """The exact integer / rational image of the FP atom `X kind c` (c a Python float, or None for a predicate)
+    when X is a conversion -- possibly under If branches and negation -- else None. `rw` rewrites the If
+    conditions and the non-conversion branches."""
+    if z3.is_app(X) and X.decl().kind() == z3.Z3_OP_ITE:
+        a = _conv_atom(kind, X.arg(1), c, fresh, rw)
+        b = _conv_atom(kind, X.arg(2), c, fresh, rw)
+        if a is None and b is None:
+            return None
+        return z3.If(rw(X.arg(0)), a if a is not None else rw(_fp_atom_term(kind, X.arg(1), c)),
+                     b if b is not None else rw(_fp_atom_term(kind, X.arg(2), c)))
+    if z3.is_app(X) and X.decl().kind() == z3.Z3_OP_FPA_NEG:
+        return _conv_atom(_NEG_KIND[kind], X.arg(0), (-c if c is not None else None), fresh, rw)
+    R = _conv_arg(X)
+    if R is None:
+        return None
+    def ge(cv):
+        lo, lo_incl, _, _ = _rne_bounds(cv)
+        return z3.BoolVal(True) if lo is None else _real_cmp_const(R, lo, not lo_incl, fresh)
+    def gt(cv):
+        _, _, hi, hi_incl = _rne_bounds(cv)
+        return z3.BoolVal(False) if hi is None else _real_cmp_const(R, hi, hi_incl, fresh)
+    tiny = 2.0 ** -1022
+    if kind in ("ge", "gt", "le", "lt", "eq", "seq") and c != c:
+        return z3.BoolVal(False)                           # a conversion is never NaN: every comparison is False
+    if kind == "ge":
+        return ge(c)
+    if kind == "gt":
+        return gt(c)
+    if kind == "le":
+        return z3.Not(gt(c))
+    if kind == "lt":
+        return z3.Not(ge(c))
+    if kind == "eq" or (kind == "seq" and c != 0):
+        return z3.And(ge(c), z3.Not(gt(c)))
+    if kind == "seq":                                      # bitwise equality with a signed zero: the sign of R decides
+        neg = _math.copysign(1.0, c) < 0
+        zero = z3.And(ge(0.0), z3.Not(gt(0.0)))
+        return z3.And(zero, z3.Not(_real_cmp_const(R, 0, False, fresh)) if neg else _real_cmp_const(R, 0, False, fresh))
+    if kind == "isnan":
+        return z3.BoolVal(False)
+    if kind == "isinf":
+        return z3.Or(ge(float("inf")), z3.Not(gt(float("-inf"))))
+    if kind == "iszero":
+        return z3.And(ge(0.0), z3.Not(gt(0.0)))
+    if kind == "isneg":                                    # the sign bit: R < 0 (a tiny negative rounds to -0.0)
+        return z3.Not(_real_cmp_const(R, 0, False, fresh))
+    if kind == "ispos":
+        return _real_cmp_const(R, 0, False, fresh)
+    if kind == "isnormal":
+        return z3.And(z3.Or(ge(tiny), z3.Not(gt(-tiny))), z3.Not(z3.Or(ge(float("inf")), z3.Not(gt(float("-inf"))))))
+    if kind == "issub":
+        return z3.And(z3.Not(z3.And(ge(0.0), z3.Not(gt(0.0)))), z3.Not(ge(tiny)), gt(-tiny))
+    return None
+
+
+def _fp_atom_term(kind, X, c):
+    """The FP atom `X kind c` itself (for a non-conversion If branch)."""
+    cv = z3.FPVal(c, _F64) if c is not None else None
+    return {"ge": lambda: z3.fpGEQ(X, cv), "gt": lambda: z3.fpGT(X, cv), "le": lambda: z3.fpLEQ(X, cv),
+            "lt": lambda: z3.fpLT(X, cv), "eq": lambda: z3.fpEQ(X, cv), "seq": lambda: X == cv,
+            "isnan": lambda: z3.fpIsNaN(X), "isinf": lambda: z3.fpIsInf(X), "iszero": lambda: z3.fpIsZero(X),
+            "isnormal": lambda: z3.fpIsNormal(X), "issub": lambda: z3.fpIsSubnormal(X),
+            "isneg": lambda: z3.fpIsNegative(X), "ispos": lambda: z3.fpIsPositive(X)}[kind]()
+
+
+_FP_ATOM_KIND = {z3.Z3_OP_FPA_GE: "ge", z3.Z3_OP_FPA_GT: "gt", z3.Z3_OP_FPA_LE: "le", z3.Z3_OP_FPA_LT: "lt",
+                 z3.Z3_OP_FPA_EQ: "eq"}
+_FP_PRED_KIND = {z3.Z3_OP_FPA_IS_NAN: "isnan", z3.Z3_OP_FPA_IS_INF: "isinf", z3.Z3_OP_FPA_IS_ZERO: "iszero",
+                 z3.Z3_OP_FPA_IS_NORMAL: "isnormal", z3.Z3_OP_FPA_IS_SUBNORMAL: "issub",
+                 z3.Z3_OP_FPA_IS_NEGATIVE: "isneg", z3.Z3_OP_FPA_IS_POSITIVE: "ispos"}
+_FLIP_KIND = {"ge": "le", "gt": "lt", "le": "ge", "lt": "gt", "eq": "eq", "seq": "seq"}
+
+
+def _bridge_rewrite(claim):
+    """claim with every atom comparing a float conversion (to_fp of a non-numeral int / Fraction / int quotient,
+    under If branches and negation) against a numeral -- and every classification predicate of one -- replaced by
+    its exact integer / rational image (_conv_atom). Equivalent to the claim; conversions used any other way
+    remain."""
+    memo = {}
+    def fresh():
+        return z3.FreshConst(z3.BoolSort(), "div0")
+    def numeral(t):
+        v = _fp_const_value(t)
+        return v
+    def rw(t):
+        k = t.get_id()
+        if k in memo:
+            return memo[k]
+        r = _rw(t)
+        memo[k] = r
+        return r
+    def _rw(t):
+        if not z3.is_app(t):
+            return t
+        dk = t.decl().kind()
+        ch = t.children()
+        if z3.is_bool(t):
+            atom = None
+            if dk in _FP_ATOM_KIND and len(ch) == 2 or (dk == z3.Z3_OP_EQ and len(ch) == 2 and z3.is_fp(ch[0])):
+                kd = _FP_ATOM_KIND.get(dk, "seq")
+                lv, rv = numeral(ch[0]), numeral(ch[1])
+                if rv is not None and lv is None:
+                    atom = (kd, ch[0], rv)
+                elif lv is not None and rv is None:
+                    atom = (_FLIP_KIND[kd], ch[1], lv)
+            elif dk in _FP_PRED_KIND and len(ch) == 1:
+                atom = (_FP_PRED_KIND[dk], ch[0], None)
+            if atom is not None:
+                r = _conv_atom(atom[0], atom[1], atom[2], fresh, rw)
+                if r is not None:
+                    return r
+        if not ch:
+            return t
+        nch = [rw(c) for c in ch]
+        if all(a.get_id() == b.get_id() for a, b in zip(ch, nch)):
+            return t
+        try:
+            return t.decl()(*nch)
+        except (z3.Z3Exception, AttributeError, TypeError):
+            return t
+    return rw(claim)
+
+
+def _fp_numerals(e):
+    """The finite float numerals and the int numerals (as their double) occurring in e."""
+    out, seen, stack = set(), set(), [e]
+    while stack:
+        n = stack.pop()
+        if not z3.is_app(n) or n.get_id() in seen:
+            continue
+        seen.add(n.get_id())
+        if z3.is_fp_value(n):
+            v = _fp_to_py(n)
+            if v is not None and v == v:
+                out.add(v)
+            continue
+        if z3.is_int_value(n):
+            v = n.as_long()
+            if abs(v) < 2 ** 1100:
+                try:
+                    out.add(float(v))
+                except OverflowError:
+                    pass
+            continue
+        stack.extend(n.children())
+    return out
+
+
+def _bridge_abstract(claim):
+    """A bridge-free over-approximation of claim: each remaining conversion to_fp(RNE, R) becomes a fresh float y
+    and each fp.to_real(x) a fresh real, constrained by facts true of every real R and float x -- y is not NaN, has
+    R's sign, is integral when R is an int, compares against every numeral of the claim exactly as RNE(R) does (the
+    rounding thresholds), and is monotone across conversions; the real of a finite x orders against every numeral
+    as x does, and the real of a conversion lies within half an ulp of R (exactly R for an int within 2**53).
+    Unsatisfiable abstraction => unsatisfiable claim; a model of it proves nothing."""
+    convs, reals = {}, {}
+    seen, stack = set(), [claim]
+    while stack:
+        n = stack.pop()
+        if not z3.is_app(n) or n.get_id() in seen:
+            continue
+        seen.add(n.get_id())
+        if _conv_arg(n) is not None:
+            convs[n.get_id()] = n
+        elif z3.is_app(n) and n.decl().kind() == z3.Z3_OP_FPA_TO_REAL and _fp_const_value(n.arg(0)) is None:
+            reals[n.get_id()] = n
+        stack.extend(n.children())
+    if not convs and not reals:
+        return None
+    nums = sorted(_fp_numerals(claim) | {0.0, 1.0, -1.0, 2.0 ** 53, -(2.0 ** 53)})
+    facts, subs = [], []
+    fresh_div0 = lambda: z3.FreshConst(z3.BoolSort(), "div0")
+    ys = []
+    for k, X in convs.items():
+        R = _conv_arg(X)
+        y = z3.FreshConst(_F64, "conv")
+        ys.append((R, y))
+        subs.append((X, y))
+        facts.append(z3.Not(z3.fpIsNaN(y)))
+        facts.append(z3.fpIsNegative(y) == z3.Not(_real_cmp_const(R, 0, False, fresh_div0)))
+        if z3.is_app(R) and R.decl().kind() == z3.Z3_OP_TO_REAL:
+            t = R.arg(0)
+            facts.append(z3.Or(z3.fpIsInf(y), z3.fpEQ(z3.fpRoundToIntegral(z3.RTZ(), y), y)))
+            facts.append(z3.Implies(t == 0, y == z3.fpPlusZero(_F64)))
+            facts.append(z3.Implies(t != 0, z3.Not(z3.fpIsZero(y))))
+        for cv in nums:
+            c = z3.FPVal(cv, _F64)
+            lo, lo_incl, hi, hi_incl = _rne_bounds(cv)
+            facts.append(z3.fpGEQ(y, c) == (z3.BoolVal(True) if lo is None
+                                            else _real_cmp_const(R, lo, not lo_incl, fresh_div0)))
+            facts.append(z3.fpGT(y, c) == (z3.BoolVal(False) if hi is None
+                                           else _real_cmp_const(R, hi, hi_incl, fresh_div0)))
+    for i in range(len(ys)):
+        for j in range(len(ys)):
+            if i != j and ys[i][0].sort() == ys[j][0].sort():
+                facts.append(z3.Implies(ys[i][0] <= ys[j][0], z3.fpLEQ(ys[i][1], ys[j][1])))
+    try:
+        body = z3.substitute(claim, *subs) if subs else claim
+    except z3.Z3Exception:
+        return None
+    rsubs = []
+    for k, T in reals.items():
+        x = z3.substitute(T.arg(0), *subs) if subs else T.arg(0)
+        rho = z3.FreshConst(z3.RealSort(), "toreal")
+        rsubs.append((z3.substitute(T, *subs) if subs else T, rho))
+        fin = z3.And(z3.Not(z3.fpIsNaN(x)), z3.Not(z3.fpIsInf(x)))
+        for cv in nums:
+            if cv in (float("inf"), float("-inf")):
+                continue
+            c, q = z3.FPVal(cv, _F64), z3.RealVal(str(_Fr_of(cv)))
+            facts.append(z3.Implies(fin, z3.And((rho <= q) == z3.fpLEQ(x, c), (rho >= q) == z3.fpGEQ(x, c))))
+        for R, y in ys:
+            if z3.eq(x, y):                                # the real of a conversion: within half an ulp of R
+                err = z3.If(R >= 0, R, -R) / (2 ** 53) + z3.Q(1, 2 ** 1075)
+                facts.append(z3.Implies(fin, z3.And(rho - R <= err, R - rho <= err)))
+                if z3.is_app(R) and R.decl().kind() == z3.Z3_OP_TO_REAL:
+                    t = R.arg(0)
+                    facts.append(z3.Implies(z3.And(t >= -(2 ** 53), t <= 2 ** 53), rho == R))
+    try:
+        body = z3.substitute(body, *rsubs) if rsubs else body
+    except z3.Z3Exception:
+        return None
+    out = z3.And(body, *facts)
+    return None if _expr_has_fp_bridge(out) else out
+
+
+def _Fr_of(v):
+    from fractions import Fraction as _Fr
+    return _Fr(v)
+
+
+def _parse_smt_value(tok):
+    """A Python / z3 value from one cvc5 get-value term (Int, Bool, Float64), or None when it is another form."""
+    import re as _rx
+    tok = tok.strip()
+    m = _rx.fullmatch(r"\(\s*-\s*(\d+)\s*\)", tok)
+    if m:
+        return z3.IntVal(-int(m.group(1)))
+    if _rx.fullmatch(r"\d+", tok):
+        return z3.IntVal(int(tok))
+    if tok in ("true", "false"):
+        return z3.BoolVal(tok == "true")
+    m = _rx.fullmatch(r"\(_\s+([+-]zero|[+-]oo|NaN)\s+11\s+53\s*\)", tok)
+    if m:
+        kind = m.group(1)
+        return {"+zero": z3.fpPlusZero(_F64), "-zero": z3.fpMinusZero(_F64), "+oo": z3.fpPlusInfinity(_F64),
+                "-oo": z3.fpMinusInfinity(_F64), "NaN": z3.fpNaN(_F64)}[kind]
+    m = _rx.fullmatch(r"\(fp\s+#b([01])\s+#b([01]{11})\s+#b([01]{52})\s*\)", tok)
+    if m:
+        bits = int(m.group(1) + m.group(2) + m.group(3), 2)
+        return z3.FPVal(struct.unpack("<d", struct.pack("<Q", bits))[0], _F64)
+    return None
+
+
+def _cvc5_bridge_solve(claim):
+    """(status, pins) for a bridge query decided by cvc5: PROVED / REFUTED / UNKNOWN, with REFUTED's Int and Float64
+    constant values read back by get-value."""
+    prep = _cvc5_prep(claim, allow_nonlinear=_is_nonlinear(claim))
+    if prep is None:
+        return UNKNOWN, None
+    smt, nonlinear = prep
+    consts = _free_consts(claim) or {}
+    want = [c for c in consts.values() if z3.is_int(c) or z3.is_fp(c) or z3.is_bool(c)]
+    try:
+        import cvc5
+        solver = cvc5.Solver()
+        solver.setOption("fresh-binders", "true")
+        solver.setOption("produce-models", "true")
+        if nonlinear:
+            solver.setOption("nl-ext", "full")
+            solver.setOption("nl-cov", "true")
+        solver.setOption("rlimit-per", str(CVC5_RLIMIT))
+        solver.setOption("tlimit-per", str(CVC5_BRIDGE_TLIMIT_MS))   # cvc5 does not meter every FP / real
+        #                                                               conversion step, so a time cap backs the rlimit
+        names = " ".join("|%s|" % c.decl().name() if not c.decl().name().isidentifier() else c.decl().name()
+                         for c in want)
+        text = smt + ("\n(get-value (%s))\n" % names if want else "")
+        parser = cvc5.InputParser(solver)
+        parser.setStringInput(cvc5.InputLanguage.SMT_LIB_2_6, text, "q")
+        sm = parser.getSymbolManager()
+        result, values = None, None
+        while True:
+            cmd = parser.nextCommand()
+            if cmd.isNull():
+                break
+            out = cmd.invoke(solver, sm)
+            if out and out.strip() in ("sat", "unsat", "unknown"):
+                result = out.strip()
+                if result != "sat":
+                    break
+            elif out and out.strip().startswith("(("):
+                values = out.strip()
+    except Exception:
+        return UNKNOWN, None
+    if result == "unsat":
+        return PROVED, None
+    if result != "sat" or values is None:
+        return UNKNOWN, None
+    pins = []
+    for c in want:
+        nm = c.decl().name()
+        key = ("|%s|" % nm) if not nm.isidentifier() else nm
+        i = values.find("(" + key + " ")
+        if i < 0:
+            continue
+        depth, j = 0, i
+        while j < len(values):
+            if values[j] == "(":
+                depth += 1
+            elif values[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        val = _parse_smt_value(values[i + 1 + len(key):j])
+        if val is not None and val.sort() == c.sort():
+            pins.append((c, val))
+    return REFUTED, pins
+
+
+def _solve_bv_image(claim_false, bv_claim, bvs):
+    """Decide a bitvector image (_bv_translate) by bit-blasting: (status, model of the ORIGINAL claim with the
+    witness pinned)."""
+    s = z3.Then("simplify", "fpa2bv", "bit-blast", "smt").solver()
+    if FP_SOLVE_RLIMIT:
+        s.set("rlimit", FP_SOLVE_RLIMIT)
+    s.set("random_seed", 0)
+    s.add(bv_claim)
+    try:
+        r = s.check()
+    except z3.Z3Exception:
+        r = z3.unknown
+    if r == z3.unsat:
+        return PROVED, None
+    if r == z3.sat:
+        bm = s.model()
+        pins = []
+        for name, (ic, bc) in bvs.items():
+            v = bm.eval(bc, model_completion=True)
+            pins.append((ic, z3.IntVal(v.as_signed_long())))
+        for c in (_free_consts(claim_false) or {}).values():
+            if z3.is_fp(c) or z3.is_bool(c):
+                pins.append((c, bm.eval(c, model_completion=True)))
+        model = _pinned_model(claim_false, pins)
+        return (REFUTED, model) if model is not None else (UNKNOWN, None)
+    return UNKNOWN, None
+
+
+_BRIDGE_REGION = (-(2 ** 62), 2 ** 62)   # the bounded region searched for a counterexample to an unbounded claim
+_BRIDGE_ROUTE_LABEL = {"rewrite": "exact rounding-threshold image", "bv": "exact bitvector image",
+                       "abstract": "bridge-free over-approximation"}
+
+
+def _solve_fp_bridge(claim_false):
+    """(status, model) for a query that converts between floats and Int / Fraction (to_fp of a non-numeral, or
+    fp.to_real), none of which z3 decides soundly. In order: (1) every atom comparing a conversion with a numeral is
+    replaced by its exact integer image (_bridge_rewrite), and a query left with no conversion is solved directly;
+    (2) a query whose integers are all bounded is decided exactly by its bitvector image; (3) otherwise a bridge-free
+    over-approximation (_bridge_abstract) that is unsatisfiable proves it, a bounded region's bitvector image that
+    is satisfiable refutes it, and cvc5 (time-capped) is the last resort. A REFUTED carries a model of the ORIGINAL
+    claim with the witness pinned and re-checked. _LAST_SOLVE_ROUTE / _LAST_BRIDGE_CLAIM record the route and the
+    bridge-free query a PROVED rests on, for the corroborating solver."""
+    global _LAST_SOLVE_ROUTE, _LAST_BV_CLAIM
+    _LAST_BV_CLAIM = None
+    rw = _bridge_rewrite(claim_false)
+    if not _expr_has_fp_bridge(rw):
+        st, model = _solve_direct(rw)
+        _LAST_SOLVE_ROUTE = "rewrite"
+        _LAST_BV_CLAIM = rw if st == PROVED else None
+        if st == REFUTED:
+            pins = [(c, model.eval(c, model_completion=True)) for c in (_free_consts(claim_false) or {}).values()
+                    if z3.is_int(c) or z3.is_fp(c) or z3.is_bool(c) or z3.is_real(c)]
+            model = _pinned_model(claim_false, pins)
+            return (REFUTED, model) if model is not None else (UNKNOWN, None)
+        return st, model
+    tr = _bv_translate(rw)
+    if tr is not None:
+        _LAST_SOLVE_ROUTE = "bv"
+        st, model = _solve_bv_image(claim_false, *tr)
+        if st == PROVED:
+            _LAST_BV_CLAIM = tr[0]
+        return st, model
+    ab = _bridge_abstract(rw)
+    if ab is not None:
+        st, _m = _solve_direct(ab)
+        if st == PROVED:
+            _LAST_SOLVE_ROUTE, _LAST_BV_CLAIM = "abstract", ab
+            return PROVED, None
+    tr = _bv_translate(rw, assume=_BRIDGE_REGION)
+    if tr is not None:
+        st, model = _solve_bv_image(claim_false, *tr)
+        if st == REFUTED:
+            _LAST_SOLVE_ROUTE = "region"
+            return REFUTED, model
+    _LAST_SOLVE_ROUTE = "cvc5"
+    st, pins = _cvc5_bridge_solve(rw)
+    if st == REFUTED:
+        model = _pinned_model(claim_false, pins or [])
+        return (REFUTED, model) if (model is not None and pins) else (UNKNOWN, None)
+    return st, None
+
+
 def _fp_query(fp, *args, retry=0):
     """Run a z3 Fixedpoint (Spacer) query with the process's native stderr (fd 2) muted for the call. z3 4.16's
     Spacer prints an internal assertion-violation notice to its C-level stderr on some nonlinear-CHC queries
@@ -8741,11 +12673,450 @@ def _fp_query(fp, *args, retry=0):
     raise last
 
 
+def _nan_alias_conds(claim):
+    """The NaN conditions of the undecided float identities (_NAN_ALIAS) the claim mentions."""
+    if not _NAN_ALIAS:
+        return []
+    names = _free_consts(claim)
+    if not names:
+        return []
+    return [_NAN_ALIAS[n] for n in names if n in _NAN_ALIAS]
+
+
+def _symbols(e, memo):
+    """The uninterpreted constants and functions of e, as (name, arity) pairs."""
+    k = e.get_id()
+    if k in memo:
+        return memo[k]
+    out, seen, stack = set(), set(), [e]
+    while stack:
+        n = stack.pop()
+        if not z3.is_app(n) or n.get_id() in seen:
+            continue
+        seen.add(n.get_id())
+        d = n.decl()
+        if d.kind() == z3.Z3_OP_UNINTERPRETED:
+            out.add((d.name(), d.arity()))
+        stack.extend(n.children())
+    memo[k] = out
+    return out
+
+
+def _define(ctx, fact, sym):
+    """Record `fact` as the definition of the fresh symbol `sym` (a constant or an application of a function only this
+    kind of fact constrains): every value of the fact's other symbols admits a value of sym satisfying it, so the
+    fact matters to a claim only once sym does (_coi_facts). Kept on the context, with the fact itself."""
+    d = sym.decl()
+    ctx.facts.append(fact)
+    ctx.__dict__.setdefault("defs", {})[fact.get_id()] = (fact, (d.name(), d.arity()))
+
+
+def _coi_facts(facts, roots, defs=None):
+    """The facts in the cone of influence of `roots`: those sharing a constant or an uninterpreted function with a
+    root, directly or through another kept fact (a fact with no symbol, or one under a quantifier, is kept); a
+    definition (_define) enters only through the symbol it defines. The facts are axioms of the real semantics
+    over the engine's fresh symbols, so a set disjoint from the claim is satisfiable on its own, as is a definition
+    of a symbol the claim does not mention, and leaving either out changes neither the satisfiability of the claim
+    nor its models."""
+    if not facts:
+        return []
+    memo = {}
+    live = set()
+    for r in roots:
+        live |= _symbols(r, memo)
+    defs = defs or {}
+
+    def defined(f):
+        e = defs.get(f.get_id())
+        return e[1] if e is not None and e[0].eq(f) else None
+    fs = [(f, _symbols(f, memo), defined(f)) for f in facts]
+    keep = [not s for _f, s, _d in fs]
+    changed = True
+    while changed:
+        changed = False
+        for i, (_f, s, d) in enumerate(fs):
+            if not keep[i] and ((d in live) if d is not None else bool(s & live)):
+                keep[i] = True
+                live |= s
+                changed = True
+    return [f for (f, _s, _d), k in zip(fs, keep) if k]
+
+
+_CONCRETE_FNS = {}    # z3 function name -> the Python function it stands for, over concrete argument values
+
+
+def _concrete_fn(name, py, *sorts):
+    """An uninterpreted function standing for a Python string function the solver cannot express exactly (the part
+    count of str.split): the facts the engine states about it are sound for every argument, and every model is
+    confirmed by evaluating `py` on the model's arguments (_confirm_concrete), so a REFUTED never rests on a value
+    CPython would not compute. Applications to equal arguments are equal, as two calls in Python are."""
+    _CONCRETE_FNS[name] = py
+    return z3.Function(name, *sorts)
+
+
+def _concrete_apps(e):
+    """The applications of concrete functions (_concrete_fn) in e."""
+    if not _CONCRETE_FNS:
+        return []
+    out, seen, stack = [], set(), [e]
+    while stack:
+        n = stack.pop()
+        if not z3.is_app(n) or n.get_id() in seen:
+            continue
+        seen.add(n.get_id())
+        if n.num_args() > 0 and n.decl().kind() == z3.Z3_OP_UNINTERPRETED and n.decl().name() in _CONCRETE_FNS:
+            out.append(n)
+        stack.extend(n.children())
+    return out
+
+
+def _has_uf_app(e):
+    """Whether e applies an uninterpreted function (of one or more arguments)."""
+    seen, stack = set(), [e]
+    while stack:
+        n = stack.pop()
+        if not z3.is_app(n) or n.get_id() in seen:
+            continue
+        seen.add(n.get_id())
+        if n.num_args() > 0 and n.decl().kind() == z3.Z3_OP_UNINTERPRETED:
+            return True
+        stack.extend(n.children())
+    return False
+
+
+def _confirm_concrete(claim, model):
+    """A model of claim in which every concrete-function application has the value its Python function computes on
+    the model's arguments, or None. The arguments' constants are pinned to their model values and each application
+    to the computed value, and the pinned claim is solved again; an argument that itself applies an uninterpreted
+    function has no concrete value here (None)."""
+    apps = _concrete_apps(claim)
+    if not apps:
+        return model
+    pins = []
+    for app in apps:
+        args = app.children()
+        if any(_has_uf_app(a) for a in args):
+            return None
+        vals = []
+        for a in args:
+            for c in (_free_consts(a) or {}).values():
+                pins.append(c == model.eval(c, model_completion=True))
+            v = model.eval(a, model_completion=True)
+            if z3.is_int_value(v):
+                vals.append(v.as_long())
+            elif z3.is_string_value(v):
+                vals.append(_z3_str_value(v))
+            else:
+                return None
+        try:
+            r = _CONCRETE_FNS[app.decl().name()](*vals)
+        except Exception:
+            return None
+        if isinstance(r, int) and not isinstance(r, bool) and app.sort() == z3.IntSort():
+            pins.append(app == r)
+        elif isinstance(r, float) and app.sort() == _F64:     # SMT equality: the exact bits (-0.0, one NaN)
+            pins.append(app == z3.FPVal(r, _F64))
+        elif isinstance(r, str) and app.sort() == z3.StringSort():
+            try:
+                pins.append(app == z3.StringVal(r))
+            except Unsupported:
+                return None
+        else:
+            return None
+    st, m2 = _solve_direct(z3.And(claim, *pins))
+    return m2 if st == REFUTED else None
+
+
+def _split_parts(s, sep, maxsplit=-1):
+    """The number of parts s.split(sep, maxsplit) yields -- with an empty separator, which raises before any part
+    is produced, a value consistent with the engine's split facts (the raise is the trap that path reports)."""
+    if sep == "":
+        return 1 if maxsplit == 0 else 2
+    return len(s.split(sep, maxsplit))
+
+
+def _split_part(s, sep, i, maxsplit=-1, right=False):
+    """Part i of s.split(sep, maxsplit) (rsplit when `right`), or '' where the call raises or i is out of range
+    (paths the engine reports as traps, where the value is never read)."""
+    if sep == "":
+        return ""
+    parts = (s.rsplit if right else s.split)(sep, maxsplit)
+    return parts[i] if 0 <= i < len(parts) else ""
+
+
+def _wsplit_part(s, i):
+    parts = s.split()
+    return parts[i] if 0 <= i < len(parts) else ""
+
+
+_SS_ = z3.StringSort()
+_SPLIT_LEN = _concrete_fn("py_split_len", lambda s, sep: _split_parts(s, sep), _SS_, _SS_, z3.IntSort())
+_SPLIT_LEN_MAX = _concrete_fn("py_split_len_max", _split_parts, _SS_, _SS_, z3.IntSort(), z3.IntSort())
+_WSPLIT_LEN = _concrete_fn("py_wsplit_len", lambda s: len(s.split()), _SS_, z3.IntSort())
+_SPLIT_PART = _concrete_fn("py_split_part", lambda s, sep, i: _split_part(s, sep, i), _SS_, _SS_, z3.IntSort(), _SS_)
+_SPLIT_PART_MAX = _concrete_fn("py_split_part_max", lambda s, sep, m, i: _split_part(s, sep, i, m),
+                               _SS_, _SS_, z3.IntSort(), z3.IntSort(), _SS_)
+_RSPLIT_PART_MAX = _concrete_fn("py_rsplit_part_max", lambda s, sep, m, i: _split_part(s, sep, i, m, True),
+                                _SS_, _SS_, z3.IntSort(), z3.IntSort(), _SS_)
+_WSPLIT_PART = _concrete_fn("py_wsplit_part", _wsplit_part, _SS_, z3.IntSort(), _SS_)
+
+
+def _py_int_of_str(s):
+    try:
+        return int(s)
+    except ValueError:
+        return 0                                             # the path raises: the value is never read
+
+
+def _py_float_of_str(s):
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _py_int_digits_over(s):
+    """1 when int(s) of a well-formed literal raises for its digit count (more than sys.get_int_max_str_digits()
+    digits, underscores not counted), else 0."""
+    lim = sys.get_int_max_str_digits() if hasattr(sys, "get_int_max_str_digits") else 0
+    if not lim:
+        return 0
+    return 1 if sum(1 for c in s if c.isdecimal()) > lim else 0
+
+
+_INT_OF_STR = _concrete_fn("py_int_of_str", _py_int_of_str, _SS_, z3.IntSort())
+_FLOAT_OF_STR = _concrete_fn("py_float_of_str", _py_float_of_str, _SS_, _F64)
+_INT_DIGITS_OVER = _concrete_fn("py_int_digits_over", _py_int_digits_over, _SS_, z3.IntSort())
+
+
+@lru_cache(maxsize=None)
+def _num_lit_res():
+    """(int literal, float literal) as z3 regular expressions: what int(s) and float(s) accept for a str s -- the
+    surrounding whitespace (str.isspace), an optional sign, Unicode decimal digits (str.isdecimal) with single
+    underscores between digits; for a float a fraction and an exponent, or inf / infinity / nan in any case."""
+    D = _re_set(_char_class("isdecimal"))
+    # CPython maps a non-ASCII whitespace character to a space before parsing and then strips ASCII whitespace
+    # (space, \t \n \v \f \r): \x1c..\x1f, which str.isspace accepts, are not a literal's whitespace
+    WS = z3.Star(_re_set(((0x09, 0x0D), (0x20, 0x20)) + tuple(r for r in _char_class("isspace") if r[0] >= 0x80)))
+    DIG = z3.Concat(D, z3.Star(z3.Concat(z3.Option(z3.Re(z3.StringVal("_"))), D)))
+    sign = z3.Option(z3.Union(z3.Re(z3.StringVal("+")), z3.Re(z3.StringVal("-"))))
+    INT = z3.Concat(WS, sign, DIG, WS)
+
+    def ci(word):
+        return z3.Concat(*[z3.Union(z3.Re(z3.StringVal(c.lower())), z3.Re(z3.StringVal(c.upper()))) for c in word])
+    special = z3.Union(z3.Concat(ci("inf"), z3.Option(ci("inity"))), ci("nan"))
+    dot = z3.Re(z3.StringVal("."))
+    mant = z3.Union(z3.Concat(DIG, z3.Option(z3.Concat(dot, z3.Option(DIG)))), z3.Concat(dot, DIG))
+    exp = z3.Concat(z3.Union(z3.Re(z3.StringVal("e")), z3.Re(z3.StringVal("E"))), sign, DIG)
+    FLOAT = z3.Concat(WS, sign, z3.Union(z3.Concat(mant, z3.Option(exp)), special), WS)
+    return INT, FLOAT
+
+
+def _int_of_str(s, ctx):
+    """int(s) for a str s: ValueError exactly when s is not an int literal (_num_lit_res) or has more digits than
+    the interpreter's int-string limit; the value a concrete function of s, its sign read from the literal."""
+    sv = z3.simplify(s)
+    if z3.is_string_value(sv):                               # a constant: CPython's own parse
+        try:
+            return z3.IntVal(int(_z3_str_value(sv)))
+        except ValueError:
+            if ctx.traps is not None:
+                _exact_trap(ctx, z3.BoolVal(True), ("ValueError",))
+            return z3.IntVal(0)
+    INT, _ = _num_lit_res()
+    ok = z3.InRe(s, INT)
+    over = _INT_DIGITS_OVER(s)
+    v = _INT_OF_STR(s)
+    if ctx.facts is not None:
+        lim = sys.get_int_max_str_digits() if hasattr(sys, "get_int_max_str_digits") else 0
+        neg = z3.InRe(s, z3.Concat(z3.Star(z3.AllChar(z3.ReSort(z3.StringSort()))), z3.Re(z3.StringVal("-")),
+                                   z3.Star(z3.AllChar(z3.ReSort(z3.StringSort())))))   # a literal with a minus sign
+        ctx.facts.append(z3.Or(over == 0, over == 1))
+        if lim:
+            ctx.facts.append(z3.Implies(z3.Length(s) <= lim, over == 0))
+        else:
+            ctx.facts.append(over == 0)
+        ctx.facts.append(z3.Implies(ok, z3.If(neg, v <= 0, v >= 0)))
+    if ctx.traps is not None:
+        _exact_trap(ctx, z3.Or(z3.Not(ok), over == 1), ("ValueError",))
+    return v
+
+
+def _float_of_str(s, ctx):
+    """float(s) for a str s: ValueError exactly when s is not a float literal (_num_lit_res); the value a concrete
+    function of s."""
+    sv = z3.simplify(s)
+    if z3.is_string_value(sv):
+        try:
+            return z3.FPVal(float(_z3_str_value(sv)), _F64)
+        except ValueError:
+            if ctx.traps is not None:
+                _exact_trap(ctx, z3.BoolVal(True), ("ValueError",))
+            return z3.FPVal(0.0, _F64)
+    _, FLOAT = _num_lit_res()
+    if ctx.traps is not None:
+        _exact_trap(ctx, z3.Not(z3.InRe(s, FLOAT)), ("ValueError",))
+    return _FLOAT_OF_STR(s)
+
+
 def _solve(claim_false) -> Tuple[str, Optional[z3.ModelRef]]:
     """Return (PROVED|REFUTED|UNKNOWN, model). claim_false asserts a counterexample. A fixed random seed keeps
     the result reproducible. A floating-point claim is bit-blasted (fpa2bv), making the theory decidable, so the
-    query returns a definite verdict rather than timing out."""
+    query returns a definite verdict rather than timing out. A claim carrying an undecided float identity is
+    PROVED only over every identity choice, and REFUTED only by a witness whose outcome no identity changes (each
+    such pair not both NaN), since the witness cannot express which arguments are the same object. A REFUTED
+    whose claim applies a concrete function holds only once its model is confirmed (_confirm_concrete)."""
+    st, model = _solve_alias(claim_false)
+    if st == REFUTED and model is not None and _concrete_apps(claim_false):
+        model = _confirm_concrete(claim_false, model)
+        return (REFUTED, model) if model is not None else (UNKNOWN, None)
+    if st == UNKNOWN:
+        hinted = _solve_hinted(claim_false)
+        if hinted is not None:
+            return REFUTED, hinted
+    return st, model
+
+
+def _solve_hinted(claim):
+    """A model of claim with a string argument of a concrete function pinned to that function's boundary witness
+    (the int digit limit's: one digit past the limit, with or without a sign), which the string solver does not
+    find on its own; the pinned model is confirmed (_confirm_concrete). None when no hint applies or none holds."""
+    lim = sys.get_int_max_str_digits() if hasattr(sys, "get_int_max_str_digits") else 0
+    if not lim:
+        return None
+    for app in _concrete_apps(claim):
+        if app.decl().name() != "py_int_digits_over":
+            continue
+        a = app.arg(0)
+        if not (z3.is_const(a) and a.decl().kind() == z3.Z3_OP_UNINTERPRETED):
+            continue
+        for cand in ("1" * (lim + 1), "-" + "1" * (lim + 1)):
+            st, m = _solve_direct(z3.And(claim, a == z3.StringVal(cand)))
+            if st == REFUTED and m is not None:
+                m2 = _confirm_concrete(claim, m)
+                if m2 is not None:
+                    return m2
+    return None
+
+
+def _solve_alias(claim_false) -> Tuple[str, Optional[z3.ModelRef]]:
+    global RECORD_OBLIGATIONS
+    conds = _nan_alias_conds(claim_false)
+    if conds:
+        st, model = _solve_direct(claim_false)
+        if st != REFUTED:
+            return st, model
+        saved, RECORD_OBLIGATIONS = RECORD_OBLIGATIONS, None   # the restricted query proves no obligation
+        try:
+            st2, model2 = _solve_direct(z3.And(claim_false, *[z3.Not(c) for c in conds]))
+        finally:
+            RECORD_OBLIGATIONS = saved
+        return (REFUTED, model2) if st2 == REFUTED else (UNKNOWN, None)
+    return _solve_direct(claim_false)
+
+
+def _merge_regex(e):
+    """e with the regular-expression memberships of one string term inside each conjunction merged into a single
+    membership of their intersection (a negated membership as one of the complement), conjunctions flattened first:
+    an equivalent formula, which z3's sequence solver decides where it leaves the separate memberships unknown."""
+    if not _has_inre(e):
+        return e
+    memo = {}
+
+    def conjuncts(t, out):
+        if z3.is_and(t):
+            for c in t.children():
+                conjuncts(c, out)
+        else:
+            out.append(t)
+
+    def membership(t):
+        while z3.is_not(t) and z3.is_not(t.arg(0)):         # not not m  is  m
+            t = t.arg(0).arg(0)
+        neg = z3.is_not(t)
+        a = t.arg(0) if neg else t
+        if z3.is_app(a) and a.decl().kind() == z3.Z3_OP_SEQ_IN_RE:
+            return a.arg(0), (z3.Complement(a.arg(1)) if neg else a.arg(1))
+        return None
+
+    def mentions(t, terms):
+        """Whether t holds a membership of one of the string terms (by id)."""
+        seen, stack = set(), [t]
+        while stack:
+            n = stack.pop()
+            if not z3.is_app(n) or n.get_id() in seen:
+                continue
+            seen.add(n.get_id())
+            if n.decl().kind() == z3.Z3_OP_SEQ_IN_RE and n.arg(0).get_id() in terms:
+                return True
+            if z3.is_bool(n):
+                stack.extend(n.children())
+        return False
+
+    def rw(t, depth=0):
+        k = (t.get_id(), depth)                              # the memo holds each key term as well: a temporary
+        hit = memo.get(k)                                    # freed before a later one could hand its id on
+        if hit is not None and hit[0].eq(t):
+            return hit[1]
+        r = _rw(t, depth)
+        memo[k] = (t, r)
+        return r
+
+    def _rw(t, depth):
+        if z3.is_and(t):
+            parts = []
+            conjuncts(t, parts)
+            parts = [rw(p, depth) for p in parts]
+            groups, rest = {}, []
+            for p in parts:
+                m = membership(p)
+                if m is None:
+                    rest.append(p)
+                else:
+                    groups.setdefault(m[0].get_id(), (m[0], []))[1].append(m[1])
+            merged = [z3.InRe(s, rs[0] if len(rs) == 1 else z3.Intersect(*rs)) for s, rs in groups.values()]
+            # a small disjunction beside memberships of the same string: distribute it, so each case's memberships
+            # merge too (s in D and (not s in R or c)  ->  s in D-R or (s in D and c)); bounded in size and depth
+            dis = next((p for p in rest if depth < 3 and (z3.is_or(p) or z3.is_implies(p))
+                        and mentions(p, set(groups))), None)
+            if dis is not None:
+                ds = list(dis.children()) if z3.is_or(dis) else [z3.Not(dis.arg(0)), dis.arg(1)]
+                if len(ds) <= 6:
+                    others = [p for p in rest if p is not dis] + merged
+                    return z3.Or(*[rw(z3.And(*others, d), depth + 1) for d in ds])
+            return z3.And(*(rest + merged)) if len(rest) + len(merged) != 1 else (rest + merged)[0]
+        if z3.is_or(t) or z3.is_not(t) or z3.is_implies(t) or (z3.is_app(t) and t.decl().kind() == z3.Z3_OP_ITE
+                                                              and z3.is_bool(t)):
+            ch = [rw(c, depth) for c in t.children()]
+            return t.decl()(*ch) if any(a.get_id() != b.get_id() for a, b in zip(ch, t.children())) else t
+        return t
+    try:
+        return rw(e)
+    except z3.Z3Exception:
+        return e
+
+
+def _has_inre(e):
+    seen, stack = set(), [e]
+    while stack:
+        n = stack.pop()
+        if not z3.is_app(n) or n.get_id() in seen:
+            continue
+        seen.add(n.get_id())
+        if n.decl().kind() == z3.Z3_OP_SEQ_IN_RE:
+            return True
+        if z3.is_bool(n):
+            stack.extend(n.children())
+    return False
+
+
+def _solve_direct(claim_false) -> Tuple[str, Optional[z3.ModelRef]]:
+    global _LAST_SOLVE_ROUTE
+    _LAST_SOLVE_ROUTE = None
+    claim_false = _merge_regex(claim_false)
     if _expr_has_fp(claim_false):
+        if _expr_has_fp_bridge(claim_false):              # an Int <-> float conversion: never decided by z3 directly
+            return _solve_fp_bridge(claim_false)
         # bit-blasting makes the FP theory decidable; the rlimit is the sole, machine-independent cutoff. The
         # wall-clock timeout is not set while an rlimit is in force (a load-dependent cutoff could turn a
         # decidable query into a spurious UNKNOWN); it is the lone backstop only when no rlimit is configured.
@@ -8772,6 +13143,22 @@ def _solve(claim_false) -> Tuple[str, Optional[z3.ModelRef]]:
     return UNKNOWN, None
 
 
+def _has_huge_numeral(e, bits=512):
+    """Whether e holds an integer numeral wider than `bits` bits (a digit-limit or float-range threshold)."""
+    seen, stack = set(), [e]
+    while stack:
+        n = stack.pop()
+        if not z3.is_app(n) or n.get_id() in seen:
+            continue
+        seen.add(n.get_id())
+        if z3.is_int_value(n):
+            if len(n.as_string()) > bits * 0.302 + 2:
+                return True
+            continue
+        stack.extend(n.children())
+    return False
+
+
 def minimize_witness(claim_false, z3args, args):
     """A model of claim_false with the smallest, simplest integer parameters -- lexicographically the
     fewest nonzero, then the least total magnitude -- or None when minimization does not apply (a
@@ -8779,6 +13166,15 @@ def minimize_witness(claim_false, z3args, args):
     it is a genuine counterexample, just the minimal one."""
     if not args or any(not z3.is_int(z3args[a]) for a in args):
         return None
+    if _expr_has_fp(claim_false) and _expr_has_fp_bridge(claim_false):
+        return None                                      # z3 is unsound on an Int <-> float conversion: keep the
+    #                                                      bridge solver's own (pinned, re-checked) witness
+    if _nan_alias_conds(claim_false):
+        return None                                      # keep the identity-independent witness _solve chose
+    if _concrete_apps(claim_false):
+        return None                                      # keep the model _solve confirmed against CPython
+    if _has_huge_numeral(claim_false):
+        return None                                      # the optimizer's bignum steps are unmetered: keep the model
     try:
         o = z3.Optimize()
         if SOLVE_RLIMIT:
@@ -9239,6 +13635,10 @@ def _cvc5_run_smt(smt, nonlinear, timeout_s=8):
         solver.setOption("fresh-binders", "true")            # z3 serializes let-bound k!N symbols; without this the
         #                                                      parser warns "Constructing a fresh variable for k!N"
         #                                                      to stderr on every query while doing the same thing
+        solver.setOption("re-inter-mode", "all")             # intersect every pair of regular-expression memberships
+        #                                                      (by default only constant ones), so an empty intersection
+        #                                                      -- an ASCII-only string holding a non-ASCII character --
+        #                                                      is decided rather than left to the time limit
         if nonlinear:                                        # CAD nonlinear extension, deterministically rlimit-bounded
             solver.setOption("nl-ext", "full")
             solver.setOption("nl-cov", "true")
@@ -9265,7 +13665,7 @@ def solve_with_cvc5(claim_false, timeout_s=8, allow_nonlinear=False):
     """Decide claim_false with cvc5 via its native bindings. allow_nonlinear enables the CAD extension (nl-cov,
     rlimit-bounded) with squared-subterm hints for a nonlinear claim -- opt-in, since CAD is costly. UNKNOWN if
     cvc5 is unavailable, undecided, hits an unhandled operation, or a quantified serialization does not round-trip."""
-    prep = _cvc5_prep(claim_false, allow_nonlinear)
+    prep = _cvc5_prep(_merge_regex(claim_false), allow_nonlinear)
     return _cvc5_run_smt(prep[0], prep[1], timeout_s) if prep is not None else UNKNOWN
 
 
@@ -9298,6 +13698,16 @@ def solve_corroborated(claim_false):
     st, model = _solve(claim_false)
     if st != PROVED:
         return st, model, None                              # cvc5 is only needed to confirm a PROVED
+    if _LAST_SOLVE_ROUTE == "cvc5":                         # an Int <-> float bridge cvc5 itself decided: z3 is unsound
+        return st, model, "cvc5 (an int / float conversion z3 cannot decide soundly)"   # on it, so no second solver
+    if _LAST_SOLVE_ROUTE in _BRIDGE_ROUTE_LABEL and _LAST_BV_CLAIM is not None:   # the bridge-free query the PROVED
+        what = _BRIDGE_ROUTE_LABEL[_LAST_SOLVE_ROUTE]                            # rests on, re-decided by cvc5
+        cv = solve_with_cvc5(_LAST_BV_CLAIM, allow_nonlinear=_is_nonlinear(_LAST_BV_CLAIM))
+        if cv == REFUTED:
+            raise SoundnessError("a PROVED %s of an int / float query is refuted by cvc5" % what)
+        if cv == PROVED:
+            return st, model, "z3 + cvc5 (%s of an int / float conversion)" % what
+        return st, model, "z3 only (%s of an int / float conversion; cvc5 undecided)" % what
     nonlinear = _is_nonlinear(claim_false)
     cv = solve_with_cvc5(claim_false, allow_nonlinear=True)
     if cv == REFUTED:
@@ -9332,7 +13742,13 @@ def _solve_corro(claim_false):
     cvc5 re-decides, so a heap, separation-logic, overflow, optional, theory, or quantified-spec PROVED is no
     longer single-solver. REFUTED and UNKNOWN pass through."""
     st, model = _solve(claim_false)
-    if st == PROVED and REQUIRE_CORROBORATION and _claim_is_cvc5_safe(claim_false):
+    if st == PROVED and REQUIRE_CORROBORATION and _LAST_SOLVE_ROUTE in _BRIDGE_ROUTE_LABEL \
+            and _LAST_BV_CLAIM is not None:
+        if solve_with_cvc5(_LAST_BV_CLAIM, timeout_s=4) == REFUTED:
+            raise SoundnessError("a PROVED %s of an int / float query is refuted by cvc5"
+                                 % _BRIDGE_ROUTE_LABEL[_LAST_SOLVE_ROUTE])
+        return st, model
+    if st == PROVED and REQUIRE_CORROBORATION and _LAST_SOLVE_ROUTE is None and _claim_is_cvc5_safe(claim_false):
         if solve_with_cvc5(claim_false, timeout_s=4) == REFUTED:
             raise SoundnessError("a PROVED verdict is refuted by the independent solver (cvc5)")
     return st, model

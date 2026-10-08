@@ -58,6 +58,31 @@ def main():
     facts = t.relational_domain_audit(trials=300)
     print(f"AUDIT relational  : {facts} relational facts replayed, 0 violations")
 
+    rt = t.rounding_threshold_audit()
+    print(f"AUDIT rounding    : {rt} rationals vs CPython's correctly rounded conversion to float, 0 mismatches")
+    fb = t.fp_bridge_audit()
+    assert fb["checks"] > 0 and fb["proved"] > 0 and fb["refuted"] > 0, fb
+    print(f"AUDIT int/float   : {fb['proved'] + fb['refuted']} int-float claims decided without z3's conversion "
+          f"({fb['proved']} proved, {fb['refuted']} refuted), {fb['checks']} CPython replays, 0 disagreements")
+    sm = t.sum_model_audit()
+    print(f"AUDIT sum()       : {sm} sums bit-identical to CPython {sys.version_info.major}.{sys.version_info.minor}")
+    pf = t.printf_model_audit()
+    assert pf["decided"] > 0, pf
+    print(f"AUDIT % format    : {pf['checks']} format/argument pairs vs CPython ({pf['decided']} decided), "
+          f"0 disagreements")
+    sl = t.stdlib_trap_model_audit()
+    assert sl["decided"] > 0, sl
+    print(f"AUDIT stdlib args : {sl['checks']} allowlisted calls at their trap boundaries vs CPython "
+          f"({sl['decided']} decided), 0 disagreements")
+    eq = t.equality_model_audit()
+    print(f"AUDIT == / lookup : {eq} value pairs, == and dict lookup vs CPython, 0 disagreements")
+    rx = t.regex_model_audit()
+    assert rx["pairs"] > 0, rx
+    print(f"AUDIT regex       : {rx['codepoints']} class code points and {rx['pairs']} pattern / string / mode "
+          f"triples vs re, 0 disagreements ({rx['declined']} patterns outside the translation)")
+    sc = t.string_conversion_audit()
+    print(f"AUDIT str models  : {sc} is* / int() / float() / encode comparisons vs CPython, 0 disagreements")
+
     core.ALLOW_SUBJECT_EXECUTION = True
     try:
         d = t.differential_equiv_audit(trials=150)

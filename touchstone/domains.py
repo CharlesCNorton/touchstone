@@ -2764,6 +2764,22 @@ _CONTAINER_INFER_METHODS = frozenset({
 _ITER_CONSUMING_BUILTINS = frozenset({"len", "sum", "sorted", "min", "max", "any", "all", "reversed",
                                       "set", "frozenset", "tuple", "list", "iter", "enumerate"})
 
+# standard-library functions whose argument at the given positions is a str ("all": every positional argument): a
+# parameter passed there directly is read as a str, its traps the string's own (a NUL in a path, a surrogate)
+_STR_ARG_STDLIB = {
+    "os.path.join": "all", "os.path.dirname": (0,), "os.path.basename": (0,), "os.path.normpath": (0,),
+    "os.path.normcase": (0,), "os.path.split": (0,), "os.path.splitext": (0,), "os.path.splitdrive": (0,),
+    "os.path.isabs": (0,), "os.path.exists": (0,), "os.path.isfile": (0,), "os.path.isdir": (0,),
+    "os.path.islink": (0,), "os.path.lexists": (0,), "os.path.ismount": (0,), "os.path.abspath": (0,),
+    "os.path.realpath": (0,), "os.path.expanduser": (0,), "os.path.expandvars": (0,), "os.path.relpath": (0, 1),
+    "os.fspath": (0,), "os.getenv": (0,), "shlex.quote": (0,), "shlex.split": (0,), "re.escape": (0,),
+    "html.escape": (0,), "html.unescape": (0,), "urllib.parse.quote": (0,), "urllib.parse.quote_plus": (0,),
+    "urllib.parse.unquote": (0,), "urllib.parse.unquote_plus": (0,), "urllib.parse.urlparse": (0,),
+    "urllib.parse.urlsplit": (0,), "textwrap.dedent": (0,), "textwrap.indent": (0, 1), "textwrap.wrap": (0,),
+    "textwrap.fill": (0,), "textwrap.shorten": (0,), "string.capwords": (0,), "sys.intern": (0,),
+    "time.strftime": (0,), "logging.getLogger": (0,), "unicodedata.normalize": (0, 1),
+}
+
 
 class _AnyC:
     """A benign stand-in for a parameter inferred to be a container: iteration yields a few integers, any index
@@ -2856,6 +2872,14 @@ def _infer_param_kinds(fn):
             for a, b in ((n.left, n.comparators[0]), (n.comparators[0], n.left)):
                 if isinstance(a, ast.Name) and isinstance(b, ast.Constant) and isinstance(b.value, str):
                     mark(a.id, "str")
+    for n in ast.walk(fn):                                   # a parameter passed straight to a str argument of a
+        if isinstance(n, ast.Call):                          # standard-library function (os.path.join(p, 'x'))
+            q = getattr(n.func, "_ts_stdlib", None) or core._dotted_callee(n.func)
+            pos = _STR_ARG_STDLIB.get(q)
+            if pos is not None:
+                for i, a in enumerate(n.args):
+                    if isinstance(a, ast.Name) and (pos == "all" or i in pos):
+                        mark(a.id, "str")
     for n in ast.walk(fn):                                   # an integer- or unknown-keyed read is a sequence
         if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and not is_str_key(n.slice):
             mark(n.value.id, "seq")

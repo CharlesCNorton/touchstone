@@ -3,6 +3,7 @@ import ast
 import hashlib
 import inspect
 import random
+import re
 import struct
 import sys
 import textwrap
@@ -795,10 +796,9 @@ def stdlib_trapfree_audit():
     """Confirm each core._STDLIB_TF function raises no modeled trap on a well-typed argument and resolves to a callable; a modeled trap on a valid argument is an unsound allowlist entry (SoundnessError), an unmodeled exception (OSError, ...) is fine."""
     import importlib, os
     MT = (ValueError, TypeError, KeyError, IndexError, ZeroDivisionError, AssertionError)
-    _posix_only = {"os.getuid", "os.getgid", "os.geteuid", "os.getegid", "os.getpgrp", "os.getlogin"}
-    for qual in core._STDLIB_TF:                              # every entry resolves to a callable
-        if qual in _posix_only and os.name != "posix":       # POSIX-only here; resolved and exercised on Linux CI
-            continue
+    for qual in core._STDLIB_TF:                              # every entry this interpreter provides resolves to a
+        if not core._stdlib_exists(qual):                    # callable; one it lacks (itertools.batched before 3.12,
+            continue                                         # os.getuid off POSIX) is never assumed trap free
         mod, _, leaf = qual.rpartition(".")
         try:
             obj = importlib.import_module(mod.split(".")[0])
@@ -842,6 +842,524 @@ def stdlib_trapfree_audit():
         except Exception:
             pass                                              # an unmodeled exception (OSError, ...) is fine
         n += 1
+    return n
+
+
+def rounding_threshold_audit(trials=300, seed=20261007):
+    """core._rne_bounds, the exact rounding interval behind the int / float bridge rewrite, against CPython's own
+    correctly rounded conversion (Fraction -> float): for random doubles across the whole range (subnormals, the
+    largest double, the infinities) every rational probed at and around each interval end must round to the double
+    exactly when the interval says it does. Returns the number of probes; SoundnessError on any disagreement."""
+    rng = random.Random(seed)
+    cs = [0.0, -0.0, 1.0, -1.0, 0.5, 2.0 ** 53, 2.0 ** 53 + 2, 5e-324, -5e-324, 2.0 ** -1022, 1.7976931348623157e308,
+          -1.7976931348623157e308, float("inf"), float("-inf"), 0.1, 1 / 3]
+    cs += [_math.ldexp(rng.random() * 2, rng.randint(-1074, 1023)) * rng.choice((1, -1)) for _ in range(trials)]
+    eps = (_Fr(0), _Fr(1, 10 ** 400), -_Fr(1, 10 ** 400), _Fr(1, 2), -_Fr(1, 2), _Fr(1), -_Fr(1))
+
+    def rne(q):
+        try:
+            return float(q)
+        except OverflowError:
+            return _math.inf if q > 0 else -_math.inf
+    n = 0
+    for c in cs:
+        lo, lo_in, hi, hi_in = core._rne_bounds(c)
+        probes = [b + d for b in (lo, hi) if b is not None for d in eps] + ([_Fr(c)] if _math.isfinite(c) else [])
+        for r in probes:
+            inside = (lo is None or (r >= lo if lo_in else r > lo)) and (hi is None or (r <= hi if hi_in else r < hi))
+            got = rne(r)
+            if inside != (got == c):
+                raise SoundnessError(f"rounding interval of {c!r} disagrees with CPython at {float(r)!r}: "
+                                     f"rounds to {got!r}")
+            n += 1
+    return n
+
+
+def fp_bridge_audit(trials=160, seed=20261008):
+    """Random claims mixing ints and floats -- float(n), int / int true division, int-float exact comparison, IEEE
+    arithmetic -- decided by core._solve's int / float bridge (never by z3 directly), each verdict replayed against
+    CPython's own semantics (an int too large for a double converts to an infinity, the SMT reading; a zero divisor
+    leaves the sample undecided): a PROVED claim must be false on every sampled input, a REFUTED claim true at its
+    model. Returns {'proved', 'refuted', 'unknown', 'checks'}; SoundnessError on any disagreement."""
+    rng = random.Random(seed)
+    n_, m_, x_ = z3.Int("n"), z3.Int("m"), z3.FP("x", core._F64)
+    OVF = core._INT_FLOAT_OVF
+    ipool = [0, 1, -1, 2, 3, -7, 10, 2 ** 53 - 1, 2 ** 53, 2 ** 53 + 1, 2 ** 53 + 2, -(2 ** 53) - 1, 2 ** 54 + 3,
+             2 ** 63, -(2 ** 63), 10 ** 20, OVF - 1, OVF, -OVF, 10 ** 400]
+    fpool = [0.0, -0.0, 1.0, -1.0, 0.5, 3.0, 2.0 ** 53, 2.0 ** 53 + 2, 1e16, 1e300, -1e300, 5e-324, _math.inf,
+             -_math.inf, _math.nan]
+
+    def to_f(i):
+        try:
+            return float(i)
+        except OverflowError:
+            return _math.inf if i > 0 else -_math.inf
+
+    class _Undef(Exception):
+        pass
+
+    def gen_int(d):
+        k = rng.randint(0, 5 if d > 0 else 2)
+        if k == 0:
+            return ("n",)
+        if k == 1:
+            return ("m",)
+        if k == 2:
+            return ("c", rng.choice(ipool))
+        if k == 3:
+            return ("add", gen_int(d - 1), gen_int(d - 1))
+        if k == 4:
+            return ("mulc", gen_int(d - 1), rng.choice([2, -3, 7]))
+        return ("sub", gen_int(d - 1), gen_int(d - 1))
+
+    def gen_float(d):
+        k = rng.randint(0, 6 if d > 0 else 2)
+        if k == 0:
+            return ("x",)
+        if k == 1:
+            return ("fc", rng.choice(fpool))
+        if k == 2:
+            return ("float", gen_int(1))
+        if k == 3:
+            return ("tdiv", gen_int(1), gen_int(1))
+        if k == 4:
+            return ("fadd", gen_float(d - 1), gen_float(d - 1))
+        if k == 5:
+            return ("fmul", gen_float(d - 1), gen_float(d - 1))
+        return ("fneg", gen_float(d - 1))
+
+    ops = [ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq]
+    pyop = {ast.Lt: lambda a, b: a < b, ast.LtE: lambda a, b: a <= b, ast.Gt: lambda a, b: a > b,
+            ast.GtE: lambda a, b: a >= b, ast.Eq: lambda a, b: a == b, ast.NotEq: lambda a, b: a != b}
+
+    def gen_atom():
+        k = rng.randint(0, 3)
+        if k == 0:
+            return ("mix", rng.choice(ops), gen_int(1), gen_float(1))
+        if k == 1:
+            return ("fcmp", rng.choice(ops), gen_float(1), gen_float(1))
+        if k == 2:
+            return ("icmp", rng.choice(ops), gen_int(1), ("c", rng.choice(ipool)))
+        return ("isinf", gen_float(1))
+
+    def zi(t):
+        tag = t[0]
+        if tag == "n": return n_
+        if tag == "m": return m_
+        if tag == "c": return z3.IntVal(t[1])
+        if tag == "add": return zi(t[1]) + zi(t[2])
+        if tag == "sub": return zi(t[1]) - zi(t[2])
+        return zi(t[1]) * t[2]
+
+    def zf(t):
+        tag = t[0]
+        if tag == "x": return x_
+        if tag == "fc": return z3.FPVal(t[1], core._F64)
+        if tag == "float": return core._to_fp(zi(t[1]))
+        if tag == "tdiv": return core._int_truediv(zi(t[1]), zi(t[2]))
+        if tag == "fadd": return z3.fpAdd(z3.RNE(), zf(t[1]), zf(t[2]))
+        if tag == "fmul": return z3.fpMul(z3.RNE(), zf(t[1]), zf(t[2]))
+        return z3.fpNeg(zf(t[1]))
+
+    def za(a):
+        if a[0] == "mix": return core._num_compare(a[1], zi(a[2]), zf(a[3]))
+        if a[0] == "fcmp": return core._FP_CMP[a[1]](zf(a[2]), zf(a[3]))
+        if a[0] == "icmp": return core._CMP[a[1]](zi(a[2]), zi(a[3]))
+        return z3.fpIsInf(zf(a[1]))
+
+    def pi(t, env):
+        tag = t[0]
+        if tag in ("n", "m"): return env[tag]
+        if tag == "c": return t[1]
+        if tag == "add": return pi(t[1], env) + pi(t[2], env)
+        if tag == "sub": return pi(t[1], env) - pi(t[2], env)
+        return pi(t[1], env) * t[2]
+
+    def pf(t, env):
+        tag = t[0]
+        if tag == "x": return env["x"]
+        if tag == "fc": return t[1]
+        if tag == "float": return to_f(pi(t[1], env))
+        if tag == "tdiv":
+            a, b = pi(t[1], env), pi(t[2], env)
+            if b == 0:
+                raise _Undef()
+            try:
+                return a / b
+            except OverflowError:
+                return _math.inf if (a < 0) == (b < 0) else -_math.inf
+        if tag == "fadd": return pf(t[1], env) + pf(t[2], env)
+        if tag == "fmul": return pf(t[1], env) * pf(t[2], env)
+        return -pf(t[1], env)
+
+    def pa(a, env):
+        if a[0] == "mix": return pyop[a[1]](pi(a[2], env), pf(a[3], env))
+        if a[0] == "fcmp": return pyop[a[1]](pf(a[2], env), pf(a[3], env))
+        if a[0] == "icmp": return pyop[a[1]](pi(a[2], env), pi(a[3], env))
+        return _math.isinf(pf(a[1], env))
+
+    out = {"proved": 0, "refuted": 0, "unknown": 0, "checks": 0}
+    saved = core.REQUIRE_CORROBORATION
+    try:
+        for _ in range(trials):
+            atoms = [gen_atom() for _ in range(rng.randint(1, 3))]
+            bound = rng.random() < 0.4
+            claim = z3.And(*[za(a) for a in atoms])
+            if bound:
+                claim = z3.And(claim, n_ >= -(2 ** 60), n_ <= 2 ** 60, m_ >= -(2 ** 60), m_ <= 2 ** 60)
+            st, model = core._solve(claim)
+
+            def holds(env):
+                if bound and not all(-(2 ** 60) <= env[v] <= 2 ** 60 for v in ("n", "m")):
+                    return False
+                return all(pa(a, env) for a in atoms)
+            if st == PROVED:
+                out["proved"] += 1
+                for nv in ipool:
+                    for mv in (0, 1, 2 ** 53 + 1, -(2 ** 63), OVF):
+                        for xv in fpool:
+                            env = {"n": nv, "m": mv, "x": xv}
+                            try:
+                                if holds(env):
+                                    raise SoundnessError(f"bridge PROVED a claim CPython satisfies at {env}: {atoms}")
+                            except _Undef:
+                                continue
+                            out["checks"] += 1
+            elif st == REFUTED:
+                out["refuted"] += 1
+                env = {}
+                for nm, c in (("n", n_), ("m", m_)):
+                    v = model.eval(c, model_completion=True)
+                    env[nm] = v.as_long()
+                xv = model.eval(x_, model_completion=True)
+                fx = core._fp_to_py(xv)
+                if fx is None:
+                    fx = _math.nan if z3.is_true(z3.simplify(z3.fpIsNaN(xv))) else 0.0
+                env["x"] = fx
+                try:
+                    if not holds(env):
+                        raise SoundnessError(f"bridge REFUTED with a model CPython rejects {env}: {atoms}")
+                    out["checks"] += 1
+                except _Undef:
+                    pass
+            else:
+                out["unknown"] += 1
+    finally:
+        core.REQUIRE_CORROBORATION = saved
+    return out
+
+
+def sum_model_audit(trials=2000, seed=20261009):
+    """core._py_sum, the exact model of builtins.sum over a constant-length sequence (the int fast path's C-long /
+    Py_ssize_t limits, the Neumaier-compensated float path of 3.12+), against CPython's sum() itself on random mixes
+    of ints, bools and floats (NaN / infinities / signed zero / huge ints included), compared bit for bit. Returns
+    the number of sums compared; SoundnessError on any difference."""
+    rng = random.Random(seed)
+    pool = [0.1, 0.2, 0.3, 1e16, -1e16, 1.0, -1.0, 1e308, -1e308, 2.5, 1e-300, 3, -7, 2 ** 31, 2 ** 31 - 1, -2 ** 31,
+            2 ** 53 + 1, 2 ** 62, 2 ** 63, -2 ** 63, 10 ** 20, True, False, 0, _math.inf, -_math.inf, _math.nan, -0.0,
+            1e-16, 5e-17]
+
+    class _C:
+        traps = None
+        pc = z3.BoolVal(True)
+
+    def zv(v):
+        if isinstance(v, bool):
+            return z3.BoolVal(v)
+        if isinstance(v, int):
+            return z3.IntVal(v)
+        return z3.FPVal(v, core._F64)
+    n = 0
+    for _ in range(trials):
+        items = [rng.choice(pool) for _ in range(rng.randint(0, 7))]
+        start = rng.choice([0, 0.0, 5, 2 ** 40, -0.0, 2 ** 31])
+        try:
+            want = sum(items, start)
+        except OverflowError:
+            continue
+        g = z3.simplify(core._py_sum(zv(start), [zv(v) for v in items], _C()))
+        if isinstance(want, float):
+            if want != want:
+                ok = z3.is_true(z3.simplify(z3.fpIsNaN(g)))
+            else:
+                gv = core._fp_to_py(g)
+                ok = gv is not None and struct.pack("<d", gv) == struct.pack("<d", want)
+        else:
+            ok = z3.is_int_value(g) and g.as_long() == want
+        if not ok:
+            raise SoundnessError(f"sum({items!r}, {start!r}) is {want!r} in CPython, {g} in the model")
+        n += 1
+    return n
+
+
+def printf_model_audit(trials=300, seed=20261010):
+    """The printf-style formatting model (core._printf_traps) against CPython on random constant format strings and
+    literal arguments: `check` of `def f(): return FMT % ARGS` must not prove a call CPython raises on, nor refute
+    one it completes. Returns {'checks', 'decided'}; SoundnessError on any disagreement."""
+    rng = random.Random(seed)
+    convs = list("diouxXeEfFgGcrsa") + ["%", "z", "(k)s", "(k)d", "(q)s", "*d", ".*f", "5.2f", "-3s", "#x", "+d",
+                                        "05d"]
+    argpool = ["1", "-7", "1.5", "'a'", "'ab'", "None", "True", "10**5000", "10**400", "float('inf')",
+               "float('nan')", "(1, 2)", "[1]", "{'k': 1}", "{'k': 'v', 'q': 2}", "0x110000", "65", "b'x'", "{1}"]
+    out = {"checks": 0, "decided": 0}
+    for _ in range(trials):
+        fmt = "".join(rng.choice(["x", " ", "%" + rng.choice(convs)]) for _ in range(rng.randint(1, 4)))
+        if rng.random() < 0.6:
+            k = rng.randint(0, 3)
+            args = "(" + ", ".join(rng.choice(argpool) for _ in range(k)) + ("," if k == 1 else "") + ")"
+        else:
+            args = rng.choice(argpool)
+        expr = "%r %% %s" % (fmt, args)
+        try:
+            eval(expr, {"__builtins__": {"float": float}})
+            raises = False
+        except (ValueError, TypeError, KeyError, IndexError, OverflowError):
+            raises = True
+        v = check("def f():\n    return %s\n" % expr, target="f")
+        if (raises and v.status == PROVED) or (not raises and v.status == REFUTED):
+            raise SoundnessError(f"printf model: {expr} {'raises' if raises else 'completes'} in CPython, "
+                                 f"check says {v.status}")
+        out["checks"] += 1
+        out["decided"] += v.status in (PROVED, REFUTED)
+    return out
+
+
+def stdlib_trap_model_audit():
+    """The argument-dependent trap models of the trap-free stdlib allowlist (core._TF_TRAP_MODELS) against CPython on
+    each modeled trap and its boundary: `check` of a call with literal arguments must not prove a call CPython
+    raises a modeled exception on, nor refute one it completes (an unmodeled exception -- OSError -- is neither).
+    Returns {'checks', 'decided'}; SoundnessError on any disagreement."""
+    import importlib, os as _os
+    cases = [
+        ("itertools", "itertools.tee([1], -1)"), ("itertools", "itertools.tee([1], 0)"),
+        ("itertools", "itertools.product([1], repeat=-1)"), ("itertools", "itertools.product([1], repeat=0)"),
+        ("itertools", "itertools.repeat(1, -1)"), ("itertools", "itertools.count('a')"),
+        ("itertools", "itertools.cycle(5)"), ("itertools", "itertools.chain(5)"),
+        ("itertools", "itertools.compress(5, [1])"), ("itertools", "itertools.zip_longest(5)"),
+        ("textwrap", "textwrap.fill('', 0)"), ("textwrap", "textwrap.fill('a b', 1)"),
+        ("textwrap", "textwrap.fill('a', -1)"), ("textwrap", "textwrap.shorten('a', 4)"),
+        ("textwrap", "textwrap.shorten('a', 5)"), ("textwrap", "textwrap.shorten('', 0)"),
+        ("textwrap", "textwrap.wrap('a b', 3, max_lines=1, placeholder='..')"),
+        ("textwrap", "textwrap.wrap('a b', 1, max_lines=1, placeholder='..')"),
+        ("string", "string.capwords('a b', '')"), ("string", "string.capwords('a b', ' ')"),
+        ("bisect", "bisect.bisect_left([1, 2], 1, -1)"), ("bisect", "bisect.bisect_left([1, 2], 1, 5)"),
+        ("bisect", "bisect.bisect_left([1, 2], 1, 0, -1)"), ("bisect", "bisect.insort([1, 2], 1, -1)"),
+        ("collections", "collections.deque([1], -1)"), ("collections", "collections.deque([1], 0)"),
+        ("collections", "collections.OrderedDict(5)"), ("collections", "collections.OrderedDict('ab')"),
+        ("collections", "collections.OrderedDict('')"), ("collections", "collections.OrderedDict([1])"),
+        ("collections", "collections.OrderedDict({}, {})"), ("collections", "collections.OrderedDict([('a', 1)])"),
+        ("warnings", "warnings.simplefilter('bogus')"), ("warnings", "warnings.simplefilter('ignore')"),
+        ("warnings", "warnings.simplefilter('ignore', lineno=-1)"), ("warnings", "warnings.filterwarnings('bogus')"),
+        ("warnings", "warnings.filterwarnings('ignore', 5)"), ("warnings", "warnings.filterwarnings('ignore', 'x')"),
+        ("logging", "logging.log('x', 'm')"), ("logging", "logging.getLogger(5)"),
+        ("logging", "logging.getLogger('a')"),
+        ("time", "time.ctime(float('nan'))"), ("time", "time.gmtime(1e20)"), ("time", "time.gmtime(2**63)"),
+        ("time", "time.strftime('%Y')"), ("time", "time.strftime('%Q')"),
+        ("os", "os.stat('a\\x00b')"), ("os", "os.path.getsize('a\\x00b')"), ("os", "os.listdir('a\\x00b')"),
+        ("os", "os.path.realpath('a\\x00b')"), ("os", "os.path.abspath('a\\x00b')"),
+        ("os", "os.path.ismount('a\\x00b')"), ("os", "os.strerror(2 ** 40)"), ("os", "os.strerror(2)"),
+        ("os", "os.getenv(5)"), ("os", "os.getenv('\\ud800')"), ("os", "os.fspath(5)"),
+        ("os", "os.path.join('a', b'b')"), ("os", "os.path.join('a', 'b')"),
+        ("sys", "sys.intern(5)"), ("re", "re.escape(5)"),
+        ("base64", "base64.b64encode('a')"), ("base64", "base64.b64encode(b'a', b'a')"),
+        ("base64", "base64.b64encode(b'a', b'-_')"), ("binascii", "binascii.hexlify(b'a', 'ab')"),
+        ("hashlib", "hashlib.md5('a')"), ("hashlib", "hashlib.md5(b'a')"),
+        ("hashlib", "hashlib.blake2b(b'', digest_size=65)"), ("html", "html.unescape(5)"),
+        ("urllib.parse", "urllib.parse.quote('\\ud800')"), ("urllib.parse", "urllib.parse.quote('a b')"),
+        ("shlex", "shlex.quote(5)"), ("functools", "functools.partial(5)"), ("random", "random.seed([1])"),
+        ("json", "json.dumps({1})"), ("json", "json.dumps(10 ** 5000)"), ("json", "json.dumps(10 ** 4000)"),
+        ("json", "json.dumps(float('nan'), allow_nan=False)"), ("json", "json.dumps({(1,): 1})"),
+        ("json", "json.dumps({1: 1, 'a': 2}, sort_keys=True)"), ("json", "json.dumps([1, 'a', None, 2.5])"),
+        ("uuid", "uuid.uuid1(node=2 ** 48)"), ("pathlib", "pathlib.Path(5)"), ("heapq", "heapq.heapify((1,))"),
+        ("shutil", "shutil.which('a\\x00b')"),
+    ]
+    modeled = (ValueError, TypeError, KeyError, IndexError, ZeroDivisionError, AssertionError, OverflowError)
+    out = {"checks": 0, "decided": 0}
+    for mod, call in cases:
+        ns = {mod.split(".")[0]: importlib.import_module(mod.split(".")[0])}
+        importlib.import_module(mod)
+        try:
+            eval(call, ns)
+            raises = False
+        except modeled:
+            raises = True
+        except Exception:
+            continue                                          # an unmodeled exception (OSError ...): no claim
+        src = "import %s\n\ndef f():\n    return %s\n" % (mod, call)
+        v = check(src, target="f")
+        if (raises and v.status == PROVED) or (not raises and v.status == REFUTED):
+            raise SoundnessError(f"stdlib trap model: {call} {'raises' if raises else 'completes'} in CPython, "
+                                 f"check says {v.status}")
+        out["checks"] += 1
+        out["decided"] += v.status in (PROVED, REFUTED)
+    return out
+
+
+def equality_model_audit(seed=20261011):
+    """Python's == and the identity-then-== test of a container / dict lookup (core._py_eq / _map_get) against
+    CPython on literal pairs across int / bool / float (NaN, +-0.0, 2**53 + 1) / str / None / tuple / list: `check`
+    of `assert (A == B) == <CPython's answer>` and of `{A: 1}[B]` must agree with CPython. Returns the number of
+    pairs; SoundnessError on any disagreement."""
+    vals = ["0", "1", "True", "False", "1.0", "0.0", "-0.0", "float('nan')", "2**53 + 1", "float(2**53)", "'a'",
+            "'1'", "None", "(1,)", "(1.0,)", "[1]", "(True, 2)", "2.5"]
+    n = 0
+    for a in vals:
+        for b in vals:
+            want = eval("%s == %s" % (a, b), {"float": float})
+            v = check("def f():\n    assert (%s == %s) == %r\n    return 0\n" % (a, b, want), target="f")
+            if v.status == REFUTED:
+                raise SoundnessError(f"equality model: {a} == {b} is {want} in CPython, the engine disagrees")
+            try:
+                eval("{%s: 1}[%s]" % (a, b), {"float": float})
+                raises = False
+            except (KeyError, TypeError):
+                raises = True
+            v = check("def f():\n    d = {%s: 1}\n    return d[%s]\n" % (a, b), target="f")
+            if (raises and v.status == PROVED) or (not raises and v.status == REFUTED):
+                raise SoundnessError(f"dict lookup model: {{{a}: 1}}[{b}] {'raises' if raises else 'succeeds'} in "
+                                     f"CPython, check says {v.status}")
+            n += 1
+    return n
+
+
+def regex_model_audit(trials=240, seed=20261012):
+    """The regular-expression translation (core._re_translate / _re_holds) against CPython's re module: every code
+    point of the solvers' alphabet against \\d, \\s and \\w (and their ASCII forms), then random patterns over
+    literals, classes, groups, alternation, greedy and lazy quantifiers and edge anchors, matched against random
+    strings with re.match / search / fullmatch. A translated pattern must agree with CPython on every pair; a
+    pattern the translation declines is skipped. Returns {'codepoints', 'pairs', 'declined'}; SoundnessError on any
+    disagreement."""
+    import re as _re
+    cps = 0
+    for kind, pat in (("digit", r"\d"), ("space", r"\s"), ("word", r"\w")):
+        for ascii_only in (False, True):
+            ranges = core._uni_class_ranges(kind, ascii_only)
+            inside = set()
+            for lo, hi in ranges:
+                inside.update(range(lo, hi + 1))
+            rx = _re.compile(pat, _re.ASCII if ascii_only else 0)
+            for cp in range(0x30000):
+                if (rx.fullmatch(chr(cp)) is not None) != (cp in inside):
+                    raise SoundnessError(f"regex class {pat} (ascii={ascii_only}) disagrees with re at U+{cp:04X}")
+                cps += 1
+    rng = random.Random(seed)
+    atoms = ["a", "b", r"\.", ".", "[ab]", "[^a]", "[a-c1]", r"\d", r"\D", r"\s", r"\S", r"\n", "_"]
+
+    def gen(d):
+        k = rng.randint(0, 6 if d > 0 else 0)
+        if k == 0:                                           # \w / \W are 747-range unions: drawn less often
+            return rng.choice(atoms) if rng.random() < 0.9 else rng.choice([r"\w", r"\W"])
+        if k == 1:
+            return gen(d - 1) + gen(d - 1)
+        if k == 2:
+            return "(%s|%s)" % (gen(d - 1), gen(d - 1))
+        if k == 3:
+            return "(?:%s)%s" % (gen(d - 1), rng.choice(["*", "+", "?", "*?", "+?", "{1,2}", "{2}", "{0,1}?"]))
+        if k == 4:
+            return "(%s)?" % gen(d - 1)
+        if k == 5:
+            return gen(d - 1) + rng.choice(["*", "+", "?"])
+        return "(%s)" % gen(d - 1)
+
+    alphabet = ["a", "b", "c", "1", " ", "\n", "_", ".", "é", "٣", " "]
+    pairs = declined = 0
+    for _ in range(trials):
+        pat = rng.choice(["", "^", r"\A"]) + gen(3) + rng.choice(["", "", "$", r"\Z"])
+        info = core._re_translate(pat)
+        if info is None:
+            declined += 1
+            continue
+        for _s in range(6):
+            s = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 5)))
+            for how in ("match", "search", "fullmatch"):
+                want = getattr(_re, how)(pat, s) is not None
+                q = core._re_holds(info, z3.StringVal(s), how)
+                r = z3.simplify(q)                           # a ground membership: the rewriter decides it
+                if z3.is_true(r) or z3.is_false(r):
+                    got = z3.is_true(r)
+                else:
+                    slv = z3.Solver()
+                    slv.add(q)
+                    c = slv.check()
+                    if c == z3.unknown:
+                        raise SoundnessError(f"regex model: re.{how}({pat!r}, {s!r}) is undecided")
+                    got = c == z3.sat
+                if got != want:
+                    raise SoundnessError(f"regex model: re.{how}({pat!r}, {s!r}) is {want} in CPython, "
+                                         f"the translation says {got}")
+                pairs += 1
+    return {"codepoints": cps, "pairs": pairs, "declined": declined}
+
+
+def string_conversion_audit(trials=160, seed=20261013):
+    """The exact string models against CPython on random strings over a pool of ASCII, Latin-1, cased, titlecase,
+    digit-like, numeric, whitespace, surrogate and astral characters: the is* predicates (core._str_predicate_exact),
+    the int() and float() literal grammars (core._num_lit_res) with the int digit limit at its boundary, and the
+    encode failure conditions of the utf-8 / utf-16 / utf-32 / ascii / latin-1 codecs. Returns the number of
+    comparisons; SoundnessError on any disagreement."""
+    rng = random.Random(seed)
+
+    def truth(term):
+        r = z3.simplify(term)
+        if z3.is_true(r) or z3.is_false(r):
+            return z3.is_true(r)
+        slv = z3.Solver()
+        slv.add(term)
+        c = slv.check()
+        if c == z3.unknown:
+            raise SoundnessError(f"string model undecided on a constant: {term}")
+        return c == z3.sat
+
+    pool = list("aZ09 _.-+eEinfINFxX,") + ["ß", "é", "ÿ", "Ā", "ǅ", "²", "٣",
+                                         "Ⅷ", "ª", " ", "　", "\x00", "\n", "\t", "\x1c",
+                                         "\ud800", "\U0001f600", "İ", "Ⅰ", "１"]
+    preds = ["isdigit", "isdecimal", "isnumeric", "isalpha", "isalnum", "isspace", "isascii", "isprintable",
+             "isupper", "islower"]
+    INT, FLOAT = core._num_lit_res()
+    n = 0
+    for _ in range(trials):
+        s = "".join(rng.choice(pool) for _ in range(rng.randint(0, 5)))
+        sv = z3.StringVal(s)
+        for p in preds:
+            want, got = getattr(s, p)(), truth(core._str_predicate_exact(p, sv))
+            if want != got:
+                raise SoundnessError(f"str.{p}({s!r}) is {want} in CPython, the model says {got}")
+            n += 1
+        for conv, rx in ((int, INT), (float, FLOAT)):
+            try:
+                conv(s)
+                want = True
+            except ValueError:
+                want = False
+            if want != truth(z3.InRe(sv, rx)):
+                raise SoundnessError(f"{conv.__name__}({s!r}) {'parses' if want else 'raises'} in CPython, the "
+                                     f"literal grammar disagrees")
+            n += 1
+        for codec, cond in (("utf-8", core._str_has_surrogate(sv)), ("utf-16", core._str_has_surrogate(sv)),
+                            ("utf-32", core._str_has_surrogate(sv)), ("ascii", core._str_has(sv, 0x80, 0x2FFFF)),
+                            ("latin-1", core._str_has(sv, 0x100, 0x2FFFF))):
+            try:
+                s.encode(codec)
+                raises = False
+            except UnicodeEncodeError:
+                raises = True
+            if raises != truth(cond):
+                raise SoundnessError(f"{s!r}.encode({codec!r}) {'raises' if raises else 'succeeds'} in CPython, the "
+                                     f"model disagrees")
+            n += 1
+    lim = sys.get_int_max_str_digits() if hasattr(sys, "get_int_max_str_digits") else 0
+    if lim:                                                   # the digit limit at its boundary: str -> int
+        for s in ("1" * lim, "1" * (lim + 1), "0" * (lim + 1), " -" + "9" * (lim + 1) + " ", "1_" * lim + "1",
+                  "٣" * (lim + 1)):
+            try:
+                int(s)
+                raises = False
+            except ValueError:
+                raises = True
+            if raises != bool(core._py_int_digits_over(s)):
+                raise SoundnessError(f"int() of a {len(s)}-character literal {'raises' if raises else 'parses'} in "
+                                     f"CPython, the digit-limit model disagrees")
+            n += 1
     return n
 
 
@@ -2339,17 +2857,27 @@ def run_self_tests(fast=False):
     assert check("def f(xs: list):\n    a, *b, c = xs\n    return a\n").status == REFUTED
     assert check("def f(xs: list):\n    if len(xs) >= 2:\n        a, *b = xs\n        return b[0]\n    return 0\n").status == PROVED
     assert check("def f(xs: list):\n    a, *b = xs\n    return b[0]\n").status == REFUTED
-    # str.encode() (default utf-8) never raises and yields bytes of length >= len(s): encode() is trap-free, unguarded encode()[0] refutes on the empty string, a len() guard proves it.
-    assert check("def f(s: str):\n    return s.encode()\n").status == PROVED
+    # str.encode() (default utf-8, strict) raises UnicodeEncodeError exactly on a surrogate code point (witnessed), and otherwise yields bytes of length >= len(s); an unguarded encode()[0] also refutes on the empty string.
+    _enc = check("def f(s: str):\n    return s.encode()\n")
+    assert _enc.status == REFUTED and any(0xD800 <= ord(c) <= 0xDFFF for c in _enc.counterexample_inputs["s"]), _enc
     assert check("def f(s: str):\n    return s.encode()[0]\n").status == REFUTED
-    assert check("def f(s: str):\n    if len(s) >= 1:\n        return s.encode()[0]\n    return 0\n").status == PROVED
-    # an explicit utf-8 codec (by name, case/separator-insensitive) is total; a lossy (ascii/latin-1) or non-constant/keyword-hidden codec can raise UnicodeEncodeError, so UNKNOWN -- s.encode(encoding='ascii') must not be PROVED.
-    assert check("def f(s: str):\n    return s.encode('utf-8')\n").status == PROVED
-    assert check("def f(s: str):\n    return s.encode('UTF_8')\n").status == PROVED
-    assert check("def f(s: str):\n    b = s.encode('utf-8')\n    return len(b) >= len(s)\n").status == PROVED
-    assert check("def f(s: str):\n    return s.encode('ascii')\n").status == UNKNOWN
-    assert check("def f(s: str):\n    return s.encode(encoding='ascii')\n").status == UNKNOWN   # lossy codec: not total
-    assert check("def f(s: str, enc: str):\n    return s.encode(enc)\n").status == UNKNOWN       # non-constant codec
+    # an explicit codec name resolves through CPython's codec registry: utf-8 (any spelling) fails exactly on a surrogate, ascii past U+007F, latin-1 past U+00FF, each witnessed; a lossless errors= handler never raises; the bytes remember their source, so decoding them back is the source and a utf-8 -> ascii round trip fails exactly on a non-ASCII character. A keyword-hidden codec stays UNKNOWN symbolically and is never PROVED.
+    assert check("def f(s: str):\n    return s.encode('utf-8')\n").status == REFUTED
+    assert check("def f(s: str):\n    return s.encode('UTF_8')\n").status == REFUTED
+    assert check("def f(s: str):\n    b = s.encode('utf-8')\n    return len(b) >= len(s)\n").status == REFUTED   # the surrogate trap
+    _ea = check("def f(s: str):\n    return s.encode('ascii')\n")
+    assert _ea.status == REFUTED and any(ord(c) > 0x7F for c in _ea.counterexample_inputs["s"]), _ea
+    _el = check("def f(s: str):\n    return s.encode('latin-1')\n")
+    assert _el.status == REFUTED and any(ord(c) > 0xFF for c in _el.counterexample_inputs["s"]), _el
+    assert check("def f(s: str):\n    return s.encode('ascii', 'replace')\n").status == PROVED
+    assert check("def f(s: str):\n    if s.isascii():\n        return s.encode('ascii')\n    return b''\n").status == PROVED
+    assert check("def f(s: str):\n    return s.encode('utf-8').decode('ascii')\n").status == REFUTED
+    assert check("def f(s: str):\n    if s.isascii():\n        return s.encode('utf-8').decode('ascii')\n"
+                 "    return ''\n").status == PROVED
+    assert prove("def f(s: str):\n    if s.isascii():\n        return s.encode('utf-8').decode('ascii')\n"
+                 "    return s\n", "result == s").status == PROVED
+    assert check("def f(s: str):\n    return s.encode(encoding='ascii')\n").status != PROVED     # keyword-hidden codec
+    assert check("def f(s: str, enc: str):\n    return s.encode(enc)\n").status == REFUTED    # enc='\x00': embedded NUL
     # str search with a position window: find/rfind with a start/end is a sound index in [-1, len(s)) (never raises), index(sub, start) raises ValueError when the substring is absent from s[start:], so a scanning parser is decided.
     assert check("def f(s: str, p: int, m: int):\n    e = s.find(\",\", p, m)\n    return e + 1\n").status == PROVED
     assert check("def f(s: str):\n    return s.index(\",\", 2)\n").status == REFUTED
@@ -2372,24 +2900,28 @@ def run_self_tests(fast=False):
     assert check("def f(s: str):\n    return s.split(',')[5]\n").status == REFUTED           # only >= 1, [5] may be OOB
     assert check("def f(s: str, i: int):\n    return s.split(',')[i]\n").status == REFUTED   # unguarded symbolic index
     assert check("def f(s: str, i: int):\n    p = s.split(',')\n    if 0 <= i < len(p):\n        return p[i]\n    return ''\n").status == PROVED
-    # map(str/repr, X) yields strings, so sep.join(...) is a trap-free string; the iterator is unsized (len() a TypeError, [i] abstains). map(abs, X) stays UNKNOWN.
-    assert check("def f(xs: list):\n    return ''.join(map(str, xs))\n").status == PROVED
-    assert check("def f(xs: list):\n    return ','.join(map(str, xs))\n").status == PROVED
+    # map(str/repr, X) yields strings, so sep.join(...) is a string; str of an int past 4300 digits raises ValueError, so a sequence whose elements may be such ints (a bare list, a dict's keys) is not proved, a list[str] / range-bounded one is. The iterator is unsized (len() a TypeError, [i] abstains). map(abs, X) stays UNKNOWN.
+    assert check("def f(xs: list[str]):\n    return ''.join(map(str, xs))\n").status == PROVED
+    assert check("def f(xs: list[str]):\n    return ','.join(map(str, xs))\n").status == PROVED
     assert check("def f(n: int):\n    return ' '.join(map(str, range(n)))\n").status == PROVED
-    assert check("def f(xs: list):\n    return '-'.join(map(repr, xs))\n").status == PROVED
-    assert check("def f(d: dict):\n    return ','.join(map(str, list(d)))\n").status == PROVED
+    assert check("def f(xs: list[str]):\n    return '-'.join(map(repr, xs))\n").status == PROVED
+    assert check("def f(xs: list):\n    return ','.join(map(str, xs))\n").status != PROVED                # a huge int element
+    assert check("def f(d: dict):\n    return ','.join(map(str, list(d)))\n").status != PROVED
     assert check("def f(xs: list):\n    return len(map(str, xs))\n").status == REFUTED       # map has no len(): TypeError
-    assert check("def f(xs: list):\n    return map(str, xs)[0]\n").status == UNKNOWN          # map not subscriptable
-    assert check("def f(xs: list):\n    return ','.join(map(abs, xs))\n").status == UNKNOWN   # abs may not yield a str
-    # a string-element generator (str(x) for x in xs) is an iterator of strings, so sep.join(...) proves; a non-string one stays UNKNOWN.
-    assert check("def f(xs: list):\n    return ','.join(str(x) for x in xs)\n").status == PROVED
-    assert check("def f(n: int):\n    return '/'.join(str(i) for i in range(n))\n").status == PROVED
-    assert check("def f(xs: list):\n    return ','.join(x for x in xs)\n").status == UNKNOWN     # elements not proven str
-    # a string-element list comp is a sized string sequence, so sep.join([...]) proves; an f-string is str-typed, so f'{x}' joins, has string methods, and f'{x}' + 1 is a refutable TypeError.
-    assert check("def f(xs: list):\n    return ','.join([str(x) for x in xs])\n").status == PROVED
-    assert check("def f(xs: list):\n    return ' '.join(f'{x}' for x in xs)\n").status == PROVED
-    assert check("def f(xs: list):\n    return ' '.join([f'{x}' for x in xs])\n").status == PROVED
-    assert check("def f(x: int):\n    return f'{x}'.upper()\n").status == PROVED
+    assert check("def f(xs: list):\n    return map(str, xs)[0]\n").status == REFUTED          # map not subscriptable
+    assert check("def f(xs: list):\n    return ','.join(map(abs, xs))\n").status == REFUTED   # an int is no str: [0]
+    # a string-element generator (str(x) for x in xs) is an iterator of strings, so sep.join(...) proves when no element can be an int past the str digit limit; a non-string one stays UNKNOWN.
+    assert check("def f(xs: list[str]):\n    return ','.join(str(x) for x in xs)\n").status == PROVED
+    assert check("def f(n: int):\n    return '/'.join(str(i) for i in range(n))\n").status == PROVED   # < 2**63 steps
+    assert check("def f(xs: list):\n    return ','.join(str(x) for x in xs)\n").status == REFUTED     # [10**4300]
+    assert check("def f(xs: list):\n    return ','.join(x for x in xs)\n").status == REFUTED     # an int element: [0]
+    # a string-element list comp is a sized string sequence, so sep.join([...]) proves; an f-string is str-typed, so f'{x}' joins, has string methods, and f'{x}' + 1 is a refutable TypeError; f'{x}' of an int past the str digit limit raises ValueError.
+    assert check("def f(xs: list[str]):\n    return ','.join([str(x) for x in xs])\n").status == PROVED
+    assert check("def f(xs: list[str]):\n    return ' '.join(f'{x}' for x in xs)\n").status == PROVED
+    assert check("def f(xs: list[float]):\n    return ' '.join([f'{x}' for x in xs])\n").status == PROVED
+    assert check("def f(x: int):\n    if -10 ** 100 < x < 10 ** 100:\n        return f'{x}'.upper()\n    return ''\n").status == PROVED
+    _fx = check("def f(x: int):\n    return f'{x}'.upper()\n")                              # the digit limit, witnessed
+    assert _fx.status == REFUTED and abs(_fx.counterexample_inputs["x"]) >= 10 ** 4300, _fx
     assert check("def f(x: int):\n    return f'{x}' + 1\n").status == REFUTED               # str + int: TypeError
     # a sequence's truthiness uses the same length its c[i] bounds check uses, so `if c: c[0]` proves.
     assert check("def f(xs: list):\n    c = [x + 1 for x in xs]\n    if c:\n        return c[0]\n    return 0\n").status == PROVED
@@ -2444,7 +2976,7 @@ def run_self_tests(fast=False):
     assert check("def f(a: list):\n    return 3 * a\n").status == PROVED
     assert check("def f(a: list):\n    return (a * 3)[0]\n").status == REFUTED   # a may be empty -> IndexError
     assert check("def f(b: bytes):\n    c = b * 3\n    if c:\n        return 1000 // (c[0] + 1)\n    return 0\n").status == PROVED
-    assert check("def f(a: list):\n    return a * 1.5\n").status == UNKNOWN   # non-integer multiplier declines
+    assert check("def f(a: list):\n    return a * 1.5\n").status == REFUTED   # a list times a float: TypeError
     # zip / enumerate / dict.items() yield fixed-arity tuples: z[i][0]/z[i][1] decide, a, b = z[i] unpacks, z[i] + 1 is a TypeError. list(enumerate/zip) is sized; sorted(d.items()) and for k, v in d.items() decide.
     assert check("def f(a: list, b: list):\n    z = list(zip(a, b))\n    if z:\n        return z[0] + 1\n    return 0\n").status == REFUTED   # tuple + int
     assert check("def f(a: list, b: list):\n    z = list(zip(a, b))\n    if z:\n        return z[0][0] + 1\n    return 0\n").status == PROVED
@@ -2506,17 +3038,57 @@ def run_self_tests(fast=False):
     assert check("def f(xs: list):\n    return max(xs, key=lambda x: x + 1, default=0)\n").status == PROVED  # no empty trap
     assert check("def f(xs: list):\n    return max(xs, key=lambda x: x + 1)\n").status == REFUTED          # empty ValueError
     assert check("def f(xs: list):\n    if xs:\n        return max(xs, key=lambda x: 10 // x)\n    return 0\n").status == REFUTED
-    assert check("def f(xs: list):\n    return sorted(xs, key=len)\n").status == UNKNOWN                   # builtin key abstains
-    assert check("def f(xs: list):\n    return max(xs, key=abs)\n").status == UNKNOWN
-    # key=str/repr are total on any element, so accepted: sorted(xs, key=str) proves, max(xs, key=str) is the empty-iterable ValueError. Element-type-dependent builtins (len/abs) decline.
-    assert check("def f(xs: list):\n    return sorted(xs, key=str)\n").status == PROVED
-    assert check("def f(xs: list):\n    return max(xs, key=str)\n").status == REFUTED                      # empty -> ValueError
-    assert check("def f(xs: list):\n    if xs:\n        return max(xs, key=repr)\n    return ''\n").status == PROVED
+    assert check("def f(xs: list):\n    return sorted(xs, key=len)\n").status == REFUTED                   # len of an int element
+    assert check("def f(xs: list):\n    return max(xs, key=abs)\n").status == REFUTED                      # max of []
+    # key=str/repr raise only on an int past the str digit limit, so accepted over strings: sorted(xs, key=str) proves for list[str], max(xs, key=str) is the empty-iterable ValueError. Element-type-dependent builtins (len/abs) decline.
+    assert check("def f(xs: list[str]):\n    return sorted(xs, key=str)\n").status == PROVED
+    assert check("def f(xs: list):\n    return sorted(xs, key=str)\n").status != PROVED                   # a huge int element
+    assert check("def f(xs: list[str]):\n    return max(xs, key=str)\n").status == REFUTED                 # empty -> ValueError
+    assert check("def f(xs: list[str]):\n    if xs:\n        return max(xs, key=repr)\n    return ''\n").status == PROVED
     # list(s)/sorted(s) of a str is a list of 1-char strings: ''.join(sorted(s)) proves, s[i].upper() proves, c[0] + 1 refutes (str + int).
     assert check("def f(s: str):\n    return ''.join(sorted(s))\n").status == PROVED
     assert check("def f(s: str):\n    c = sorted(s)\n    if c:\n        return c[0] + 1\n    return 0\n").status == REFUTED
     assert check("def f(s: str):\n    c = list(s)\n    if c:\n        return c[0].upper()\n    return ''\n").status == PROVED
     assert check("def f(xs: list):\n    c = sorted(xs)\n    if c:\n        return c[0] + 1\n    return 0\n").status == PROVED   # list source: int elements
+    # a container's elements are fresh per read, so a second read that may name an element already read (the same or a symbolic index, an alias, a copy, a slice, a sorted / reversed view, an aggregate) marks the over-approximation (_elem_read): a trap conditioned on two reads disagreeing is never a refutation, while reads of provably distinct elements and a single read of a view stay exact.
+    assert check("def f(xs: list[int]):\n    ys = sorted(xs)\n    if len(ys) >= 2 and ys[0] > ys[1]:\n        return 1 // 0\n    return 0\n").status != REFUTED
+    assert check("def f(xs: list[int]):\n    ys = list(xs)\n    if len(ys) >= 1 and ys[0] != xs[0]:\n        return 1 // 0\n    return 0\n").status != REFUTED
+    assert check("def f(xs: list[int]):\n    ys = xs\n    if len(xs) > 0 and xs[0] != ys[0]:\n        return 1 // 0\n    return 0\n").status != REFUTED
+    assert check("def f(xs):\n    if len(xs) > 0 and xs[0] != xs[0]:\n        return 1 // 0\n    return 0\n").status != REFUTED
+    assert check("def f(xs: list[int]):\n    ys = xs[:]\n    if len(xs) > 0 and xs[0] != ys[0]:\n        return 1 // 0\n    return 0\n").status != REFUTED
+    assert check("def f(xs: list[int]):\n    ys = tuple(xs)\n    if len(xs) > 0 and xs[0] != ys[0]:\n        return 1 // 0\n    return 0\n").status != REFUTED
+    assert check("def f(xs: list[int]):\n    ys = list(reversed(xs))\n    if len(xs) > 0 and xs[0] != ys[-1]:\n        return 1 // 0\n    return 0\n").status != REFUTED
+    assert check("def f(xs: list[int]):\n    if len(xs) > 0 and min(xs) > xs[0]:\n        return 1 // 0\n    return 0\n").status != REFUTED
+    assert check("def f(xs: list[int]):\n    if len(xs) == 1 and sum(xs) != xs[0]:\n        return 1 // 0\n    return 0\n").status != REFUTED
+    assert check("def f(xs: list[int]):\n    ys = sorted(xs)\n    if len(ys) >= 1 and ys[0] > min(xs):\n        return 1 // 0\n    return 0\n").status != REFUTED
+    assert check("def f(x: int):\n    ys = sorted([3, 1, 2])\n    if ys[0] != 1:\n        return 1 // 0\n    return x\n").status == PROVED   # a literal sorts exactly
+    assert check("def f(x: int):\n    ys = list([3, 1, 2])\n    return x // ys[1]\n").status == PROVED                  # list() of a literal is its values
+    assert check("def f(xs: list[int]):\n    ys = sorted(xs)\n    return ys[0] + ys[1]\n").status == REFUTED           # the length is an input: IndexError
+    assert check("def f(xs: list[int]):\n    if len(xs) < 2:\n        return 0\n    return xs[0] // xs[1]\n").status == REFUTED   # distinct elements: exact
+    _ov = check("def f(x: int):\n    return x / 2\n")                                                                 # the report names the recorded kind
+    assert _ov.status == REFUTED and "OverflowError" in _ov.reason, _ov.reason
+    # == over containers is decided where the values are known (a container equals itself and never a number, a string, None or a bytes; two literals compare by content) and is otherwise a fresh Bool realizable by some contents (equal sequences have equal lengths, two empty ones are equal), so a trap under a container comparison is never fabricated from an undetermined answer.
+    assert check("def f(xs: list[int]):\n    if xs != xs:\n        return 10 // 0\n    return 0\n").status == PROVED
+    assert check("def f(xs: list[int]):\n    if xs == xs:\n        return 10 // 0\n    return 0\n").status == REFUTED
+    assert check("def f(a: list[int], x: int):\n    if a == x:\n        return 10 // 0\n    return 0\n").status == PROVED
+    assert check("def f(a: list[int], s: str):\n    if a == s:\n        return 10 // 0\n    return 0\n").status == PROVED
+    assert check("def f(a: list[int], b: bytes):\n    if a == b:\n        return 10 // 0\n    return 0\n").status == PROVED
+    assert check("def f(b: bytes):\n    if b'abc' == b'abd':\n        return 10 // 0\n    return 0\n").status == PROVED
+    assert check("def f(b: bytes):\n    if b'abc' == b'abc':\n        return 10 // 0\n    return 0\n").status == REFUTED
+    assert check("def f(a: list[int], b: list[int]):\n    if a == b:\n        return 10 // (len(a) - len(b))\n    return 0\n").status == REFUTED
+    assert check("def f(a: list[int], b: list[int]):\n    if a == b and len(a) != len(b):\n        return 10 // 0\n    return 0\n").status != REFUTED
+    assert check("def f(a: list[int], b: list[int]):\n    if a != b and len(a) == 0 and len(b) == 0:\n        return 10 // 0\n    return 0\n").status != REFUTED
+    # a bytes literal holds its own bytes (an array), so an index and an iteration read the literal's values; the exact first iteration of a loop over a literal binds its first value, a later one one of the rest, so a break before the trapping value is honored.
+    assert check("def f(i: int):\n    return 10 // (b'abc'[0] - 97)\n").status == REFUTED
+    assert check("def f(i: int):\n    return 10 // (b'abc'[0] - 98)\n").status == PROVED
+    assert check("def f(y: int):\n    for x in (0, 5):\n        if x == 0:\n            break\n        y = 100 // (x - 5)\n    return y\n").status != REFUTED
+    assert check("def f(y: int):\n    for x in (5, 0):\n        if x == 0:\n            break\n        y = 100 // (x - 5)\n    return y\n").status == REFUTED
+    assert check("def f(y: int):\n    for x in b'\\x05':\n        y = 100 // (x - 5)\n    return y\n").status == REFUTED
+    # the integer CHC engines bind every variable as an Int relation, so a container parameter they do not carry as a read-only list, used as a scalar (a == x), and a str / bytes / float parameter defer to the value engine instead of reading the comparison as integer equality.
+    assert prove("def f(a: list[int], x: int):\n    s = 0\n    for i in range(x):\n        s = s + i\n    if a == x:\n        s = -1\n    return s\n",
+                 "result != -1", requires="x >= 0").status != REFUTED
+    assert prove("def f(a: list[int], n: int):\n    i = 0\n    while i < n:\n        i = i + 1\n    if a == n:\n        return -1\n    return i\n",
+                 "result != -1", requires="n >= 0").status != REFUTED
     # getattr(o, 'name'[, default]) with a constant name models the field o.name (duck-typed numeric); a parameter used as getattr/hasattr(o, ...) is inferred an object, so arithmetic on a getattr is decided.
     assert check("def f(o):\n    return getattr(o, \"x\", 0) + 1\n").status == PROVED
     assert check("def f(o):\n    return 10 // getattr(o, \"x\", 0)\n").status == REFUTED
@@ -2569,7 +3141,7 @@ def run_self_tests(fast=False):
     assert check("def f(xs, a, b):\n    for x in xs:\n        if a:\n            r = x\n        if b:\n            break\n    else:\n        r = 0\n    return r + 1\n").status == UNKNOWN
     # a for-loop counter stepped by an unconditional integer constant has the exact post-loop value s_init + c * len(seq), so a trap on it is decided (a len() guard proves 10 // s safe); a conditionally-incremented counter stays havoc'd (UNKNOWN).
     assert check("def f(xs: list):\n    if len(xs) >= 1:\n        s = 0\n        for x in xs:\n            s = s + 1\n        return 10 // s\n    return 0\n").status == PROVED
-    assert check("def f(xs: list):\n    s = 0\n    for x in xs:\n        if x > 0:\n            s = s + 1\n    return 10 // s\n").status == UNKNOWN
+    assert check("def f(xs: list):\n    s = 0\n    for x in xs:\n        if x > 0:\n            s = s + 1\n    return 10 // s\n").status == REFUTED   # no positive element: 10 // 0
     # an in-repo class constructor C(args) is an opaque instance: the arguments are trap-checked and a dataclass-style __init__ (only self-attribute stores of trap-free expressions) is confirmed trap-free; a non-trivial one abstains.
     assert check("def f():\n    v = C()\n    return v.x\n", repo={"C": "class C:\n    def __init__(self):\n        self.x = 0\n        self.items = []\n"}).status == PROVED
     assert check("def f(n):\n    p = P(10 // n, n)\n    return p.a\n", repo={"P": "class P:\n    def __init__(self, a, b):\n        self.a = a\n        self.b = b\n"}).status == REFUTED
@@ -2592,7 +3164,7 @@ def run_self_tests(fast=False):
     assert check("def f(xs: list):\n    return xs[0] if xs else None\n").status == PROVED
     assert check("def f(xs: list):\n    return xs[0] if len(xs) > 0 else None\n").status == PROVED
     assert check("def f(xs: list):\n    return xs[0] if True else None\n").status == REFUTED
-    assert check("def f(xs: list):\n    y = xs[0] if xs else None\n    return y + 1\n").status == UNKNOWN
+    assert check("def f(xs: list):\n    y = xs[0] if xs else None\n    return y + 1\n").status == REFUTED   # [] -> None + 1
     # a method's unfilled trailing parameter takes its default (so 10 // x with x=0 is found), the one-expression C(...).m() form constructs then dispatches on the fresh exact-type instance, and a dict-attribute read raises KeyError on an absent key.
     assert check("class C:\n    def m(self, x=2):\n        return 10 // x\n\ndef f():\n    c = C()\n    return c.m()\n").status == PROVED
     assert check("class C:\n    def m(self, x=0):\n        return 10 // x\n\ndef f():\n    c = C()\n    return c.m()\n").status == REFUTED
@@ -2604,10 +3176,10 @@ def run_self_tests(fast=False):
     assert check("def f(s: str):\n    x: str = s\n    return x.upper()\n").status == PROVED
     assert check("def f(o):\n    i = 0\n    while i < 3:\n        i = i + 1\n    return o.x\n").status == PROVED
     # SOUNDNESS: isinstance on a guessed-scalar parameter must not statically prune the non-matching branch. The engine answers isinstance on a z3 scalar from its sort, so isinstance(v, str) on a usage-inferred str reads unconditionally true and would kill the else -- but the type was guessed, so a trap there must not be hidden: the engine abstains. A DECLARED type is a real precondition the pruning honours.
-    assert check("def f(v):\n    if isinstance(v, str):\n        return v.encode()\n    return 1 // 0\n").status == UNKNOWN
-    assert check("def f(v):\n    if isinstance(v, str):\n        return v.encode()\n    return 1 // len(v)\n").status == UNKNOWN
+    assert check("def f(v):\n    if isinstance(v, str):\n        return v.upper()\n    return 1 // 0\n").status != PROVED   # f(0) traps
+    assert check("def f(v):\n    if isinstance(v, str):\n        return v.upper()\n    return 1 // len(v)\n").status != PROVED
     assert check("def f(n):\n    d = {}\n    d[0] = n\n    if isinstance(n, int):\n        return d[0]\n    return 1 // 0\n").status == UNKNOWN
-    assert check("def f(v: str):\n    if isinstance(v, str):\n        return v.encode()\n    return 1 // 0\n").status == PROVED
+    assert check("def f(v: str):\n    if isinstance(v, str):\n        return v.upper()\n    return 1 // 0\n").status == PROVED
     # the guess propagates through a plain alias (x = n), a type tuple, and a negated test, so those abstain too; an alias forced to a concrete type (x = n + 1) and an isinstance on an unrelated container keep their PROVED -- the abstention is scoped to the guessed-scalar name.
     assert check("def f(n):\n    x = n\n    d = {}\n    d[0] = x\n    if isinstance(x, int):\n        return d[0]\n    return 1 // 0\n").status == UNKNOWN
     assert check("def f(n):\n    x = n + 1\n    d = {}\n    d[0] = x\n    if isinstance(x, int):\n        return d[0]\n    return 1 // 0\n").status == PROVED
@@ -2638,7 +3210,7 @@ def run_self_tests(fast=False):
     assert check("def f(d: dict):\n    return d.popitem()\n").status == REFUTED                   # empty dict: KeyError
     assert check("def f(d: dict):\n    k, v = d.popitem()\n    return 0\n").status == REFUTED      # same trap, unpacked
     assert check("def f(d: dict):\n    if len(d) > 0:\n        return d.popitem()\n    return None\n").status == PROVED
-    assert check("def f(d: dict):\n    a = d.popitem()\n    b = d.popitem()\n    return 0\n").status == UNKNOWN   # two pops: not mutate-once
+    assert check("def f(d: dict):\n    a = d.popitem()\n    b = d.popitem()\n    return 0\n").status == REFUTED   # a one-key dict
     # bool(dict) is len(d) != 0, so `if d:` proves a popitem/max(d.values()) as `if len(d) > 0:` does; the `not d` branch is the empty one, so a popitem there refutes; truthiness is not key membership, so a guarded d[k] on an unproven key refutes.
     assert check("def f(d: dict):\n    if d:\n        return d.popitem()\n    return None\n").status == PROVED
     assert check("def f(d: dict):\n    if not d:\n        return None\n    return d.popitem()\n").status == PROVED
@@ -2646,15 +3218,15 @@ def run_self_tests(fast=False):
     assert check("def f(d: dict):\n    if not d:\n        return d.popitem()\n    return 0\n").status == REFUTED   # not d == empty
     assert check("def f(d: dict, k: int):\n    if d:\n        return d[k]\n    return 0\n").status == REFUTED   # non-empty != has k
     assert check("def f(xs: list):\n    if len(xs) >= 1:\n        a = xs.pop()\n        b = xs.pop()\n"
-                 "        return a + b\n    return 0\n").status == UNKNOWN   # popped twice: abstains
-    assert check("def f(xs: list):\n    x = xs.pop()\n    xs.append(x)\n    return x\n").status == UNKNOWN   # pop + append: excluded
+                 "        return a + b\n    return 0\n").status == REFUTED   # popped twice: [0]
+    assert check("def f(xs: list):\n    x = xs.pop()\n    xs.append(x)\n    return x\n").status == REFUTED   # pop of []
     # list.index(x)/remove(x) raise ValueError when x is absent, against the stable membership predicate, so an `x in xs` guard proves them (and connects to the length -- a member means non-empty -- so a guarded index proves). remove mutates, gated to one mutation like pop; the unguarded forms refute with the missing-element witness.
     assert check("def f(xs: list):\n    return xs.index(9)\n").status == REFUTED                     # 9 maybe absent: ValueError
     assert check("def f(xs: list):\n    if 9 in xs:\n        return xs.index(9)\n    return 0\n").status == PROVED
     assert check("def f(xs: list):\n    xs.remove(9)\n    return 0\n").status == REFUTED
     assert check("def f(xs: list):\n    if 9 in xs:\n        xs.remove(9)\n    return 0\n").status == PROVED
     assert check("def f(xs: list):\n    if 9 in xs:\n        return xs[0]\n    return 0\n").status == PROVED   # member => non-empty
-    assert check("def f(xs: list):\n    if 9 in xs:\n        xs.remove(9)\n        xs.remove(9)\n    return 0\n").status == UNKNOWN   # removed twice: abstains
+    assert check("def f(xs: list):\n    if 9 in xs:\n        xs.remove(9)\n        xs.remove(9)\n    return 0\n").status == REFUTED   # one 9: [9]
     # index is non-mutating, so modeled on an immutable tuple too -- t.index(x) raises ValueError unless x is a member, an `x in t` guard proves it; t.count(x) never raises; tuple has no remove (unmodeled AttributeError), so t.remove(...) abstains rather than be miscast as a ValueError.
     assert check("def f(t: tuple):\n    return t.index(9)\n").status == REFUTED                       # 9 maybe absent
     assert check("def f(t: tuple):\n    if 9 in t:\n        return t.index(9)\n    return 0\n").status == PROVED
@@ -2665,6 +3237,43 @@ def run_self_tests(fast=False):
     assert check("def f(d: dict, k):\n    return d.get(k)[0]\n").status == REFUTED            # None[0]: TypeError
     assert check("def f(d: dict, k):\n    return d.get(k, 0) + 1\n").status == PROVED         # a default: never None
     assert check("def f(d: dict, k):\n    v = d.get(k)\n    if v is None:\n        return 0\n    return v + 1\n").status == PROVED
+    # d.get(k) is None exactly when k is absent, and the value otherwise, so a present value still traps (10 // 0) and a
+    # guard on the value proves it; a callee returning None on some path hands its caller that same maybe-None value.
+    assert check("def f(d: dict[str, int], k: str):\n    v = d.get(k)\n    if v is not None:\n"
+                 "        return 10 // v\n    return 0\n").status == REFUTED
+    assert check("def f(d: dict[str, int], k: str):\n    v = d.get(k)\n    if v is not None and v != 0:\n"
+                 "        return 10 // v\n    return 0\n").status == PROVED
+    assert check("def f(d: dict[str, int], k: str):\n    return d.get(k) or 0\n").status == PROVED
+    _mn = {"g": "def g(x: int):\n    if x > 0:\n        return 1\n", "f": "def f(x: int):\n    return g(x) + 1\n"}
+    assert check(_mn["f"], repo=_mn, target="f").status == REFUTED                    # g(0) is None
+    _mn2 = dict(_mn, f="def f(x: int):\n    r = g(x)\n    if r is None:\n        return 0\n    return r + 1\n")
+    assert check(_mn2["f"], repo=_mn2, target="f").status == PROVED
+    # element types follow the annotation through every binding: dict keys and views, items() / enumerate / zip
+    # positions, tuple unpacking, nested sequences and heterogeneous tuples.
+    assert check("def f(d: dict[str, int]):\n    s = 0\n    for k in d:\n        s += d[k]\n    return s\n").status == PROVED
+    assert check("def f(d: dict[str, int]):\n    return [k + 1 for k in d.keys()]\n").status == REFUTED
+    assert check("def f(d: dict[str, int]):\n    return [k.upper() for k in d]\n").status == PROVED
+    assert check("def f(xs: list[str], ys: list[int]):\n    return [x + y for x, y in zip(xs, ys)]\n").status == REFUTED
+    assert check("def f(xs: list[str]):\n    return [(i, x.upper()) for i, x in enumerate(xs)]\n").status == PROVED
+    assert check("def f(xs: list[str]):\n    if len(xs) == 2:\n        a, b = xs\n        return a + 1\n"
+                 "    return 0\n").status == REFUTED
+    assert check("def f(t: tuple[int, str]):\n    return t[1].upper()\n").status == PROVED
+    assert check("def f(t: tuple[int, str]):\n    return t[1] + 1\n").status == REFUTED
+    assert check("def f(m: list[list[str]]):\n    if m and m[0]:\n        return m[0][0].upper()\n    return ''\n").status == PROVED
+    # str.split: the part count is a function of the arguments (two calls agree), exactly one part when the separator
+    # is absent and at least two when present; each part is confirmed against CPython before a refutation stands.
+    assert check("def f(s: str):\n    if ',' in s:\n        return s.split(',')[1]\n    return ''\n").status == PROVED
+    assert check("def f(s: str):\n    if len(s.split(',')) > 2:\n        return s.split(',')[2]\n    return ''\n").status == PROVED
+    assert check("def f(name: str):\n    return ''.join(w[0] for w in name.split())\n").status == PROVED
+    _sp = check("def f(name: str):\n    return ''.join(w[0] for w in name.split(' '))\n")
+    assert _sp.status == REFUTED and _sp.counterexample_inputs == {"name": ""}, _sp
+    assert check("def f(s: str):\n    k, v = s.split('=')\n    return k\n").status == REFUTED
+    # an unannotated parameter passed to a str argument of a standard-library function reads as a str; a callee's
+    # reading never survives inlining, so os.path.dirname of an int the caller passes is the TypeError it is.
+    _dn = {"g": "import os\ndef g(p):\n    return os.path.dirname(p)\n", "f": "def f(n: int):\n    return g(n)\n"}
+    assert check(_dn["f"], repo=_dn, target="f").status == REFUTED
+    _ds = dict(_dn, f="def f(s: str):\n    return g(s)\n")
+    assert check(_ds["f"], repo=_ds, target="f").status == PROVED
     assert check("def f(d: dict, k):\n    x = d.get(k)\n    if x:\n        return x + 1\n    return 0\n").status == PROVED   # truthiness guard
     assert check("def f(d: dict, k):\n    return d.get(k)\n").status == PROVED                # returning None is fine
     # len() of a dict/view/opaque container is nonnegative, so 10 // (len(d) + 1) is trap-free; the unguarded 10 // len(d) refutes (empty dict).
@@ -2703,14 +3312,14 @@ def run_self_tests(fast=False):
     assert check("def f(a: dict, b: dict, k):\n    c = a | b\n    return c[k]\n").status == REFUTED
     assert prove("def f(a: dict, b: dict):\n    return a | b\n", "len(result) >= len(a)", target="f").status == PROVED
     assert prove("def f(a: dict, b: dict):\n    return a | b\n", "len(result) <= len(a) + len(b)", target="f").status == PROVED
-    assert prove("def f(a: dict, b: dict):\n    return a | b\n", "len(result) == len(a) + len(b)", target="f").status == UNKNOWN
+    assert prove("def f(a: dict, b: dict):\n    return a | b\n", "len(result) == len(a) + len(b)", target="f").status == REFUTED   # shared keys
     # a dict's value type is modeled (dict[K, V]): a read-only dict[str, list] read d[k] is a stable list, so len(d[k]) > 0 guards d[k][0], an unguarded d[k][0] refutes, and d[k].append/len(d[k]) decide; dict[str, str] read d[k] is a string. A bare dict leaves d[k] opaque, so d[k][0] abstains.
     assert check("def f(d: dict[str, list], k):\n    if k in d and len(d[k]) > 0:\n        return d[k][0]\n    return 0\n").status == PROVED
     assert check("def f(d: dict[str, list], k):\n    if k in d:\n        return d[k][0]\n    return 0\n").status == REFUTED
     assert check("def f(d: dict[str, list], k):\n    if k in d:\n        d[k].append(1)\n    return 0\n").status == PROVED
     assert check("from typing import Dict, List\ndef f(d: Dict[str, List[int]], k):\n    if k in d and len(d[k]) > 0:\n        return d[k][0]\n    return 0\n").status == PROVED
     assert check("def f(d: dict[str, str], k):\n    if k in d:\n        return d[k].upper()\n    return 0\n").status == PROVED
-    assert check("def f(d: dict, k):\n    if k in d:\n        return d[k][0]\n    return 0\n").status == UNKNOWN
+    assert check("def f(d: dict, k):\n    if k in d:\n        return d[k][0]\n    return 0\n").status == REFUTED   # an int value: 0[0]
     # None in arithmetic is a TypeError trap; an `is None` guard that exits or rebinds proves the use safe
     assert check("def f():\n    y = None\n    return y + 1\n").status == REFUTED
     assert check("def f(c):\n    y = None\n    if c:\n        y = 3\n    return y + 1\n").status == REFUTED
@@ -2813,9 +3422,18 @@ def run_self_tests(fast=False):
     assert prove("def f(x):\n    try:\n        return 10 // x\n    except:\n        return -1\n", "result >= 0", requires="x >= 0", target="f").status != PROVED
     assert prove("def f(x):\n    try:\n        return 10 // x\n    except:\n        return 0\n", "result == 10 // x", requires="x >= 1", target="f").status == PROVED
     assert check("def f(x):\n    try:\n        return 10 // x\n    except:\n        return 10 // x\n", target="f").status == REFUTED
-    # a str/bytes parameter is outside the integer CHC model, so the no-raise engine abstains rather than proving false trap freedom: int(s)/float(s) may ValueError, str + int / str // int is a TypeError, none of which an integer relation sees. check() then decides via the value engine: the conversions UNKNOWN, the type-mismatched arithmetic REFUTED, a safe string use proves, an unused str param doesn't block integer reasoning.
-    assert check("def f(s: str):\n    return int(s)\n").status == UNKNOWN                   # int('x') may raise ValueError
-    assert check("def f(s: str):\n    return float(s)\n").status == UNKNOWN                 # float('x') may raise ValueError
+    # a str/bytes parameter is outside the integer CHC model, so the no-raise engine abstains rather than proving false trap freedom: int(s)/float(s) may ValueError, str + int / str // int is a TypeError, none of which an integer relation sees. check() then decides via the value engine: int(s) / float(s) by their literal grammars (int also by the digit limit), the type-mismatched arithmetic REFUTED, a safe string use proves, an unused str param doesn't block integer reasoning.
+    assert check("def f(s: str):\n    return int(s)\n").status == REFUTED                   # int('') raises ValueError
+    assert check("def f(s: str):\n    return float(s)\n").status == REFUTED                 # float('') raises ValueError
+    # a decimal string under the digit limit parses: never refuted (z3 decides it; cvc5 does not decide the 64-range decimal class, so the proof is single-solver and withheld)
+    assert check("def f(s: str):\n    if s.isdecimal() and len(s) < 100:\n        return int(s)\n    return 0\n").status != REFUTED
+    assert check("def f(s: str):\n    if s.isdigit() and len(s) < 100:\n        return int(s)\n    return 0\n").status == REFUTED   # '²'
+    _dl = check("def f(s: str):\n    if s.isdecimal():\n        return int(s)\n    return 0\n")
+    assert _dl.status == REFUTED and len(_dl.counterexample_inputs["s"]) > 4300, _dl          # past the digit limit
+    assert check("def f(s: str):\n    try:\n        return int(s)\n    except ValueError:\n        return 0\n").status == PROVED
+    assert prove("def f(s: str):\n    if s.isdecimal() and len(s) < 100:\n        return int(s)\n    return 0\n",
+                 "result >= 0").status != REFUTED                                      # a decimal literal: no sign
+    assert check("def f(s: str):\n    if s.isascii() and s.isdecimal():\n        return float(s)\n    return 0.0\n").status != REFUTED
     assert check("def f(s: str):\n    return s + 1\n").status == REFUTED                    # str + int: TypeError
     assert check("def f(s: str):\n    return s // 2\n").status == REFUTED                   # str // int: TypeError
     assert verify_no_raise("nr", "f", "def f(s: str):\n    return int(s)\n",
@@ -3791,31 +4409,31 @@ def run_self_tests(fast=False):
     assert check("def f(b: bytes, bo: str):\n    if bo == 'big' or bo == 'little':\n        return int.from_bytes(b, bo)\n    return 0\n").status == PROVED
     assert check("def f(b: bytes):\n    x = int.from_bytes(b, 'big')\n    return 1000 // (x + 1)\n").status == PROVED
     assert check("def f(b: bytes):\n    x = int.from_bytes(b, 'big', signed=True)\n    return 1000 // (x + 1)\n").status == REFUTED
-    assert check("def f(s: str):\n    return int.from_bytes(s, 'big')\n").status == UNKNOWN
-    # int('42')/float('1.5') parse a string literal exactly as CPython does: a valid literal is total with a known value (int('42') is 42, float('inf') the IEEE infinity), while an unparseable one (float('abc'), int('0x10') without a base) raises ValueError. A non-literal string stays UNKNOWN (a str-to-number predicate is not in the theory).
+    assert check("def f(s: str):\n    return int.from_bytes(s, 'big')\n").status == REFUTED    # a str is no bytes: TypeError
+    # int('42')/float('1.5') parse a string literal exactly as CPython does: a valid literal is total with a known value (int('42') is 42, float('inf') the IEEE infinity), while an unparseable one (float('abc'), int('0x10') without a base) raises ValueError. A non-literal string is decided by the literal grammar.
     assert check("def f():\n    return float('inf')\n").status == PROVED
     assert check("def f():\n    return 100 // (int('42') - 41)\n").status == PROVED   # int('42') == 42 exactly
     assert check("def f():\n    x = float('1.5')\n    return 10.0 / (x - 1.5 + 1.0)\n").status == PROVED   # float('1.5') == 1.5
     assert check("def f():\n    return float('abc')\n").status == REFUTED
     assert check("def f():\n    return int('0x10')\n").status == REFUTED            # base-10 int() rejects a 0x prefix
-    assert check("def f(s: str):\n    return float(s)\n").status == UNKNOWN
-    # int(str_literal, base) parses with the given base (positional or base=, default 10). A valid (digits, base) is total with a known value (int('ff', 16) is 255); an invalid digit string or out-of-range base (0 or 2..36) raises ValueError. base= must use that base, not 10, so int('ff', base=16) is valid. A non-literal string or base abstains.
+    assert check("def f(s: str):\n    return float(s)\n").status == REFUTED
+    # int(str_literal, base) parses with the given base (positional or base=, default 10). A valid (digits, base) is total with a known value (int('ff', 16) is 255); an invalid digit string or out-of-range base (0 or 2..36) raises ValueError. base= must use that base, not 10, so int('ff', base=16) is valid. A non-literal string with another base is decided only by a concrete input (int('', 16) raises).
     assert check("def f():\n    return int('ff', base=16)\n").status == PROVED          # base= keyword, not base 10
     assert check("def f():\n    return 1000 // (int('ff', 16) - 254)\n").status == PROVED   # int('ff', 16) == 255 exactly
     assert check("def f():\n    return int('zz', 16)\n").status == REFUTED
     assert check("def f():\n    return int('5', 37)\n").status == REFUTED               # base out of range (2..36 or 0)
-    assert check("def f(s: str):\n    return int(s, 16)\n").status == UNKNOWN
+    assert check("def f(s: str):\n    return int(s, 16)\n").status == REFUTED
     # itertools.chain(a, b, ...) concatenates sized iterables into one of the summed length (trap-free), so len(list(chain(a, b))) is len(a) + len(b), an index past it refutes (both may be empty), and a non-sized argument (chain(5, 6)) abstains.
     assert check("import itertools\ndef f(a: list, b: list):\n    return 10 // (len(list(itertools.chain(a, b))) - len(a) - len(b) + 1)\n").status == PROVED
     assert check("import itertools\ndef f(a: list, b: list):\n    c = list(itertools.chain(a, b))\n    if len(c) > 0:\n        return c[0]\n    return 0\n").status == PROVED
     assert check("import itertools\ndef f(a: list, b: list):\n    return list(itertools.chain(a, b))[0]\n").status == REFUTED
     assert check("import itertools\ndef f():\n    return len(list(itertools.chain(5, 6)))\n").status == UNKNOWN
-    # a = [1, 2, 3]; a[i] = v mutates a list literal in place: a constant in-range index updates exactly (a[0] = 9 then a[0] is 9), a constant out-of-range or unguarded symbolic index refutes (IndexError), a guarded one proves. A tuple literal is not mutable ((1, 2, 3)[0] = v stays UNKNOWN). Exact reads and unpacking over a list literal are unchanged.
+    # a = [1, 2, 3]; a[i] = v mutates a list literal in place: a constant in-range index updates exactly (a[0] = 9 then a[0] is 9), a constant out-of-range or unguarded symbolic index refutes (IndexError), a guarded one proves. A tuple literal is not mutable ((1, 2, 3)[0] = v is the TypeError it is). Exact reads and unpacking over a list literal are unchanged.
     assert check("def f():\n    a = [1, 2, 3]\n    a[0] = 9\n    return 10 // (a[0] - 8)\n").status == PROVED   # a[0] == 9 exactly
     assert check("def f(i: int):\n    a = [1, 2, 3]\n    if 0 <= i < 3:\n        a[i] = 9\n    return a[0]\n").status == PROVED
     assert check("def f(i: int):\n    a = [1, 2, 3]\n    a[i] = 9\n    return 0\n").status == REFUTED
     assert check("def f():\n    a = [1, 2, 3]\n    a[5] = 9\n    return 0\n").status == REFUTED
-    assert check("def f():\n    a = (1, 2, 3)\n    a[0] = 9\n    return 0\n").status == UNKNOWN          # tuple literal: not mutable
+    assert check("def f():\n    a = (1, 2, 3)\n    a[0] = 9\n    return 0\n").status == REFUTED          # a tuple: TypeError
     assert check("def f():\n    return 10 // ([1, 2, 3][0])\n").status == PROVED                       # exact read preserved
     assert check("def f():\n    a, b = [1, 2]\n    return 10 // a\n").status == PROVED                 # unpacking preserved
     # reversed(seq): an indexable sized sequence gives a NEW sequence of the same length (trap-free), so len(list(reversed(xs))) is len(xs) and an unguarded index refutes (it may be empty); reversed bytes yields ints in [0, 255]. A set/frozenset is not reversible -- reversed(s) refutes (TypeError); a str/bytes/dict (3.8+) is.
@@ -3905,7 +4523,7 @@ def run_self_tests(fast=False):
     assert check("def f(n: int):\n    if -128 <= n and n <= 127:\n        return n.to_bytes(1, 'big', signed=True)\n    return b''\n").status == PROVED
     assert check("def f(n: int):\n    if 0 <= n and n < 256:\n        b = n.to_bytes(4, 'big')\n        return 10 // (len(b) - 4 + 1)\n    return 0\n").status == PROVED
     assert check("def f(n: int):\n    if 0 <= n and n < 256:\n        return n.to_bytes(1, 'middle')\n    return b''\n").status == REFUTED
-    assert check("def f(n: int, L: int):\n    return n.to_bytes(L, 'big')\n").status == UNKNOWN
+    assert check("def f(n: int, L: int):\n    return n.to_bytes(L, 'big')\n").status == REFUTED   # a negative length
 
     # sys.exit/exit()/quit() terminate the path (SystemExit is an intentional exit, not a modeled crash), so a trap on a path the exit guards proves; a module name shadowed by a parameter is not the real sys.exit.
     assert check("import sys\ndef f(x: int):\n    if x == 0:\n        sys.exit()\n    return 10 // x\n").status == PROVED
@@ -3923,21 +4541,23 @@ def run_self_tests(fast=False):
     assert check("def f(n: int):\n    dp = [0] * (n + 1)\n    return dp[0]\n").status == REFUTED
     # SOUNDNESS: [x] * n replicates the reference, so [[0]] * 2 is two names for one inner row (an append through a[0] grows a[1] too). The value engine cannot track the mutation, so a mutating method through a subscript/attribute receiver forgets the root container; the later read abstains rather than return the stale pre-mutation row.
     _alias = "def f():\n    a = [[0]] * 2\n    a[0].append(1)\n    return len(a[1])\n"
-    assert prove(_alias, "result == 1", target="f").status == UNKNOWN, prove(_alias, "result == 1", target="f")
+    assert prove(_alias, "result == 1", target="f").status == REFUTED, prove(_alias, "result == 1", target="f")   # it is 2
     assert prove(_alias, "result == 2", target="f").status == UNKNOWN, prove(_alias, "result == 2", target="f")
-    # even with separately-written rows the value engine cannot model the append's effect, so a read of the mutated row abstains rather than be proved wrong.
+    # even with separately-written rows the value engine cannot model the append's effect, so a read of the mutated row abstains symbolically; the stale value is refuted by the run itself.
     assert prove("def f():\n    a = [[0], [0]]\n    a[0].append(1)\n    return len(a[0])\n",
-                 "result == 1", target="f").status == UNKNOWN
-    # the bare-name append-then-read is forgotten the same way (already sound; locked here as a regression guard)
-    assert prove("def f():\n    a = [0]\n    a.append(1)\n    return len(a)\n", "result == 1", target="f").status == UNKNOWN
+                 "result == 1", target="f").status == REFUTED
+    # the bare-name append-then-read is forgotten the same way (never the stale value; locked here as a regression guard)
+    assert prove("def f():\n    a = [0]\n    a.append(1)\n    return len(a)\n", "result == 1", target="f").status == REFUTED
     # the same staleness through an alias: b = a makes b and a one object, so b.append grows a too. Forgetting only the receiver b is not enough, so the engine forgets every name sharing the mutated object.
     assert prove("def f():\n    a = [2, 3]\n    b = a\n    b.append(3)\n    return len(a)\n",
-                 "result == 2", target="f").status == UNKNOWN
+                 "result == 2", target="f").status == REFUTED
     assert prove("def f():\n    a = [2, 3]\n    b = a\n    b.append(3)\n    return len(a)\n",
                  "result == 3", target="f").status == UNKNOWN
 
     # str % args (printf formatting) is a trap-free string; the args are trap-checked, so a div by zero in an argument still refutes.
-    assert check("def f(a: int, b: int):\n    return '%d/%d' % (a, b)\n").status == PROVED
+    assert check("def f(a: int, b: int):\n    return '%d/%d' % (a, b)\n").status == REFUTED   # a past 4300 digits
+    assert check("def f(a: int, b: int):\n    if -10 ** 50 < a < 10 ** 50 and -10 ** 50 < b < 10 ** 50:\n"
+                 "        return '%d/%d' % (a, b)\n    return ''\n").status == PROVED
     assert check("def f(x: int):\n    return '%d' % (10 // x)\n").status == REFUTED
 
     # verification-guided repair loop: a counterexample drives a generator to a verified result
@@ -4459,7 +5079,7 @@ def run_self_tests(fast=False):
     assert prove(_ape, "len(result) == len(xs)", target="f").status == PROVED
     assert prove(_ap, "len(result) == len(xs) + 1", target="f").status == REFUTED
     assert prove("def f(xs: list):\n    out = []\n    for x in xs:\n        if x > 0:\n            out.append(x)\n    return out\n",
-                 "len(result) == len(xs)", target="f").status == UNKNOWN   # conditional append: not one per element
+                 "len(result) == len(xs)", target="f").status == REFUTED   # conditional append: xs=[0] keeps nothing
     # for-loop equivalence by a relational product: one inductive invariant over both accumulating loops, sound both ways.
     _sum1 = "def f(xs: list):\n    total = 0\n    for x in xs:\n        total = total + x\n    return total\n"
     _sum2 = "def g(xs: list):\n    acc = 0\n    for y in xs:\n        acc = acc + y\n    return acc\n"
@@ -4479,7 +5099,7 @@ def run_self_tests(fast=False):
     assert prove(_rl, "result >= 0", requires=_rlr, target="cnt").status == PROVED
     _rs = "def hsum(xs: list, i):\n    if i >= len(xs):\n        return 0\n    return xs[i] + hsum(xs, i + 1)\n"
     assert prove(_rs, "result >= 0", requires=_rlr, target="hsum").status == REFUTED        # a sum can be negative
-    assert prove(_rs, "result >= xs[0]", requires=_rlr, target="hsum").status == UNKNOWN    # list subscript: declined
+    assert prove(_rs, "result >= xs[0]", requires=_rlr, target="hsum").status == REFUTED    # xs=[1, -5]: -4 < 1
     # prove falls back to the value/loop over-approximation for a post the exact engines decline (a for-loop, annotated assignment, comprehension): sound and PROVED-only, so a post depending on the loop's exact effect, or a false one, is not proved.
     assert prove("def f(xs):\n    s = 0\n    for x in xs:\n        s = s + 1\n    return 5\n", "result == 5", target="f").status == PROVED
     assert prove("def f(xs, k):\n    s = 0\n    for x in xs:\n        s = s + x\n    return k\n", "result == k", target="f").status == PROVED
@@ -4922,7 +5542,7 @@ def run_self_tests(fast=False):
     assert check(_ma + "def f(a: float, b: float):\n    return math.hypot(a, b)\n", target="f").status == PROVED   # never traps
     assert check(_ma + "def f(x: float):\n    return math.degrees(math.atan(x))\n", target="f").status == PROVED
     assert check("from math import floor\ndef f(n: int):\n    return floor(n)\n", target="f").status == PROVED   # bare imported name
-    assert prove(_ma + "def f(x: float):\n    return math.floor(x)\n", "result >= 0", requires="x >= 0.0", target="f").status == UNKNOWN   # value over-approx
+    assert prove(_ma + "def f(x: float):\n    return math.floor(x)\n", "result >= 0", requires="x >= 0.0", target="f").status == REFUTED   # floor(inf) raises
     assert math_domain_audit() > 0                             # every modeled domain trap holds against CPython
     # math.pow always returns a float with the exact ValueError domain (neg finite base ** fractional, zero base ** negative); the ** operator x ** n (constant integral n) carries sign axioms and traps at base 0 for n < 0. A fractional ** abstains. math_pow_axiom_audit checks it vs CPython.
     assert prove(_ma + "def f(x: float):\n    if x >= 0.0:\n        return math.pow(x, 0.5)\n    return 1.0\n",
@@ -4935,7 +5555,7 @@ def run_self_tests(fast=False):
                  "result >= 0.0", target="f").status == PROVED                         # integral-valued float exponent
     assert prove("def f(x: float):\n    if x > 0.0 and x < 1e150:\n        return x ** -2\n    return 1.0\n",
                  "result >= 0.0", target="f").status == PROVED                         # negative integral exponent
-    assert prove("def f(x: float):\n    return x ** 0.5\n", "result >= 0.0", target="f").status == UNKNOWN     # complex boundary: abstains
+    assert prove("def f(x: float):\n    return x ** 0.5\n", "result >= 0.0", target="f").status == REFUTED     # nan ** 0.5 is nan
     assert math_pow_axiom_audit() > 0                          # every math.pow / x ** n trap and axiom holds vs CPython
     # OverflowError (math range error) for a magnitude-growing power: check must not prove an unbounded-base power trap-free (issue #3, every spelling routes math.pow / builtin pow / x ** n through the same range trap); the trap fires at the exact DBL_MAX^(1/n) base boundary, so a bound below it proves and one that crosses it does not, while a constant and x ** 0 stay trap-free and prove is unaffected since overflow raises.
     assert check("import math\ndef f(x: float):\n    return math.pow(x, 3.0)\n", target="f").status != PROVED   # math.pow can overflow
@@ -5018,7 +5638,7 @@ def run_self_tests(fast=False):
     assert prove("def f(c: str):\n    return chr(ord(c))\n", "result == c",
                  requires="len(c) == 1").status == PROVED                                       # chr . ord == id
     assert prove("def f(c: str):\n    if len(c) == 1:\n        return ord(c)\n    return 0\n",
-                 "result == 65").status == UNKNOWN                                              # value not pinned
+                 "result == 65").status == REFUTED                                              # c='a': 97
     assert check("def f(n: int):\n    return chr(n)\n").status == REFUTED                       # ValueError out of range
     assert check("def f(n: int):\n    if n >= 0 and n <= 1114111:\n        return chr(n)\n    return 'x'\n").status == PROVED
     # an unannotated parameter paired with a non-integral float literal (x * 0.5, x == 0.5) or a float-only method is modeled under IEEE-754, not the default int; an integral float (2.0) is ambiguous, a subscript stays a seq.
@@ -5051,8 +5671,9 @@ def run_self_tests(fast=False):
     assert check("import json\ndef f(s: str):\n    return json.loads(s)\n", target="f").status == UNKNOWN   # a parser: excluded
     assert stdlib_trapfree_audit() > 0                        # every registered entry holds against CPython
     # the trap-bearing builtins bin/hex/oct/ascii/format (str results), chr/ord (a domain ValueError), and hash (an int): each composes or refutes against its exact trap.
-    assert check("def f(n: int):\n    return hex(n) + bin(n) + oct(n)\n", target="f").status == PROVED
-    assert check("def f(x: int):\n    return ascii(x)\n", target="f").status == PROVED
+    assert check("def f(n: int):\n    return hex(n) + bin(n) + oct(n)\n", target="f").status == PROVED   # no digit limit
+    assert check("def f(x: int):\n    return ascii(x)\n", target="f").status == REFUTED   # decimal: past 4300 digits
+    assert check("def f(x: str):\n    return ascii(x)\n", target="f").status == PROVED
     assert check("def f(x: float):\n    return format(x, '.2f')\n", target="f").status == PROVED
     assert check("def f(n: int):\n    return chr(n)\n", target="f").status == REFUTED        # outside [0, 0x10FFFF]
     assert check("def f(n: int):\n    if 0 <= n and n < 1000:\n        return chr(n)\n    return 'a'\n", target="f").status == PROVED
@@ -5072,8 +5693,14 @@ def run_self_tests(fast=False):
                  requires="len(s) == 0").status == PROVED
     assert verify_predicate("upper-ne", "f", "def f(s: str):\n    return s.upper()\n",
                             lambda za, o: z3.Implies(z3.Length(za["s"]) >= 1, z3.Length(o) >= 1), {}).status == PROVED
-    # a property the over-approximation does not force is UNKNOWN
-    assert prove("def f(s: str):\n    return s.strip()\n", "result == s").status == UNKNOWN
+    # a property the over-approximation does not force is UNKNOWN when true, and refuted on a concrete input when false
+    assert prove("def f(s: str):\n    return s.strip()\n", "result == s").status == REFUTED          # s=' '
+    assert prove("def f(s: str):\n    return s.strip()\n", "not result.startswith(' ')").status == UNKNOWN
+    # a case map keeps the length unless a character's map is longer ('ß'.upper() is 'SS'); replace by literals has the exact length
+    assert prove("def f(s: str):\n    if s.isascii():\n        return s.upper()\n    return s\n", "len(result) == len(s)").status != REFUTED
+    assert prove("def f(s: str):\n    return s.upper()\n", "len(result) == len(s)").status == REFUTED
+    assert prove("def f(s: str):\n    return s.replace('a', 'bb')\n", "len(result) >= len(s)").status == PROVED
+    assert prove("def f(s: str):\n    return s.replace('ab', 'c')\n", "len(result) <= len(s)").status == PROVED
     # str.split/splitlines yield a list of strings of unknown length, so the length is a nonnegative integer (a sound over-approximation).
     assert prove("def f(s: str):\n    return len(s.split())\n", "result >= 0").status == PROVED
     assert prove("def f(s: str):\n    return len(s.splitlines())\n", "result >= 0").status == PROVED
@@ -5122,19 +5749,24 @@ def run_self_tests(fast=False):
         assert verify_predicate("unmod", "f", _m, lambda za, o: z3.BoolVal(True), {}).status == UNKNOWN
     # an f-string format spec that is a constant alignment/width spec ([fill]<>^ then an optional non-zero width) applies to a str/int/float/bool through __format__ without raising -- a string; a spec with a sign/0-fill/precision/presentation type can raise on an incompatible value and stays UNKNOWN.
     assert check("def f(name: str):\n    return f'{name:>20}'\n", target="f").status == PROVED
-    assert check("def f(n: int):\n    return f'{n:^8}'\n", target="f").status == PROVED
+    assert check("def f(n: int):\n    return f'{n:^8}'\n", target="f").status == REFUTED   # decimal past 4300 digits
+    assert check("def f(n: bool):\n    return f'{n:^8}'\n", target="f").status == PROVED
     assert verify_predicate("fstr-spec", "f", "def f(x: float):\n    return f'{x:.2f}'\n",
                             lambda za, o: z3.BoolVal(True), {}).status == UNKNOWN    # a precision/type spec: may raise
     # an f-string field with a constant presentation spec compatible with the value's type never raises, so check() proves trap freedom; a type-incompatible spec is declined; the safe-spec predicate is validated in format_spec_audit.
     assert check("def f(x: float):\n    return f'{x:.2f}'\n", target="f").status == PROVED
     assert check("def f(x: float):\n    return f'{x:+.3e}'\n", target="f").status == PROVED
-    assert check("def f(n: int):\n    return f'{n:d}'\n", target="f").status == PROVED
-    assert check("def f(n: int):\n    return f'{n:#x}'\n", target="f").status == PROVED
-    assert check("def f(n: int):\n    return f'{n:.2f}'\n", target="f").status == PROVED        # int via a float type: coerced
+    assert check("def f(n: int):\n    return f'{n:d}'\n", target="f").status == REFUTED       # the str digit limit
+    assert check("def f(n: int):\n    if -10 ** 9 < n < 10 ** 9:\n        return f'{n:d}'\n    return ''\n",
+                 target="f").status == PROVED
+    assert check("def f(n: int):\n    return f'{n:#x}'\n", target="f").status == PROVED         # hex: no digit limit
+    assert check("def f(n: int):\n    return f'{n:.2f}'\n", target="f").status == REFUTED      # int -> double overflow
+    assert check("def f(n: int):\n    if -10 ** 300 < n < 10 ** 300:\n        return f'{n:.2f}'\n    return ''\n",
+                 target="f").status == PROVED                                                # coerced in range
     assert check("def f(s: str):\n    return f'{s:.5s}'\n", target="f").status == PROVED        # string truncation
-    assert check("def f(x: float):\n    return f'{x:d}'\n", target="f").status == UNKNOWN        # integer type on a float
-    assert check("def f(n: int):\n    return f'{n:.2d}'\n", target="f").status == UNKNOWN        # precision on an integer
-    assert check("def f(s: str):\n    return f'{s:d}'\n", target="f").status == UNKNOWN          # numeric type on a string
+    assert check("def f(x: float):\n    return f'{x:d}'\n", target="f").status == REFUTED        # integer type on a float
+    assert check("def f(n: int):\n    return f'{n:.2d}'\n", target="f").status == REFUTED        # precision on an integer
+    assert check("def f(s: str):\n    return f'{s:d}'\n", target="f").status == REFUTED          # numeric type on a string
     assert format_spec_audit() > 0                              # the safe-spec predicate holds against CPython
     # str.maketrans(x, y) raises ValueError when the strings differ in length (modeled against their symbolic lengths); the dict and three-argument forms carry no length trap.
     assert check("def f():\n    return str.maketrans('abc', 'xyz')\n", target="f").status == PROVED
@@ -5142,8 +5774,19 @@ def run_self_tests(fast=False):
     assert check("def f(a: str, b: str):\n    return str.maketrans(a, b)\n", target="f").status == REFUTED   # lengths may differ
     assert check("def f(a: str, b: str):\n    if len(a) == len(b):\n        return str.maketrans(a, b)\n    return {}\n",
                  target="f").status == PROVED                                       # length guard: safe
-    # re.match/search/fullmatch with a constant compilable pattern is a total call returning Optional[Match] modeled as None, so an unguarded .group() is a trap and an `if m:` guard proves the use safe. A non-constant pattern or one that does not compile stays UNKNOWN.
-    assert check("import re\ndef f(s: str):\n    return re.match('a.*', s).group()\n", target="f").status == REFUTED
+    # re.match/search/fullmatch with a constant compilable pattern is a total call returning a Match exactly when the pattern, translated to a z3 regular expression, matches, else None: an unguarded .group() is a trap on a non-matching subject, an `if m:` guard proves the use safe, a fullmatch-validated subject proves a later int(), and a group index past the pattern's groups is an IndexError. A non-constant pattern or one that does not compile stays UNKNOWN.
+    _rm = check("import re\ndef f(s: str):\n    return re.match('a.*', s).group()\n", target="f")
+    assert _rm.status == REFUTED and _rm.counterexample_inputs is not None \
+        and re.match('a.*', _rm.counterexample_inputs["s"]) is None, _rm
+    assert check("import re\ndef f(s: str):\n    return re.match('a*', s).group()\n", target="f").status == PROVED
+    assert check("import re\ndef f(s: str):\n    m = re.fullmatch(r'(\\d+)-(\\d+)', s)\n    if m:\n"
+                 "        return m.group(3)\n    return ''\n", target="f").status == REFUTED       # no group 3
+    assert check("import re\ndef f(s: str):\n    m = re.fullmatch(r'(\\d+)-(\\d+)', s)\n    if m:\n"
+                 "        return m.group(2)\n    return ''\n", target="f").status == PROVED
+    assert check("import re\ndef f(s: str):\n    m = re.search(r'x(\\d)?', s)\n    if m:\n"
+                 "        return m.group(1).upper()\n    return ''\n", target="f").status != PROVED    # group 1 may be None
+    assert check("import re\nP = 0\ndef f(s: str):\n    p = re.compile('[ab]+')\n    if p.fullmatch(s):\n"
+                 "        return s[0]\n    return ''\n", target="f").status == PROVED              # a match: s is non-empty
     assert check("import re\ndef f(s: str):\n    m = re.match('a.*', s)\n    if m:\n        return m.group()\n    return ''\n",
                  target="f").status == PROVED
     assert check("import re\ndef f(s: str):\n    m = re.search('x', s)\n    if m is not None:\n        return m.group()\n    return ''\n",
@@ -5208,7 +5851,7 @@ def run_self_tests(fast=False):
     assert prove("def f(a, b):\n    return a | b\n", "result >= a", requires="a >= 0 and b >= 0").status == PROVED
     assert prove("def f(a, b):\n    return a & b\n", "result <= a", requires="a >= 0 and b >= 0").status == PROVED
     assert prove("def f(a, b):\n    return a ^ b\n", "result >= 0", requires="a >= 0 and b >= 0").status == PROVED
-    assert prove("def f(a, b):\n    return a | b\n", "result == a", requires="a >= 0 and b >= 0").status == UNKNOWN
+    assert prove("def f(a, b):\n    return a | b\n", "result == a", requires="a >= 0 and b >= 0").status == REFUTED   # 0 | 1
     _bor = verify_predicate("bor-unk", "f", "def f(a, b):\n    return a | b\n", lambda za, o: o == 0, {})
     assert _bor.status == UNKNOWN and _bor.reason, _bor      # the over-approximation withholds a counterexample
     # trap freedom: the bitwise result is a fresh over-approximated integer flowing into later arithmetic. The nonnegative-operand bounds carry through (0 <= a & b, so 10 // ((a & b) + 1) proves under a nonneg guard), while an unguarded 10 // (a & b) abstains (a & b can be 0). The bare a & b is trap-free.
@@ -5272,21 +5915,21 @@ def run_self_tests(fast=False):
     assert prove("def f(x, y):\n    return x ** y\n", "result >= 0", requires="x >= 0 and y >= 0", target="f").status == PROVED
     assert prove("def f(x, y):\n    return x ** y\n", "result >= 1", requires="x >= 1 and y >= 0", target="f").status == PROVED
     assert prove("def f(x, y):\n    return pow(x, y)\n", "result >= 0", requires="x >= 0 and y >= 0", target="f").status == PROVED
-    assert prove("def f(x, y):\n    return x ** y\n", "result >= 0", target="f").status == UNKNOWN     # unconstrained: not forced
+    assert prove("def f(x, y):\n    return x ** y\n", "result >= 0", target="f").status == REFUTED     # (-1) ** 1
     # a constant exponent over the unroll cap (64) is over-approximated but the reason distinguishes it from a variable exponent.
     _vcap = prove("def f(x):\n    return x ** 100\n", "result >= x", requires="x >= 1", target="f")
     assert _vcap.status == UNKNOWN and "constant exponent over the unroll cap" in _vcap.reason, _vcap
-    _vvar = prove("def f(x, y):\n    if y >= 1:\n        return x ** y\n    return 1\n", "result >= x",
+    _vvar = prove("def f(x, y):\n    if y >= 1:\n        return x ** y\n    return x\n", "result >= x",
                   requires="x >= 1", target="f")
     assert _vvar.status == UNKNOWN and "variable exponent" in _vvar.reason, _vvar
-    # trap freedom of a variable-exponent power: the only trap is 0 ** (negative), exact on the operands, so an unguarded x ** n refutes and a guard proves. A nested over-approximated base ((a ** b) ** n) does not fabricate a refutation; a divisor built from the result stays UNKNOWN.
+    # trap freedom of a variable-exponent power: the only trap is 0 ** (negative), exact on the operands, so an unguarded x ** n refutes and a guard proves. A nested over-approximated base ((a ** b) ** n) does not fabricate a refutation; a divisor built from the result is refuted only on a concrete input (x=-1, n=1 makes it 0).
     assert check("def f(x: int, n: int):\n    return x ** n\n", target="f").status == REFUTED
     assert check("def f(n: int):\n    return 0 ** n\n", target="f").status == REFUTED
     assert check("def f(x: int, n: int):\n    if x != 0:\n        return x ** n\n    return 0\n", target="f").status == PROVED
     assert check("def f(x: int, n: int):\n    if n >= 0:\n        return x ** n\n    return 0\n", target="f").status == PROVED
     assert check("def f(n: int):\n    return 2 ** n\n", target="f").status == PROVED
     assert check("def f(a: int, b: int, n: int):\n    if a >= 1 and n >= 0:\n        y = a ** b\n        return y ** n\n    return 0\n", target="f").status == PROVED
-    assert check("def f(x: int, n: int):\n    if x != 0:\n        return 10 // (x ** n + 1)\n    return 0\n", target="f").status == UNKNOWN
+    assert check("def f(x: int, n: int):\n    if x != 0:\n        return 10 // (x ** n + 1)\n    return 0\n", target="f").status == REFUTED
     # a float accumulator crossing a loop keeps its float kind through the havoc, so a later bitwise x & 1 (a TypeError on a float) abstains rather than falsely PROVE.
     assert check("def f(n: int):\n    x = 1.5\n    for i in range(n):\n        x = x + 1.0\n    return x & 1\n", target="f").status != PROVED
     assert check("def f(n: int):\n    x = 1.5\n    for i in range(n):\n        x = x + 1.0\n    return x | 1\n", target="f").status != PROVED
@@ -5324,9 +5967,10 @@ def run_self_tests(fast=False):
     # container/iterator builtins (set/frozenset/tuple/iter) are trap-free over an iterable; next() of a possibly-empty iterator raises StopIteration (guarded by non-empty, it proves).
     assert check("def f(xs):\n    return len(set(xs))\n", target="f").status == PROVED
     assert check("def f(xs):\n    s = set(xs)\n    return s[0]\n", target="f").status == REFUTED
-    assert check("def f(n: int):\n    return set(n)\n", target="f").status == UNKNOWN
+    assert check("def f(n: int):\n    return set(n)\n", target="f").status == REFUTED   # an int is not iterable
     assert check("def f(xs):\n    t = tuple(xs)\n    if len(t) > 0:\n        return t[0]\n    return 0\n", target="f").status == PROVED
-    assert check("def f(xs):\n    it = iter(xs)\n    return next(it)\n", target="f").status == UNKNOWN   # StopIteration on an empty iterable
+    _nx = check("def f(xs):\n    it = iter(xs)\n    return next(it)\n", target="f")       # StopIteration on an empty
+    assert _nx.status == REFUTED and _nx.counterexample_inputs == {"xs": []}, _nx       # iterable: witnessed by []
     assert check("def f(xs):\n    it = iter(xs)\n    if xs:\n        return next(it)\n    return 0\n", target="f").status == PROVED   # guarded non-empty: proves
     assert check("def f(xs):\n    return set(10 // k for k in xs)\n", target="f").status == REFUTED
     # set union/intersection/difference/symmetric-difference carry content: membership on the result reduces to the operands', with the size relation, exactly.
@@ -5425,7 +6069,7 @@ def run_self_tests(fast=False):
     assert prove("def f(b: bytes):\n    c = b[1:]\n    if len(c) > 0:\n        return c[0]\n    return 0\n",
                  "result >= 0 and result <= 255").status == PROVED                          # slice keeps byte elements
     assert prove("def f(s: str):\n    if len(s) >= 2:\n        return s[::2]\n    return ''\n",
-                 "result == s").status == UNKNOWN                                           # strided content not pinned
+                 "result == s").status == REFUTED                                           # 'ab'[::2] == 'a'
     assert check("def f(xs: list, k: int):\n    return xs[::k]\n", target="f").status == REFUTED        # zero step: ValueError
     assert check("def f(xs: list, k: int):\n    if k != 0:\n        return xs[::k]\n    return xs\n",
                  target="f").status == PROVED
@@ -5761,9 +6405,15 @@ def run_self_tests(fast=False):
     _iz = check("def f(x):\n    return 7 // int(x)\n", target="f")          # int(x) == 0 reachable -> witnessed REFUTED
     assert _iz.status == REFUTED and _iz.counterexample_inputs == {"x": 0}, _iz
     assert check("def f():\n    return 5 // int()\n", target="f").status == REFUTED       # int() == 0
-    assert check("def f(x):\n    y = x / 2.0\n    return int(y)\n", target="f").status == PROVED   # int(float): no trap
-    _io = check("def f(x):\n    y = x / 2.0\n    return 9 // int(y)\n", target="f")       # over-approx: no spurious refute
-    assert _io.status == UNKNOWN, _io
+    # x / 2.0 converts the int x to a double: past the double range that is CPython's OverflowError, witnessed
+    _io = check("def f(x):\n    y = x / 2.0\n    return int(y)\n", target="f")
+    assert _io.status == REFUTED and abs(_io.counterexample_inputs["x"]) >= 2 ** 1024 - 2 ** 970, _io
+    assert check("def f(x):\n    if -2 ** 60 < x < 2 ** 60:\n        return int(x / 2.0)\n    return 0\n",
+                 target="f").status == PROVED                                          # in range: int(finite) is total
+    _io = check("def f(x):\n    if -2 ** 60 < x < 2 ** 60:\n        return 9 // int(x / 2.0)\n    return 0\n",
+                target="f")                                                            # int(x / 2.0) is 0 for |x| <= 1
+    assert _io.status == REFUTED and abs(_io.counterexample_inputs["x"]) <= 1, _io
+    assert check("def f(x: float):\n    return int(x / 2.0)\n", target="f").status == REFUTED   # int(inf) / int(nan)
     # sum(...): exact over a constant-length sequence (a trap through it refutes), a sound over-approximation over an int-element container. A bare parameter used only as sum(p) is inferred a container.
     assert prove("def f(a, b, c):\n    return sum((a, b, c))\n", "result == a + b + c", target="f").status == PROVED
     assert check("def f():\n    return 10 // sum((1, -1))\n", target="f").status == REFUTED       # exact 0
@@ -5773,19 +6423,26 @@ def run_self_tests(fast=False):
     _su = check("def f(nums):\n    return 10 // sum(nums)\n", target="f")                          # sum can be 0:
     assert _su.status == REFUTED, _su                                                             # a real trap
     assert check("def f(xs: list):\n    return sum(xs) / len(xs)\n", target="f").status == REFUTED
-    assert check("def f(xs: list):\n    if len(xs) > 0:\n        return sum(xs) / len(xs)\n    return 0\n",
+    assert check("def f(xs: list[float]):\n    if len(xs) > 0:\n        return sum(xs) / len(xs)\n    return 0\n",
                  target="f").status == PROVED
+    assert check("def f(xs: list[int]):\n    if len(xs) > 0:\n        return sum(xs) / len(xs)\n    return 0\n",
+                 target="f").status != PROVED                                                      # an int sum past 2**1024
     assert check("def f(xs: list):\n    s = sum(xs)\n    if s != 0:\n        return 10 // s\n    return 0\n",
                  target="f").status == PROVED                                                      # guard on the stable sum
     # math float constants (math.pi/e/tau/inf/nan, and bare-imported names) are modeled exactly, so arithmetic over them decides; a local name shadows the module.
-    assert check("def f(r):\n    return 2 * pi * r\n", target="f").status == PROVED                # bare pi
-    assert prove("def f(r):\n    return 2 * math.pi * r\n", "result == 2.0 * 3.141592653589793 * r",
-                 target="f").status == PROVED                                                      # exact value
-    assert check("def f(angle, radius):\n    return 2 * math.pi * radius * (angle / 360)\n",
+    assert check("def f(r: float):\n    return 2 * pi * r\n", target="f").status == PROVED         # bare pi
+    assert check("def f(r):\n    return 2 * pi * r\n", target="f").status == REFUTED              # an int r past 2**1024
+    assert prove("def f(r: float):\n    return 2 * math.pi * r\n", "result == 2.0 * 3.141592653589793 * r",
+                 requires="r == r", target="f").status == PROVED                                   # exact value
+    assert prove("def f(r: float):\n    return 2 * math.pi * r\n", "result == 2.0 * 3.141592653589793 * r",
+                 target="f").status == REFUTED                                                     # NaN != NaN
+    assert check("def f(angle: float, radius: float):\n    return 2 * math.pi * radius * (angle / 360)\n",
                  target="f").status == PROVED                                                      # a real arc length
     assert check("def f(math):\n    return math + 1\n", target="f").status == PROVED               # param shadows module
     # float(...): exact for an int/bool argument (a float-zero division through it refutes), 0.0 for float(); a string or unmodeled argument is declined.
-    assert prove("def f(x):\n    return float(x)\n", "result == 1.0 * x", target="f").status == PROVED
+    assert prove("def f(x):\n    return float(x)\n", "result == 1.0 * x", requires="-2 ** 1000 < x < 2 ** 1000",
+                 target="f").status == PROVED
+    assert prove("def f(x):\n    return float(x)\n", "result == 1.0 * x", target="f").status == REFUTED   # OverflowError
     assert check("def f(x):\n    return 1.0 / float(x)\n", target="f").status == REFUTED            # float(0) == 0.0
     assert check("def f():\n    return float()\n", target="f").status == PROVED                     # float() -> 0.0
     # bool(...): exact for int/bool/float -- bool() is False, bool(int) the nonzero test; a string/container argument is declined.
@@ -5793,18 +6450,23 @@ def run_self_tests(fast=False):
     assert check("def f(x):\n    if bool(x):\n        return 10 // x\n    return 0\n", target="f").status == PROVED
     assert prove("def f():\n    return bool()\n", "result == False", target="f").status == PROVED
     # f-string !r/!a/!s conversions never trap (repr/ascii/str of any value): an opaque string, the interpolated expression still trap-checked; a type-incompatible format spec is declined.
-    assert check("def f(n):\n    return f'value={n!r}'\n", target="f").status == PROVED
+    assert check("def f(n):\n    return f'value={n!r}'\n", target="f").status == REFUTED      # repr past 4300 digits
+    assert check("def f(n: float):\n    return f'value={n!r}'\n", target="f").status == PROVED
     assert check("def f(n):\n    return f'{(10 // n)!r}'\n", target="f").status == REFUTED   # interpolated expr traps
-    assert check("def f(n):\n    return f'{n:.2d}'\n", target="f").status == UNKNOWN          # precision on an integer: declined
+    assert check("def f(n):\n    return f'{n:.2d}'\n", target="f").status == REFUTED          # precision on an integer
     # str(x) for a modeled value (number, bool, None, string, list/dict/tuple) calls a builtin __str__ that cannot raise, so it is a total call yielding a fresh string of unknown content. str() of an opaquely-held value (an unmodeled result, whose __str__ could be a raising override) stays declined.
-    assert check("def f(n: int):\n    return str(n)\n", target="f").status == PROVED
-    assert check("def f(n: int):\n    return len(str(n)) >= 0\n", target="f").status == PROVED
+    _sn = check("def f(n: int):\n    return str(n)\n", target="f")                          # ValueError past 4300
+    assert _sn.status == REFUTED and abs(_sn.counterexample_inputs["n"]) >= 10 ** 4300, _sn  # digits, witnessed
+    assert check("def f(n: int):\n    if abs(n) < 10 ** 4300:\n        return str(n)\n    return ''\n",
+                 target="f").status == PROVED                                                      # the exact boundary
+    assert check("def f(n: float):\n    return len(str(n)) >= 0\n", target="f").status == PROVED
     assert check("def f(x: float):\n    return str(x) + '!'\n", target="f").status == PROVED
     assert check("def f():\n    return str()\n", target="f").status == PROVED                  # str() is the empty string
     assert check("def f(n: int):\n    s = str(n)\n    return 1 // 0\n", target="f").status == REFUTED   # str total, trap after
     assert check("def f(o):\n    return str(o.compute())\n", target="f").status == UNKNOWN      # opaque result: __str__ may raise
     # range(...) used as a value is a sized immutable integer sequence carrying its exact length: an index equal to the length is out of range (REFUTED, which a fresh symbolic length could not give), one below it under a guard is in range, and step-2/negative-step lengths bound their indices precisely. A zero step refutes (ValueError), a non-constant step is declined.
-    assert check("def f(n: int):\n    return len(range(n))\n", target="f").status == PROVED
+    assert check("def f(n: int):\n    return len(range(n))\n", target="f").status == REFUTED   # past sys.maxsize
+    assert check("def f(n: int):\n    if n < 2 ** 40:\n        return len(range(n))\n    return 0\n", target="f").status == PROVED
     assert check("def f(n: int):\n    return range(n)[n]\n", target="f").status == REFUTED              # idx == len: out of range
     assert check("def f(n: int):\n    if n > 0:\n        return range(n)[n - 1]\n    return 0\n", target="f").status == PROVED
     assert check("def f():\n    return range(0, 10, 2)[4]\n", target="f").status == PROVED              # len 5: index 4 in range
@@ -5848,11 +6510,14 @@ def run_self_tests(fast=False):
     assert check("def f(xs: list):\n    return len(sorted(xs, key=abs, reverse=True))\n", target="f").status == UNKNOWN
     assert check("def f(xs: list, i: int):\n    c = list(xs)\n    if 0 <= i < len(c):\n        return c[i]\n    return 0\n", target="f").status == PROVED
     assert check("def f(n: int, i: int):\n    c = list(range(n))\n    if 0 <= i < n:\n        return c[i]\n    return 0\n", target="f").status == PROVED
-    assert check("def f(nums: list):\n    s = sorted(nums)\n    n = len(s)\n    if n == 0:\n        return 0\n    if n % 2 == 1:\n        return s[n // 2]\n    return (s[n // 2 - 1] + s[n // 2]) / 2\n", target="f").status == PROVED   # the median idiom
+    assert check("def f(nums: list[float]):\n    s = sorted(nums)\n    n = len(s)\n    if n == 0:\n        return 0\n    if n % 2 == 1:\n        return s[n // 2]\n    return (s[n // 2 - 1] + s[n // 2]) / 2\n", target="f").status == PROVED   # the median idiom
+    assert check("def f(nums: list):\n    s = sorted(nums)\n    n = len(s)\n    if n == 0:\n        return 0\n    if n % 2 == 1:\n        return s[n // 2]\n    return (s[n // 2 - 1] + s[n // 2]) / 2\n", target="f").status != PROVED   # two ints past 2**1024
     assert check("def f(n: int):\n    return list(n)\n", target="f").status != PROVED                               # int is not iterable
-    # print(...) is a total call returning None. Each argument is still trap-checked (print(10 // n) refutes), and the result is None (using it in arithmetic refutes).
-    assert check("def f(n: int):\n    print('value', n)\n    return n\n", target="f").status == PROVED
-    assert check("def f(n: int):\n    print(f'v={n}')\n    return n\n", target="f").status == PROVED                  # f-string arg
+    # print(...) returns None; it renders each argument with str() (an int past 4300 digits raises), and each argument is trap-checked (print(10 // n) refutes); the result is None (using it in arithmetic refutes).
+    assert check("def f(n: int):\n    print('value', n)\n    return n\n", target="f").status == REFUTED
+    assert check("def f(n: float):\n    print('value', n)\n    return n\n", target="f").status == PROVED
+    assert check("def f(n: int):\n    if -10 ** 9 < n < 10 ** 9:\n        print(f'v={n}')\n    return n\n",
+                 target="f").status == PROVED                                                                  # f-string arg
     assert check("def f(n: int):\n    print(10 // n)\n    return 0\n", target="f").status == REFUTED                  # arg trap-checked
     assert check("def f(n: int):\n    x = print(n)\n    return x + 1\n", target="f").status == REFUTED                # result is None
     # a set/frozenset parameter is a sized, iterable, membership-queryable container that is NOT subscriptable: len(s), x in s, for x in s are total, while s[i], s[i:j], s[i] = v each raise TypeError, so indexing a set is a bug, not a missed model.
@@ -6017,7 +6682,8 @@ def run_self_tests(fast=False):
     assert verify_equiv("std-copysign", "f", "import math\ndef f(x: float):\n    return math.copysign(x, 1.0)\n",
                         "def g(x: float):\n    import math\n    return math.fabs(x)\n", {}).status == PROVED
     # math.sqrt is nonnegative for x >= 0, a domain trap for x < 0.
-    assert prove("import math\ndef f(x):\n    return math.sqrt(x)\n", "result >= 0.0", requires="x >= 0.0").status == PROVED
+    assert prove("import math\ndef f(x: float):\n    return math.sqrt(x)\n", "result >= 0.0", requires="x >= 0.0").status == PROVED
+    assert prove("import math\ndef f(x):\n    return math.sqrt(x)\n", "result >= 0.0", requires="x >= 0.0").status == REFUTED   # an int past 2**1024
     assert verify_equiv("sqrt-bare", "f", "from math import sqrt\ndef f(x: float):\n    return sqrt(x)\n",
                         "def g(x: float):\n    import math\n    return math.sqrt(x)\n", {}).status == PROVED
     vsq = verify_predicate("sqrt-trap", "f", "import math\ndef f(x: float):\n    return math.sqrt(x)\n",
@@ -6690,7 +7356,7 @@ def run_self_tests(fast=False):
     assert core.SOLVE_RLIMIT > 0                                                   # resource-bounded, not timed
     # the verdict is gated solely on that rlimit, never the wall clock, so a hard query is identical run to run. _solve binds the rlimit on both paths and sets a wall-clock timeout only as a no-rlimit fallback.
     assert core.FP_SOLVE_RLIMIT > 0
-    _slines = inspect.getsource(core._solve).splitlines()
+    _slines = inspect.getsource(core._solve_direct).splitlines()                    # _solve's solver construction
     assert sum('s.set("rlimit"' in ln for ln in _slines) == 2                      # both solve paths bind the rlimit
     for _i, _ln in enumerate(_slines):                                             # every wall-clock timeout is gated
         if 's.set("timeout"' in _ln:                                              # behind a no-rlimit else, never set
@@ -6955,11 +7621,13 @@ def run_self_tests(fast=False):
     # a budget-bound UNKNOWN auto-escalates the rlimit once before returning: at a starved budget prove is UNKNOWN with escalation off and PROVED with it (deterministic retry; the verdict is still the solver's).
     _esrc = "def f(a, b, c):\n    return (a + b + c) * (a + b + c)\n"
     _epost = "result == a*a + b*b + c*c + 2*a*b + 2*a*c + 2*b*c"
-    _eprior, _ecap = core.configure(solve_rlimit=100000), core.BUDGET_ESCALATE_CAP
+    _eprior, _ecap = core.configure(solve_rlimit=1), core.BUDGET_ESCALATE_CAP
     try:
-        core.BUDGET_ESCALATE_CAP = 100000                                        # 8x > cap: escalation off
-        assert prove(_esrc, _epost, target="f").status == UNKNOWN
-        core.BUDGET_ESCALATE_CAP = 200000000                                     # escalation on
+        core.BUDGET_ESCALATE_CAP = 1                                             # 8x > cap: escalation off
+        _esv = prove(_esrc, _epost, target="f")
+        assert _esv.status == UNKNOWN, _esv
+        core.configure(solve_rlimit=100000)
+        core.BUDGET_ESCALATE_CAP = 200000000                                     # escalation on: 8x the budget
         assert prove(_esrc, _epost, target="f").status == PROVED
     finally:
         core.BUDGET_ESCALATE_CAP = _ecap
@@ -7082,7 +7750,7 @@ def run_self_tests(fast=False):
     assert check("def f(s, sep):\n    return (sep or ' ').join(s)\n", target="f").status == UNKNOWN
     assert check("def f(x):\n    return 10 // x\n", best_effort=True, target="f").status == REFUTED
     assert check("def f(x):\n    return x.data[3]\n", target="f").status == UNKNOWN          # sound default: abstains
-    assert check("def f(x: int):\n    n = 0\n    for y in x:\n        n = y\n    return n\n", target="f").status == UNKNOWN
+    assert check("def f(x: int):\n    n = 0\n    for y in x:\n        n = y\n    return n\n", target="f").status == REFUTED   # an int is not iterable
     assert check("def f(x):\n    return ext(x)\n").status == UNKNOWN                       # flag restored after the run
     assert prove("def f(x):\n    return ext(x)\n", "result >= 0", best_effort=True).status == UNKNOWN
     # best-effort is taint-tracked: tagged lower-trust only when an assumption was used, else full-trust (untagged, certificate kept). An opaque result used as a number is assumed numeric.
@@ -7150,7 +7818,21 @@ def run_self_tests(fast=False):
                   "f": "def f(n):\n    return rec(n)\n"}
         assert check(_rtrap["f"], repo=_rtrap, target="f").status != PROVED      # a trapping helper is not marked trap free
         assert sorted(_trapfree_recursive_callees(_rfac["f"], _rfac)) == ["fac"]  # only the trap-free recursive callee is marked
-        assert _trapfree_recursive_callees(_rtrap["f"], _rtrap) == frozenset()
+        assert _trapfree_recursive_callees(_rtrap["f"], _rtrap) == {}
+        # a summarized recursive callee is inlined only for arguments of the types it was verified for, and returns a
+        # value of the sort it returns: a str passed for its int parameter, or its str result used as a number, is
+        # not proved; a matching call is.
+        _rarg = {"g": "def g(x: int):\n    if x <= 0:\n        return 0\n    return g(x - 1) + 1\n",
+                 "f": "def f(s: str):\n    return g(s)\n"}
+        assert check(_rarg["f"], repo=_rarg, target="f").status != PROVED
+        _rlst = {"g": "def g(xs: list[int], i: int):\n    if i < 0 or i >= len(xs):\n        return 0\n"
+                      "    return xs[i] + g(xs, i + 1)\n", "f": "def f(ys: list[str]):\n    return g(ys, 0)\n"}
+        assert check(_rlst["f"], repo=_rlst, target="f").status != PROVED
+        _rok = dict(_rlst, f="def f(ys: list[int]):\n    return g(ys, 0) + 1\n")
+        assert check(_rok["f"], repo=_rok, target="f").status == PROVED
+        _rstr = {"g": "def g(n: int):\n    if n <= 0:\n        return ''\n    return g(n - 1) + 'a'\n",
+                 "f": "def f(n: int):\n    return g(n) + 1\n"}
+        assert check(_rstr["f"], repo=_rstr, target="f").status != PROVED
     finally:
         core.SANDBOX_SUBJECT, core.ALLOW_SUBJECT_EXECUTION = _sv6
 
@@ -7544,7 +8226,7 @@ def run_self_tests(fast=False):
         assert _nd == _nok and _nd >= 9, (_nd, _nok, _ngv)               # sound (decided == correct); decides >= 9/12
 
     # diagnostic/engine refinements: an approximation UNKNOWN names its cause; a non-termination REFUTED carries the divergence certificate; the bitvector engine infers a width; a trap witness is minimized; --budget is flagged a no-op.
-    _pv = prove("def f(s: str):\n    return s.strip()\n", "result == s", target="f")
+    _pv = prove("def f(s: str):\n    return s.strip()\n", "not result.startswith(' ')", target="f")
     assert _pv.status == UNKNOWN and "str.strip" in _pv.reason and "line" in _pv.reason, _pv   # provenance, not canned
     assert classify_unknown(_pv.reason) == "approximation" and not budget_helps(_pv.reason), _pv   # budget no-op
     assert budget_helps("solver returned unknown") and not budget_helps("an over-approximated value")
@@ -7686,8 +8368,8 @@ def run_self_tests(fast=False):
     assert prove("def f():\n    return round(2.5)\n", "result == 2", target="f").status == PROVED
     assert prove("def f():\n    return round(1.5)\n", "result == 2", target="f").status == PROVED
     assert prove("def f():\n    return round(2.675, 2)\n", "result == 2.67", target="f").status == PROVED
-    assert prove("def f(x: float):\n    return round(x)\n", "result == 0", target="f").status == UNKNOWN
-    assert prove("def f(x: float):\n    return round(x)\n", "result != 0", target="f").status == UNKNOWN
+    assert prove("def f(x: float):\n    return round(x)\n", "result == 0", target="f").status == REFUTED   # x=1.0
+    assert prove("def f(x: float):\n    return round(x)\n", "result != 0", target="f").status == REFUTED   # x=0.0
     assert prove("def f(n: int):\n    return round(n)\n", "result == n", target="f").status == PROVED
 
     # CPython semantic corners, pinned as a standing battery: each fact below is a ground truth of the
@@ -8106,6 +8788,14 @@ __all__ = [
     'math_pow_axiom_audit',
     'math_domain_audit',
     'stdlib_trapfree_audit',
+    'rounding_threshold_audit',
+    'fp_bridge_audit',
+    'sum_model_audit',
+    'printf_model_audit',
+    'stdlib_trap_model_audit',
+    'equality_model_audit',
+    'regex_model_audit',
+    'string_conversion_audit',
     'torch_shape_audit',
     'tryexcept_differential_audit',
     'string_method_axiom_audit',

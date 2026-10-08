@@ -80,6 +80,51 @@ def _run_trace(src, repo, fname, argvals, max_steps):
         _sys.settrace(old)
 
 
+class _StepBudget(Exception):
+    pass
+
+
+def _bounded_call(fn, tup, max_steps=20000):
+    """fn(*tup) under a line budget on the subject's own code: ('ok', result), ('raise', exception name), or
+    ('diverge',). Kept in sync with core._bounded_call."""
+    steps = [0]
+
+    def tracer(frame, event, arg):
+        if frame.f_code.co_filename != "<string>":
+            return None
+        if event == "line":
+            steps[0] += 1
+            if steps[0] > max_steps:
+                raise _StepBudget()
+        return tracer
+    old = sys.gettrace()
+    sys.settrace(tracer)
+    try:
+        return ("ok", fn(*tup))
+    except _StepBudget:
+        return ("diverge",)
+    except RecursionError:
+        return ("raise", "RecursionError")
+    except Exception as e:
+        return ("raise", type(e).__name__)
+    finally:
+        sys.settrace(old)
+
+
+def _plain(v, depth=0):
+    """Whether v is plain data (None / bool / int / float / str / bytes, or a list / tuple / set / dict of them),
+    which crosses back to the parent as itself. Kept in sync with core._sandbox_plain."""
+    if depth > 6:
+        return False
+    if v is None or type(v) in (bool, int, float, str, bytes):
+        return True
+    if type(v) in (list, tuple, set, frozenset):
+        return all(_plain(x, depth + 1) for x in v)
+    if type(v) is dict:
+        return all(_plain(k, depth + 1) and _plain(x, depth + 1) for k, x in v.items())
+    return False
+
+
 def main():
     try:
         job = pickle.load(sys.stdin.buffer)
@@ -108,14 +153,17 @@ def main():
         return
     out = []
     for tup in inputs:
+        if mode in ("typed", "values"):                          # a line budget per input: one divergent input
+            r = _bounded_call(fn, tup)                           # does not cost the batch
+            if r[0] == "ok":
+                r = ("ok",) if mode == "typed" else (("ok", r[1]) if _plain(r[1]) else ("ok_opaque",))
+            out.append(r)
+            continue
         try:
             r = fn(*tup)
-            if mode == "typed":
-                out.append(("ok",))
-            else:
-                out.append(("ok", r) if isinstance(r, int) and not isinstance(r, bool) else ("nonint",))
-        except Exception as e:                                   # a raise is a trap, modeled separately
-            out.append(("raise", type(e).__name__) if mode == "typed" else ("trap",))
+            out.append(("ok", r) if isinstance(r, int) and not isinstance(r, bool) else ("nonint",))
+        except Exception:                                        # a raise is a trap, modeled separately
+            out.append(("trap",))
     try:
         pickle.dump(("results", out), sys.stdout.buffer)
         sys.stdout.buffer.flush()

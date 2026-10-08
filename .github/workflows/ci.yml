@@ -9,13 +9,17 @@ on:
 
 jobs:
   python:
-    name: self-tests + audits
+    name: self-tests + audits (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python }}
       - name: install (z3-solver and cvc5 pinned in pyproject.toml)
         run: pip install .
       - name: run the self-tests, soundness audits, and completeness regressions

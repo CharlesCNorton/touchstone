@@ -62,33 +62,140 @@ def _float_kinds(src):
     return kf or None
 
 
+def _horn_error_reason(m):
+    """The UNKNOWN reason for a Spacer query that raised: its time budget, or the solver's own message."""
+    if "canceled" in m or "timeout" in m:
+        return "the Horn solver (Spacer) reached its time budget before finding an invariant or a path"
+    return "the Horn solver (Spacer) stopped: %s" % (m.decode("utf-8", "replace") if isinstance(m, bytes)
+                                                     else str(m))[:120]
+
+
 def _solve_horn(prop, target, technique, proved, relations, declvars, rules, query, *,
-                on_error, proved_reason="", refuted_reason="", corroborate=True, timeout=4000, retry=1) -> Verdict:
+                on_error, proved_reason="", refuted_reason="", corroborate=True, timeout=4000, retry=1,
+                overapprox=None) -> Verdict:
     """The shared Spacer tail of the CHC engines: build a Fixedpoint over `relations` / `declvars` / `rules`,
     query `query`, and map unsat / sat / unknown to PROVED / REFUTED / UNKNOWN. `technique` labels REFUTED and
     both UNKNOWN verdicts, `proved` the PROVED one; `on_error(msg)` gives the reason on a Z3Exception, and
-    `corroborate` gates the cvc5 invariant re-check (`proof_certificate`) on a PROVED."""
-    fp = z3.Fixedpoint(); fp.set(engine="spacer"); fp.set("timeout", timeout)
-    for rel in relations:
-        fp.register_relation(rel)
-    fp.declare_var(*declvars)
-    for h, b in rules:
-        fp.rule(h, b)
+    `corroborate` gates the cvc5 invariant re-check (`proof_certificate`) on a PROVED. `overapprox` (a reason
+    string) marks rules that over-approximate some value: a reachable query is then no refutation (UNKNOWN)."""
+    def build(inline=True):
+        fp = z3.Fixedpoint(); fp.set(engine="spacer"); fp.set("timeout", timeout)
+        if not inline:
+            fp.set("xform.inline_linear", False); fp.set("xform.inline_eager", False)
+        for rel in relations:
+            fp.register_relation(rel)
+        fp.declare_var(*declvars)
+        for h, b in rules:
+            fp.rule(h, b)
+        return fp
+    fp = build()
     try:
         r = core._fp_query(fp, query, retry=retry)
     except z3.Z3Exception as e:
         return Verdict(UNKNOWN, prop, target, technique, reason=on_error(str(e)))
     if r == z3.unsat:
-        cert = core.proof_certificate() if (corroborate and core._corroborate_horn(fp, rules, query)) else None
+        try:
+            ok = corroborate and core._corroborate_horn(fp, rules, query)
+        except core.SoundnessError:
+            # the invariant Spacer reports after inlining relations does not validate under cvc5 (its answer for
+            # an inlined relation is reconstructed too weak): re-solve with inlining off, whose invariant is the
+            # proof object itself; a reachable query there, or a second invalid invariant, is no proof
+            fp = build(inline=False)
+            try:
+                r2 = core._fp_query(fp, query, retry=retry)
+            except z3.Z3Exception:
+                r2 = z3.unknown
+            if r2 == z3.sat:
+                raise core.SoundnessError("Spacer proves the query unreachable with inlining and reaches it without: "
+                                          "the two solves contradict")
+            try:
+                ok = r2 == z3.unsat and core._corroborate_horn(fp, rules, query)
+            except core.SoundnessError:
+                ok = None
+            if ok is None or r2 != z3.unsat:
+                return Verdict(UNKNOWN, prop, target, technique,
+                               reason="the solver's invariant does not validate under cvc5; the proof is withheld")
+        cert = core.proof_certificate() if ok else None
         return Verdict(PROVED, prop, target, proved, reason=proved_reason, certificate=cert)
     if r == z3.sat:
+        if overapprox:
+            return Verdict(UNKNOWN, prop, target, technique, reason=overapprox)
+        if any(core._concrete_apps(t) for h, b in rules for t in [h] + list(b)) or core._concrete_apps(query):
+            return Verdict(UNKNOWN, prop, target, technique,   # a concrete function's value in the derivation is
+                           reason="the reaching derivation applies a string function whose values are not confirmed")
         return Verdict(REFUTED, prop, target, technique, reason=refuted_reason)
     return Verdict(UNKNOWN, prop, target, technique, reason="engine returned unknown")
 
 
 def verify_equiv(prop, target, impl_src, spec_src, repo) -> Verdict:
-    """Two functions are equivalent iff they trap (divide by zero) on exactly the
-    same inputs and return equal values everywhere neither traps."""
+    """Two functions are equivalent iff they trap (divide by zero) on exactly the same inputs and return equal
+    values everywhere neither traps. When the symbolic engines leave the pair undecided, both are run in the
+    sandbox on the same sampled inputs, and an input on which exactly one traps, or both return different values,
+    refutes."""
+    v = _verify_equiv_core(prop, target, impl_src, spec_src, repo)
+    if v.status != UNKNOWN:
+        return v
+    try:
+        w, wtxt, what = _concrete_equiv_refute(impl_src, spec_src, repo)
+    except Exception:
+        w = None
+    if w is None:
+        return v
+    return Verdict(REFUTED, prop, target, "equivalence (concrete counterexample)", counterexample=wtxt,
+                   counterexample_inputs=w, reason="%s on a concrete input (run in the sandbox)" % what)
+
+
+def _concrete_equiv_refute(impl_src, spec_src, repo, trials=64):
+    """An input, sampled for the implementation's parameters and run on both functions in the isolated sandbox, on
+    which exactly one raises a modeled trap or both return different values (a NaN equal to a NaN). Returns
+    ({name: value}, "name=value, ...", what differs) or (None, None, None)."""
+    if not (core.SANDBOX_SUBJECT or core.ALLOW_SUBJECT_EXECUTION):
+        return None, None, None
+    fi = next((n for n in _parse(impl_src).body if isinstance(n, ast.FunctionDef)), None)
+    fs = next((n for n in _parse(spec_src).body if isinstance(n, ast.FunctionDef)), None)
+    if fi is None or fs is None or len(fi.args.args) != len(fs.args.args):
+        return None, None, None
+    for f in (fi, fs):
+        if f.args.vararg or f.args.kwarg or f.args.kwonlyargs or f.args.posonlyargs:
+            return None, None, None
+    kept = _typed_samples(fi, "True", trials=trials)
+    if not kept:
+        return None, None, None
+    params = [a.arg for a in fi.args.args]
+    ri = _sandbox_runs(core.sandbox_run_batch_values, impl_src, repo, fi.name, kept, params)
+    rs = _sandbox_runs(core.sandbox_run_batch_values, spec_src, repo, fs.name, kept, params)
+    guessed = any(a.annotation is None for a in fi.args.args)
+
+    def outcome(r):
+        if r is None:
+            return None
+        if r[0] == "raise":
+            m = _modeled_raise(r[1])
+            return ("trap",) if m and not (guessed and m == "TypeError") else None
+        return ("ok", r[1]) if r[0] == "ok" else None
+
+    def same(a, b):
+        if isinstance(a, float) and isinstance(b, float) and a != a and b != b:
+            return True                                          # two NaNs: the same outcome
+        try:
+            return bool(a == b)
+        except Exception:
+            return True                                          # an incomparable pair: no conclusion
+    for s, a, b in zip(kept, ri, rs):
+        oa, ob = outcome(a), outcome(b)
+        if oa is None or ob is None:
+            continue                                             # an unmodeled exception or an opaque result
+        what = None
+        if oa[0] != ob[0]:
+            what = "one function raises and the other returns"
+        elif oa[0] == "ok" and not same(oa[1], ob[1]):
+            what = "the results differ (%r vs %r)" % (oa[1], ob[1])
+        if what is not None:
+            return dict(s), ", ".join("%s=%r" % (p, s[p]) for p in params), what
+    return None, None, None
+
+
+def _verify_equiv_core(prop, target, impl_src, spec_src, repo) -> Verdict:
     _require_str("impl_src", impl_src); _require_str("spec_src", spec_src); _require_repo(repo)
     impl_src, spec_src = core._strip_async(impl_src), core._strip_async(spec_src)   # equate awaited results
     ctx = Ctx(repo); ctx.facts = []
@@ -257,8 +364,36 @@ def verify_predicate(prop, target, impl_src, predicate, repo) -> Verdict:
 
 def _with_facts(ctx, claim_false):
     """Conjoin the over-approximation axioms (about uninterpreted transcendental functions) into the
-    refutation query. They are true facts, so a still-unsatisfiable query is a sound PROVED."""
-    return z3.And(*ctx.facts, claim_false) if getattr(ctx, "facts", None) else claim_false
+    refutation query -- those in its cone of influence (core._coi_facts). They are true facts, so a
+    still-unsatisfiable query is a sound PROVED."""
+    if not getattr(ctx, "facts", None):
+        return claim_false
+    return z3.And(*core._coi_facts(ctx.facts, [claim_false], getattr(ctx, "defs", None)), claim_false)
+
+
+def _trap_claim(pre_term, facts, traps, defs=None):
+    """pre AND some trap, with the facts in their cone of influence (core._coi_facts). The conjuncts every trap
+    shares (the path condition that guards them all) are factored out of the disjunction, an equivalent form that
+    puts a guard's variable bounds at the top level, where the int / float bridge solver reads them."""
+    def flat(t, out):
+        if z3.is_and(t):
+            for c in t.children():
+                flat(c, out)
+        elif not z3.is_true(t):
+            out.append(t)
+        return out
+    parts = [flat(t, []) for t in traps]
+    common_ids = set.intersection(*[{c.get_id() for c in p} for p in parts]) if parts else set()
+    common = [c for c in parts[0] if c.get_id() in common_ids] if parts else []
+    rests = [[c for c in p if c.get_id() not in common_ids] for p in parts]
+    if not parts or any(not r for r in rests):               # a trap that is the shared condition itself: the
+        disj = z3.BoolVal(True)                              # disjunction holds
+    else:
+        terms = [r[0] if len(r) == 1 else z3.And(*r) for r in rests]
+        disj = terms[0] if len(terms) == 1 else z3.Or(*terms)
+    body = (z3.And(*common, disj) if not z3.is_true(disj) else
+            (common[0] if len(common) == 1 else z3.And(*common))) if common else disj
+    return z3.And(pre_term, *core._coi_facts(facts or [], [pre_term, body], defs), body)
 
 
 def _downgrade_overapprox(status, model, ctx):
@@ -1068,7 +1203,21 @@ def prove(impl_src, ensures, requires="True", repo=None, prop="property", target
             return _label_best_effort(v, core.BEST_EFFORT_ASSUMED)
         finally:
             core.BEST_EFFORT = saved
-    return _escalate_budget(lambda: _prove_core(impl_src, ensures, requires, repo, prop, target))
+    v = _escalate_budget(lambda: _prove_core(impl_src, ensures, requires, repo, prop, target))
+    if v.status == UNKNOWN or (v.status == REFUTED and not v.counterexample_inputs):
+        # no proof and no refutation, or a refutation with no replayable input: a concrete input, run in the
+        # sandbox, on which the function raises or the postcondition fails is a real counterexample
+        try:
+            w, wtxt, what = _concrete_post_refute(core._strip_async(impl_src), ensures, requires, repo, target)
+        except Exception:
+            w = None
+        if w is not None:
+            if v.status == REFUTED:                               # the engine's own account of the failure stays
+                return Verdict(REFUTED, v.prop, v.target, v.technique, counterexample=v.counterexample or wtxt,
+                               reason=v.reason, counterexample_inputs=w, trace=v.trace)
+            return Verdict(REFUTED, prop, v.target, "property (concrete counterexample)", counterexample=wtxt,
+                           counterexample_inputs=w, reason="%s on a concrete input (run in the sandbox)" % what)
+    return v
 
 
 def _prove_recursive_list(prop, target, src, pre_node, post_node, spec):
@@ -1139,7 +1288,7 @@ def _prove_core(impl_src, ensures, requires, repo, prop, target):
     except SyntaxError as e:
         return Verdict(UNKNOWN, prop, target, "property (Python spec)", reason=f"spec syntax: {e}")
     pre_node, post_node = _strip_old(pre_node), _strip_old(post_node)
-    pre_fn = lambda S: ev_bool(pre_node, dict(S), spec)
+    pre_fn = _with_param_domains(lambda S: ev_bool(pre_node, dict(S), spec), impl_src, target)
     post_fn = lambda S, r: ev_bool(post_node, {**S, "result": r}, spec)
     if not repo and _quantified_post_spec(post_node) is not None:                # an element-universal spec:
         fv = _prove_forall(prop, target, impl_src, post_node, pre_node)          # all(P(result[j]) / a[j] ...),
@@ -1202,8 +1351,15 @@ def _prove_core(impl_src, ensures, requires, repo, prop, target):
         if core.ALLOW_SUBJECT_EXECUTION:
             soundness_probe(impl_src, z3args, rets, args, repo)
         out = fold(rets)
-        pre_term = ev_bool(pre_node, dict(z3args), spec)
-        post_term = ev_bool(post_node, {**z3args, "result": out}, spec)
+        _spec_facts, spec.facts = spec.facts, ctx.facts         # a conversion in the spec (int(x), math.floor) states
+        try:                                                    # its facts into the same claim
+            pre_term = ev_bool(pre_node, dict(z3args), spec)
+            post_term = ev_bool(post_node, {**z3args, "result": out}, spec)
+        finally:
+            spec.facts = _spec_facts
+        if spec.overapprox:                                     # an over-approximated value in the specification
+            ctx.overapprox = True                               # (a transcendental, a hash) withholds REFUTED too
+            ctx.overapprox_reason = ctx.overapprox_reason or spec.overapprox_reason
     except (Unsupported, KeyError, z3.Z3Exception, TypeError, AttributeError) as u:
         hv = _prove_via_havoc(prop, target, impl_src, pre_node, post_node, repo)   # complex targets / AnnAssign /
         if hv.status != UNKNOWN:                                                   # comprehensions the exact engine declines
@@ -1288,13 +1444,37 @@ def _isinstance_guards_guessed_scalar(fn, kinds) -> bool:
                for n in ast.walk(fn))
 
 
-def _check_trapfree_symexec(prop, target, src, pre_node, spec, repo, has_pre, trapfree_callees=frozenset()) -> Verdict:
+def _param_only(t, z3args):
+    """Whether a trap condition reads nothing but the scalar parameters (and literals): no fresh over-approximated
+    value and no uninterpreted function (a transcendental, an ord axiom) -- so it is exact in the inputs."""
+    names = {v.decl().name() for v in z3args.values() if z3.is_expr(v) and z3.is_const(v)}
+    names |= {"len_" + v.name for v in z3args.values()               # a container parameter's length is an input
+              if isinstance(v, (core._SafeContainer, core._DictParam)) and getattr(v, "length", None) is None}
+    seen, stack = set(), [t]
+    while stack:
+        n = stack.pop()
+        if not z3.is_app(n) or n.get_id() in seen:
+            if z3.is_quantifier(n):
+                return False
+            continue
+        seen.add(n.get_id())
+        d = n.decl()
+        if d.kind() == z3.Z3_OP_UNINTERPRETED:
+            if n.num_args() > 0 or d.name() not in names:
+                return False
+        stack.extend(n.children())
+    return True
+
+
+def _check_trapfree_symexec(prop, target, src, pre_node, spec, repo, has_pre, trapfree_callees=None,
+                            strict=False) -> Verdict:
     """Trap-freedom fallback through the value engine, for a loop-free function the CFG/CHC checker declines
     (a local dict built by `d[k] = v` then read). `core._TRAPFREE` makes the value engine total, so the verdict
     rests on the traps alone (a missing-key KeyError, a division by zero, a failing assert). PROVED when no trap
     is reachable under the precondition; a reachable trap REFUTES only with no precondition and no havoc, where
-    the query is exact. `trapfree_callees` are recursive callees verified trap free standalone, inlined as a
-    fresh result so the caller proceeds."""
+    the query is exact. `trapfree_callees` maps each recursive callee verified trap free standalone to its
+    reading (the argument types it was verified for, the sort it returns), inlined at a matching call as a fresh
+    result of that sort. `strict` reads no unannotated parameter's type as a guess (see _trapfree_recursive_callees)."""
     src = _rewrite_object_attrs(src)                            # model a simple object's attribute stores as locals
     gated = _definite_assignment_guard(prop, target, "implicit contracts (asserts + trap freedom)", [src])
     if gated is not None:                                        # a variable possibly read before assignment on some
@@ -1308,7 +1488,10 @@ def _check_trapfree_symexec(prop, target, src, pre_node, spec, repo, has_pre, tr
     except Exception:
         kinds = None
         risky_isinstance = False
-    ctx = Ctx(repo or {}); ctx.facts = []; ctx.trapfree_callees = trapfree_callees
+    ctx = Ctx(repo or {}); ctx.facts = []
+    ctx.trapfree_callees = frozenset(trapfree_callees or ())
+    ctx.callee_readings = dict(trapfree_callees or {})
+    ctx.strict_reading = strict
     ctx.exact_traps = []                                          # precise first-iteration loop traps (refutable)
     ctx.hard_traps = []                                           # exact traps refutable even under the value over-approx
     saved = core._TRAPFREE; core._TRAPFREE = True
@@ -1327,7 +1510,7 @@ def _check_trapfree_symexec(prop, target, src, pre_node, spec, repo, has_pre, tr
                        reason="a None may survive a loop; the value engine's havoc cannot model it soundly")
     hard = getattr(ctx, "hard_traps", None)                      # an exact trap (0 ** negative, exact operands) refutes
     if hard and not has_pre:                                     # even under the value over-approximation that set it,
-        hc = z3.And(pre_term, *ctx.facts, z3.Or(*hard)) if ctx.facts else z3.And(pre_term, z3.Or(*hard))   # and even
+        hc = _trap_claim(pre_term, ctx.facts, hard, getattr(ctx, "defs", None))                        # and even
         if _solve(hc)[0] == REFUTED:                             # when ctx.traps holds no other (unsuppressed) trap
             return Verdict(REFUTED, prop, target, "implicit contracts (asserts + trap freedom)",
                            reason="a trap is reachable")
@@ -1337,43 +1520,106 @@ def _check_trapfree_symexec(prop, target, src, pre_node, spec, repo, has_pre, tr
                            reason="an isinstance test narrows an inferred-typed parameter; a branch the engine pruned "
                                   "may carry a trap the committed type hides")   # static isinstance unsoundly prunes a branch
         return Verdict(PROVED, prop, target, "implicit contracts (asserts + trap freedom)",
-                       reason="no trap reachable (value engine)")
-    claim = z3.And(pre_term, *ctx.facts, z3.Or(*traps)) if ctx.facts else z3.And(pre_term, z3.Or(*traps))
-    st = _solve(claim)[0]                                          # claim asserts a reachable trap
-    if st == PROVED:                                              # no trap reachable under the precondition
+                       reason="no trap reachable (value engine)",
+                       certificate="no solver query: the value engine derives no trap condition; "
+                                   + core.proof_certificate("construction").split("; ", 1)[1])
+    claim = _trap_claim(pre_term, ctx.facts, traps, getattr(ctx, "defs", None))
+    st, _model, corr = solve_corroborated(claim)                  # claim asserts a reachable trap; a PROVED is
+    if st == PROVED:                                              # confirmed by the second procedure
         if risky_isinstance:                                     # see above: a static isinstance on a guessed-scalar
             return Verdict(UNKNOWN, prop, target, "implicit contracts (asserts + trap freedom)",   # parameter prunes a
                            reason="an isinstance test narrows an inferred-typed parameter; a branch the engine pruned "
                                   "may carry a trap the committed type hides")   # branch whose trap would be hidden
         return Verdict(PROVED, prop, target, "implicit contracts (asserts + trap freedom)",
-                       reason="no trap reachable (value engine)")
+                       reason="no trap reachable (value engine)", certificate=core.proof_certificate(corr))
     if st == REFUTED and not has_pre and not ctx.havoc and not getattr(ctx, "overapprox", False):
         # a precise trap: no precondition, no loop havoc, and no over-approximated term (a float **, a
         # transcendental, a string bound) on which a satisfiable trap query could be spurious -- exactly as
         # _downgrade_overapprox withholds REFUTED for prove / verify_predicate.
         return Verdict(REFUTED, prop, target, "implicit contracts (asserts + trap freedom)",
                        reason="a trap is reachable")
+    if st == REFUTED and not has_pre and not ctx.havoc:          # over-approximated values elsewhere: a trap whose
+        pex = [t for t in traps if _param_only(t, z3args)]       # condition reads only the parameters is exact, so
+        if pex:                                                  # its model is a real trapping input
+            pc_ = _trap_claim(pre_term, ctx.facts, pex, getattr(ctx, "defs", None))
+            if _solve(pc_)[0] == REFUTED:
+                return Verdict(REFUTED, prop, target, "implicit contracts (asserts + trap freedom)",
+                               reason="a trap is reachable")
     exact = getattr(ctx, "exact_traps", None)                    # a precise first-iteration loop trap refutes even
-    if exact and not has_pre and not getattr(ctx, "overapprox", False):   # under the loop's havoc (the element is
-        ec = z3.And(pre_term, *ctx.facts, z3.Or(*exact)) if ctx.facts else z3.And(pre_term, z3.Or(*exact))   # free,
-        if _solve(ec)[0] == REFUTED:                             # the prior state exact, so the witness is real)
+    if exact and not has_pre and getattr(ctx, "overapprox", False):   # under the loop's havoc (the element is free,
+        exact = [t for t in exact if _param_only(t, z3args)]     # the prior state exact, so the witness is real); with
+    if exact and not has_pre:                                    # an over-approximated value elsewhere, only one whose
+        ec = _trap_claim(pre_term, ctx.facts, exact, getattr(ctx, "defs", None))   # condition reads the parameters
+        if _solve(ec)[0] == REFUTED:                             # alone
             return Verdict(REFUTED, prop, target, "implicit contracts (asserts + trap freedom)",
                            reason="a trap is reachable on a loop iteration")
     return Verdict(UNKNOWN, prop, target, "implicit contracts (asserts + trap freedom)", reason="solver returned unknown")
 
 
+def _recursive_callee_reading(g, src, repo, known):
+    """(parameter readings, return sort, trap kinds) of the self-recursive callee g: the type the value engine
+    gives each parameter (by annotation, or by the usage-inferred kind of an unannotated one), the one z3 sort
+    every return path yields when its self-calls yield that sort (a fixpoint, so the reading is consistent by
+    induction on the call depth), and the exception kinds of the traps its body carries. None when a parameter
+    has no comparable reading, a path returns None or a non-scalar, or the paths disagree on the sort."""
+    try:
+        from .domains import _infer_param_kinds
+        src2 = _rewrite_object_attrs(src)
+        fn = _fndef(src2)
+        if fn.args.vararg or fn.args.kwarg or fn.args.kwonlyargs or fn.args.posonlyargs:
+            return None
+        kinds = _infer_param_kinds(fn)
+    except Exception:
+        return None
+    params = []
+    for a in fn.args.args:
+        t = (core._kind_term(a.arg, kinds[a.arg]) if kinds and a.arg in kinds and a.annotation is None
+             else core._param_term(a))
+        r = core._value_reading(t)
+        if r is None:
+            return None
+        params.append(r)
+    sorts = {"Int": z3.IntSort(), "Bool": z3.BoolSort(), "String": z3.StringSort(),
+             core._F64.sexpr(): core._F64}
+    ret = "Int"
+    for _ in range(3):
+        ctx = Ctx(repo or {}); ctx.facts = []; ctx.exact_traps = []; ctx.hard_traps = []
+        ctx.trapfree_callees = frozenset(set(known) | {g})
+        ctx.callee_readings = {**known, g: (tuple(params), sorts[ret])}
+        ctx.strict_reading = True
+        saved = core._TRAPFREE; core._TRAPFREE = True
+        try:
+            _a, _z, rets, traps, none_pc = symexec(src2, ctx, param_kinds=kinds)
+        except Exception:
+            return None
+        finally:
+            core._TRAPFREE = saved
+        if not z3.is_false(z3.simplify(none_pc)) or not rets:
+            return None
+        got = {v.sort().sexpr() if z3.is_expr(v) else None for _p, v in rets}
+        if len(got) != 1 or None in got or next(iter(got)) not in sorts:
+            return None
+        s = got.pop()
+        if s == ret:
+            tk = list(getattr(traps, "kinds", [None] * len(traps)))
+            return tuple(params), sorts[ret], tk
+        ret = s
+    return None
+
+
 def _trapfree_recursive_callees(src, repo):
     """The in-repo callees reachable from `src` that are self-recursive (which the value-engine inliner cannot
     unfold, bailing the caller to UNKNOWN) and provably trap free standalone, so they can be inlined as a
-    trap-free opaque result. An all-integer-parameter callee is verified by the recursion engine (its integer
-    model is sound there). A callee with a container / string parameter is verified instead by the container-
-    aware value engine, assuming its own self-call is trap free (the inductive hypothesis): sound for partial
-    trap freedom -- a terminating call is a finite tree whose every body, checked over arbitrary arguments with
-    the sequence model, is trap free, so the whole call is -- and unlike the recursion engine's integer model
+    trap-free result of the sort they return. An all-integer-parameter callee is verified by the recursion engine
+    (its integer model is sound there). A callee with a container / string parameter is verified instead by the
+    container-aware value engine, assuming its own self-call is trap free (the inductive hypothesis): sound for
+    partial trap freedom -- a terminating call is a finite tree whose every body, checked over arbitrary arguments
+    with the sequence model, is trap free, so the whole call is -- and unlike the recursion engine's integer model
     (which an indexed container could vacuously satisfy) the value engine bounds-checks the container exactly.
-    Returns the (possibly empty) frozenset of such callee names."""
+    Every callee is verified with no parameter's type read as a guess, since its callers pass real values, and is
+    inlined only at a call whose arguments have the types it was verified for. Returns {name: reading}."""
     if not repo:
-        return frozenset()
+        return {}
     edges = {k: _called_repo_names(repo[k], repo) for k in repo}
     reach, stack = set(), list(_called_repo_names(src, repo))
     while stack:                                                  # the transitive callees of src
@@ -1383,27 +1629,35 @@ def _trapfree_recursive_callees(src, repo):
         reach.add(k)
         stack.extend(edges.get(k, set()) - reach)
     triv = lambda S: z3.BoolVal(True)
-    out = set()
+    out = {}
     for g in reach:
         if g not in edges.get(g, set()):                          # not self-recursive
             continue
+        rd = _recursive_callee_reading(g, repo[g], repo, out)
+        if rd is None:
+            continue
+        params, ret_sort, kinds = rd
+        reading = (params, ret_sort)
         v = None
-        if _all_int_params(repo[g]):
+        try:                                                      # the body, its self-call assumed trap free with the
+            spec = Ctx(repo); spec.traps = None; spec.pc = z3.BoolVal(True)   # reading's result (the induction
+            pn = _strip_old(core.parse_spec("True"))                          # hypothesis)
+            v = _check_trapfree_symexec("trap freedom", g, repo[g], pn, spec, repo, False,
+                                        trapfree_callees={**out, g: reading}, strict=True)
+        except Exception:
+            v = None
+        if ((v is None or v.status == UNKNOWN) and _all_int_params(repo[g])
+                and all(r == ("z3", "Int") for r in params) and ret_sort == z3.IntSort()
+                and all(k is not None and k <= {"ZeroDivisionError"} for k in kinds)):
+            # an all-integer recursion whose only possible traps are divisions: the recursion engine, whose
+            # invariant over the results can discharge a division by a recursive result
             try:
                 v = verify_recursive("tf", g, repo[g], triv, lambda S, r: z3.BoolVal(True))
             except Exception:
                 v = None
-        else:                                                     # a container / string-parameter self-recursion:
-            try:                                                  # check the body with the self-call assumed trap free
-                spec = Ctx(repo); spec.traps = None; spec.pc = z3.BoolVal(True)
-                pn = _strip_old(core.parse_spec("True"))
-                v = _check_trapfree_symexec("trap freedom", g, repo[g], pn, spec, repo, False,
-                                            trapfree_callees=frozenset(out | {g}))
-            except Exception:
-                v = None
         if v is not None and v.status == PROVED:                  # proved trap free standalone
-            out.add(g)
-    return frozenset(out)
+            out[g] = reading
+    return out
 
 
 def _trap_witness(src, pre_node, spec, repo):
@@ -1417,6 +1671,7 @@ def _trap_witness(src, pre_node, spec, repo):
     except Exception:
         kinds = None
     ctx = Ctx(repo or {}); ctx.facts = []; ctx.track_trap_lines = True
+    ctx.hard_traps = []                                           # exact traps, witnessable under the over-approx
     saved = core._TRAPFREE; core._TRAPFREE = True
     try:
         args, z3args, _rets, traps, _none = symexec(src, ctx, param_kinds=kinds)
@@ -1425,9 +1680,13 @@ def _trap_witness(src, pre_node, spec, repo):
         return None, None, None
     finally:
         core._TRAPFREE = saved
-    if not traps or ctx.havoc or getattr(ctx, "none_havoc", False) or getattr(ctx, "overapprox", False):
-        return None, None, None                                   # over-approx / havoc: a model is not a guaranteed witness
-    claim = z3.And(pre_term, *ctx.facts, z3.Or(*traps)) if ctx.facts else z3.And(pre_term, z3.Or(*traps))
+    if ctx.havoc or getattr(ctx, "none_havoc", False):
+        return None, None, None                                   # havoc: a model is not a guaranteed witness
+    if getattr(ctx, "overapprox", False):                         # over-approx: only an exact trap -- one whose
+        traps = list(ctx.hard_traps) + [t for t in traps if _param_only(t, z3args)]   # condition reads only the
+    if not traps:                                                 # parameters -- yields a witness
+        return None, None, None
+    claim = _trap_claim(pre_term, ctx.facts, traps, getattr(ctx, "defs", None))
     st, model = _solve(claim)
     if st != REFUTED or model is None:
         return None, None, None
@@ -1437,7 +1696,85 @@ def _trap_witness(src, pre_node, spec, repo):
         cex_str, cex_in = _model_cex(model, z3args, args)         # replayable value; a dict/list param has no model
     except Exception:                                            # value here, so report no witness rather than crash
         return None, None, None
+    fired = [t for t in traps if z3.is_true(model.eval(t, model_completion=True))]
+    cex_str, cex_in = _container_witness(src, args, z3args, model, cex_str, cex_in, pre_node, spec, repo, kinds,
+                                         by_length=any(_param_only(t, z3args) for t in fired))
     return cex_in, cex_str, trap_info
+
+
+def _container_witness(src, args, z3args, model, cex_str, cex_in, pre_node, spec, repo, kinds, by_length=False):
+    """Complete a trap witness with a concrete value for each list / tuple / bytes / set / dict parameter: one of
+    the model's length (a list of len_<name> neutral elements -- 0, '', 0.0, False by the annotated element type),
+    kept when the firing trap reads only the scalar inputs and the containers' lengths (`by_length`: any contents
+    of that length realize it), or when re-running the function symbolically on those concrete containers, with
+    the scalar inputs pinned, still reaches a trap. A container the trap does not pin this way is left out."""
+    conts = [a for a in args if isinstance(z3args.get(a), (core._SafeContainer, core._DictParam))
+             and not isinstance(z3args.get(a), core._SetExpr)]
+    if not conts or cex_in is None or not (isinstance(pre_node, ast.Constant) and pre_node.value is True):
+        return cex_str, cex_in                                # (a precondition would need the containers too)
+    neutral = {"str": "", "float": 0.0, "bool": False, "bytes": b"", "int": 0, None: 0}
+    concrete = {}
+    for a in conts:
+        c = z3args[a]
+        n = model.eval(z3.Int("len_" + c.name), model_completion=True)
+        k = n.as_long() if z3.is_int_value(n) else 0
+        if not 0 <= k <= 64:
+            return cex_str, cex_in
+        if isinstance(c, core._DictParam):
+            if k:
+                return cex_str, cex_in                        # a non-empty dict's keys are not pinned here
+            concrete[a] = {}
+        elif c.byteslike:
+            concrete[a] = bytes(k)
+        elif c.elem is not None or c.tuple_arity is not None:
+            return cex_str, cex_in
+        else:
+            e = neutral.get(getattr(c, "scalar", None), 0)
+            concrete[a] = tuple([e] * k) if (c.immutable and not c.unindexable) else (
+                set([e] * min(k, 1)) if c.unindexable else [e] * k)
+            if c.unindexable and k > 1:
+                return cex_str, cex_in                        # a set of k > 1 neutral elements collapses
+    if by_length:
+        out = dict(cex_in)
+        out.update(concrete)
+        extra = ", ".join("%s=%r" % (a, v) for a, v in concrete.items())
+        return ((cex_str + ", " + extra) if cex_str else extra), out
+    # replay: bind the concrete containers as literals at the top of the body
+    try:
+        mod = ast.parse(textwrap.dedent(src))
+        fn = next(n for n in mod.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+        binds = [ast.parse("%s = %r" % (a, v)).body[0] for a, v in concrete.items()]
+        fn.args.args = [p for p in fn.args.args if p.arg not in concrete]
+        fn.args.defaults = []
+        fn.body = binds + fn.body
+        rsrc = ast.unparse(ast.fix_missing_locations(mod))
+        ctx = Ctx(repo or {}); ctx.facts = []; ctx.hard_traps = []
+        saved = core._TRAPFREE; core._TRAPFREE = True
+        try:
+            rargs, rz3, _r, rtraps, _n = symexec(rsrc, ctx, param_kinds=kinds)
+        finally:
+            core._TRAPFREE = saved
+        if ctx.havoc or not rtraps:
+            return cex_str, cex_in
+        pins = [rz3[p] == (z3.IntVal(cex_in[p]) if isinstance(cex_in[p], int) and not isinstance(cex_in[p], bool)
+                           else z3.BoolVal(cex_in[p]) if isinstance(cex_in[p], bool)
+                           else z3.StringVal(cex_in[p]) if isinstance(cex_in[p], str)
+                           else z3.FPVal(cex_in[p], core._F64))
+                for p in rargs if p in cex_in and z3.is_expr(rz3.get(p))]
+        if ctx.overapprox:
+            rtraps = list(ctx.hard_traps) + [t for t in rtraps if _param_only(t, rz3)]
+        if not rtraps:
+            return cex_str, cex_in
+        q = z3.And(*ctx.facts, *pins, z3.Or(*rtraps))
+        if _solve(q)[0] != REFUTED:
+            return cex_str, cex_in
+    except Exception:
+        return cex_str, cex_in
+    out = dict(cex_in)
+    out.update(concrete)
+    text = ", ".join(p for p in [cex_str] if p) if cex_str else ""
+    extra = ", ".join("%s=%r" % (a, v) for a, v in concrete.items())
+    return (text + ", " + extra) if text else extra, out
 
 
 def _trap_type_at_line(src, line):
@@ -1469,12 +1806,15 @@ def _firing_trap_info(src, traps, model):
     """'TYPE at line N' for the first trap condition the witness model satisfies, or None. The line is exact
     (recorded per condition by the value engine's trap list); the type is read statically from that line."""
     lines = getattr(traps, "lines", None)
+    kinds = getattr(traps, "kinds", None) or []
     if not lines:
         return None
-    for cond, ln in zip(traps, lines):
+    for i, (cond, ln) in enumerate(zip(traps, lines)):
         try:
             if ln is not None and z3.is_true(model.eval(cond, model_completion=True)):
-                return "%s at line %d" % (_trap_type_at_line(src, ln) or "a modeled trap", ln)
+                ks = kinds[i] if i < len(kinds) else None     # the kinds the value engine recorded at the trap site
+                ty = " / ".join(sorted(ks)) if ks else _trap_type_at_line(src, ln)   # (int / int past the largest
+                return "%s at line %d" % (ty or "a modeled trap", ln)                # double is an OverflowError)
         except z3.Z3Exception:
             continue
     return None
@@ -1564,7 +1904,7 @@ def _bmc_trap_witness(src, pre_node, spec, repo, k=24):
     if ctx.havoc or getattr(ctx, "none_havoc", False) or getattr(ctx, "overapprox", False) or not ctx.traps:
         return None, None                                         # an over-approximation slipped in: a model is not a witness
     pre_term = ev_bool(pre_node, dict(base), spec)
-    claim = z3.And(pre_term, *ctx.facts, z3.Or(*ctx.traps)) if ctx.facts else z3.And(pre_term, z3.Or(*ctx.traps))
+    claim = _trap_claim(pre_term, ctx.facts, ctx.traps, getattr(ctx, "defs", None))
     st, model = _solve(claim)
     if st != REFUTED or model is None:
         return None, None
@@ -1578,15 +1918,15 @@ def _bmc_trap_witness(src, pre_node, spec, repo, k=24):
     return cex_in, cex_str
 
 
-def _sandbox_first_trap(fn, src, repo, requires, prefer=None, trials=48, seed=20240916):
-    """Sample precondition-satisfying inputs for a plain-positional-parameter function (an optional `prefer`
-    witness tried first), run the real function in the isolated sandbox, and return ({name: value},
-    exception_name) for the first input that raises a modeled trap (ZeroDivision / Index / Key / Type / Value
-    / Assertion), else (None, None). The shared core of check's interprocedural oracle and scan's
-    finding-confirmation; the sampled values are built-in types so they cross the sandbox boundary cleanly."""
+def _typed_samples(fn, requires, prefer=None, trials=48, seed=20240916):
+    """Precondition-satisfying inputs for a plain-positional-parameter function, each a {name: value} of built-in
+    values of the parameter's annotated type (an unannotated one by its usage-inferred kind, an int otherwise): an
+    optional `prefer` witness first, an integer boundary grid for integer parameters, then `trials` random draws.
+    None when a parameter has no faithful sample (a class annotation, a method receiver) or nothing satisfies the
+    precondition. The values are built-in types, so they cross the sandbox boundary cleanly."""
     params = [a.arg for a in fn.args.args]
     if params and params[0] in ("self", "cls"):                  # a method receiver cannot be sampled standalone:
-        return None, None                                        # a trap on an int self is a type artifact, not a bug
+        return None                                              # a trap on an int self is a type artifact, not a bug
     try:
         from .domains import _infer_param_kinds
         kinds = _infer_param_kinds(fn)                            # usage-inferred kind of each unannotated parameter
@@ -1594,26 +1934,88 @@ def _sandbox_first_trap(fn, src, repo, requires, prefer=None, trials=48, seed=20
         kinds = {}
     rng = random.Random(seed)
 
+    class _NoSample(Exception):
+        pass
+
+    def _of(ann, depth=0):                                       # a value of the annotated type: a list[int] is a list of
+        if ann is None or depth > 3:                             # ints, never the int 0 (a TypeError on an ill-typed input
+            return rng.choice([0, 0, 1, -1, 2, 7, rng.randint(-64, 64)])   # is no witness of anything)
+        if isinstance(ann, ast.Constant) and ann.value is None:
+            return None
+        if isinstance(ann, ast.Name):
+            nm = ann.id
+            if nm == "int":
+                if rng.random() < 0.1:                           # a boundary of the double / C-long / int ranges
+                    return rng.choice([2 ** 53 + 1, -(2 ** 53 + 1), 2 ** 63, -(2 ** 63) - 1, 10 ** 20, 2 ** 1024])
+                return rng.choice([0, 0, 1, -1, 2, 7, rng.randint(-64, 64)])
+            if nm == "float":
+                if rng.random() < 0.1:                           # the IEEE-754 specials and extremes
+                    return rng.choice([float("nan"), float("inf"), float("-inf"), -0.0, 5e-324, 1.7976931348623157e308,
+                                       0.5, 2.5, 1e16])
+                return rng.choice([0.0, 1.0, -1.0, 2.5, rng.uniform(-50.0, 50.0)])
+            if nm == "bool":
+                return rng.random() < 0.5
+            if nm == "str":
+                return "".join(rng.choice("ab 0,") for _ in range(rng.randint(0, 4)))
+            if nm == "bytes":
+                return bytes(rng.randint(0, 255) for _ in range(rng.randint(0, 4)))
+            if nm in ("list", "List", "Sequence"):
+                return [rng.randint(-9, 9) for _ in range(rng.randint(0, 4))]
+            if nm in ("tuple", "Tuple"):
+                return tuple(rng.randint(-9, 9) for _ in range(rng.randint(0, 4)))
+            if nm in ("dict", "Dict", "Mapping"):
+                return {rng.randint(-4, 4): rng.randint(-9, 9) for _ in range(rng.randint(0, 3))}
+            if nm in ("set", "Set", "frozenset"):
+                return {rng.randint(-9, 9) for _ in range(rng.randint(0, 3))}
+            raise _NoSample()                                    # a class / alias: no faithful built-in value
+        if isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name):
+            base, sl = ann.value.id, ann.slice
+            if base in ("list", "List", "Sequence", "MutableSequence"):
+                return [_of(sl, depth + 1) for _ in range(rng.randint(0, 4))]
+            if base in ("set", "Set", "frozenset", "FrozenSet"):
+                vals = [_of(sl, depth + 1) for _ in range(rng.randint(0, 3))]
+                try:
+                    return set(vals)
+                except TypeError:
+                    raise _NoSample()
+            if base in ("tuple", "Tuple"):
+                elts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
+                if any(isinstance(e, ast.Constant) and e.value is Ellipsis for e in elts):
+                    return tuple(_of(elts[0], depth + 1) for _ in range(rng.randint(0, 4)))
+                return tuple(_of(e, depth + 1) for e in elts)
+            if base in ("dict", "Dict", "Mapping", "MutableMapping") and isinstance(sl, ast.Tuple) and len(sl.elts) == 2:
+                out = {}
+                for _ in range(rng.randint(0, 3)):
+                    try:
+                        out[_of(sl.elts[0], depth + 1)] = _of(sl.elts[1], depth + 1)
+                    except TypeError:
+                        raise _NoSample()
+                return out
+            if base == "Optional":
+                return None if rng.random() < 0.3 else _of(sl, depth + 1)
+        raise _NoSample()
+
     def _samp(a):                                                 # one built-in-typed value per parameter, matching
-        ann = a.annotation.id if isinstance(a.annotation, ast.Name) else None   # the annotation or the inferred kind so
-        kind = kinds.get(a.arg)                                   # a string/list parameter is not sampled as an int
-        if ann == "list" or kind in ("seq", "container"):        # (which would TypeError -- a confirmation artifact)
+        kind = kinds.get(a.arg)                                   # the annotation or the inferred kind so a string /
+        if a.annotation is not None:                              # list parameter is never sampled as an int (which
+            return _of(a.annotation)                              # would TypeError -- a confirmation artifact)
+        if kind in ("seq", "container"):
             return [rng.randint(-9, 9) for _ in range(rng.randint(0, 4))]
-        if ann == "tuple":
-            return tuple(rng.randint(-9, 9) for _ in range(rng.randint(0, 4)))
-        if ann == "dict" or kind == "dict":
+        if kind == "dict":
             return {rng.randint(-4, 4): rng.randint(-9, 9) for _ in range(rng.randint(0, 3))}
-        if ann == "str" or kind == "str":
-            return "".join(rng.choice("ab 0") for _ in range(rng.randint(0, 4)))
-        if ann == "float":
-            return rng.choice([0.0, 1.0, -1.0, 2.5, rng.uniform(-50.0, 50.0)])
-        if ann == "bool":
-            return rng.random() < 0.5
+        if kind == "str":
+            return "".join(rng.choice("ab 0,") for _ in range(rng.randint(0, 4)))
         return rng.choice([0, 0, 1, -1, 2, 7, rng.randint(-64, 64)])   # int / unannotated: 0 hits div/mod traps
 
     samples = []
-    if prefer and all(p in prefer for p in params) \
-            and all(isinstance(prefer[p], (int, float, bool, str)) for p in params):
+
+    def _fits(a, v):                                              # the preferred witness value has the annotated type
+        ann = a.annotation
+        if ann is None:
+            return isinstance(v, (int, float, bool, str))
+        want = {"int": int, "float": float, "bool": bool, "str": str}.get(getattr(ann, "id", None))
+        return want is not None and isinstance(v, want) and (want is not int or not isinstance(v, bool))
+    if prefer and all(p in prefer for p in params) and all(_fits(a, prefer[a.arg]) for a in fn.args.args):
         samples.append({p: prefer[p] for p in params})           # the engine's own witness, replayed first
     if not params:
         samples.append({})
@@ -1625,16 +2027,33 @@ def _sandbox_first_trap(fn, src, repo, requires, prefer=None, trials=48, seed=20
             import itertools                                      # that trap (0, +-1, equal arguments) hit for sure
             for combo in itertools.product((0, 1, -1, 2, -2), repeat=len(params)):
                 samples.append(dict(zip(params, combo)))
+        strs = [a.arg for a in fn.args.args if (isinstance(a.annotation, ast.Name) and a.annotation.id == "str")
+                or (a.annotation is None and kinds.get(a.arg) == "str")]
+        if strs:                                                 # a string boundary grid, one parameter at a time:
+            lim = sys.get_int_max_str_digits() if hasattr(sys, "get_int_max_str_digits") else 0
+            grid = ["", " ", "0", "-1", "a", "ß", "²", "İ", "é", "\ud800", "\x00", "a,b"] + (
+                ["1" * (lim + 1)] if lim else [])                 # case maps that change length, a non-decimal digit,
+            for p in strs:                                        # a surrogate, a NUL, the int digit limit
+                for g in grid:
+                    try:
+                        base = {a.arg: _samp(a) for a in fn.args.args}
+                    except _NoSample:
+                        return None
+                    base[p] = g
+                    samples.append(base)
         for _ in range(trials):
-            samples.append({a.arg: _samp(a) for a in fn.args.args})
+            try:
+                samples.append({a.arg: _samp(a) for a in fn.args.args})
+            except _NoSample:
+                return None                                      # an annotation with no faithful sample: no oracle
 
     pre_ok = lambda s: True
     if requires.strip() != "True":                              # keep only the inputs the precondition admits
         try:
             code = compile(textwrap.dedent(requires), "<requires>", "eval")
         except SyntaxError:
-            return None, None
-        g = {"__builtins__": {"abs": abs, "min": min, "max": max, "len": len, "int": int, "bool": bool}}
+            return None
+        g = {"__builtins__": dict(_SPEC_EVAL_BUILTINS)}
         pre_ok = lambda s, _c=code, _g=g: bool(eval(_c, _g, dict(s)))
 
     kept = []
@@ -1644,16 +2063,75 @@ def _sandbox_first_trap(fn, src, repo, requires, prefer=None, trials=48, seed=20
                 kept.append(s)
         except Exception:
             continue                                            # a sample the precondition cannot evaluate on: skip
+    return kept or None
+
+
+def _large_sample(s):
+    """Whether a sample holds a value one single operation can spend unbounded time on (a huge int raised to a
+    power, a string past the int digit limit): such samples run in a batch of their own."""
+    def big(v):
+        if isinstance(v, bool):
+            return False
+        if isinstance(v, int):
+            return abs(v) > 2 ** 40
+        if isinstance(v, (str, bytes)):
+            return len(v) > 1000
+        if isinstance(v, (list, tuple, set)):
+            return any(big(x) for x in v)
+        if isinstance(v, dict):
+            return any(big(k) or big(x) for k, x in v.items())
+        return False
+    return any(big(v) for v in s.values())
+
+
+def _sandbox_runs(run, src, repo, fname, kept, params):
+    """Run `run` (a sandbox_run_batch_* function) over the samples, the large ones (_large_sample) in a batch of
+    their own, so one unbounded operation costs only that batch. Returns results aligned with `kept`, None for a
+    sample whose batch could not run."""
+    out = [None] * len(kept)
+    for want_large in (False, True):
+        idx = [i for i, s in enumerate(kept) if _large_sample(s) == want_large]
+        if not idx:
+            continue
+        res = run(src, repo or {}, fname, [[kept[i][a] for a in params] for i in idx])
+        if res is None:
+            continue
+        for i, r in zip(idx, res):
+            out[i] = r
+    return out
+
+
+# the builtins a precondition / postcondition may use when it is evaluated on a concrete input
+_SPEC_EVAL_BUILTINS = {"abs": abs, "min": min, "max": max, "len": len, "int": int, "bool": bool, "float": float,
+                       "str": str, "sum": sum, "all": all, "any": any, "sorted": sorted, "set": set, "list": list,
+                       "tuple": tuple, "range": range, "round": round, "isinstance": isinstance, "True": True,
+                       "False": False, "None": None}
+
+
+def _sandbox_first_trap(fn, src, repo, requires, prefer=None, trials=48, seed=20240916):
+    """Sample precondition-satisfying inputs (_typed_samples), run the real function in the isolated sandbox, and
+    return ({name: value}, exception_name) for the first input that raises a modeled trap (ZeroDivision / Index /
+    Key / Type / Value / Assertion), else (None, None). The shared core of check's concrete oracle and scan's
+    finding-confirmation. A TypeError with an unannotated parameter is no witness: its sampled type is a guess."""
+    kept = _typed_samples(fn, requires, prefer, trials, seed)
     if not kept:
         return None, None
-    inputs = [[s[a] for a in params] for s in kept]
-    res = core.sandbox_run_batch_typed(src, repo or {}, fn.name, inputs)
-    if res is None:
-        return None, None
-    for s, r in zip(kept, res):
-        if r[0] == "raise" and r[1] in core._MODELED_TRAP_NAMES:   # a real, reachable modeled trap
-            return dict(s), r[1]
+    params = [a.arg for a in fn.args.args]
+    res = _sandbox_runs(core.sandbox_run_batch_typed, src, repo, fn.name, kept, params)
+    guessed = any(a.annotation is None for a in fn.args.args)   # an unannotated parameter's sampled type is a guess,
+    for s, r in zip(kept, res):                                  # so a TypeError there may be the guess's own mismatch
+        if r is None:
+            continue
+        if r[0] == "raise" and _modeled_raise(r[1]) and not (guessed and _modeled_raise(r[1]) == "TypeError"):
+            return dict(s), r[1]                                 # a real, reachable modeled trap
     return None, None
+
+
+def _modeled_raise(name):
+    """The modeled trap an exception raised in the sandbox counts as -- the exception itself or the builtin trap
+    class it derives from (UnicodeEncodeError is a ValueError) -- or None."""
+    hits = core._exc_self_and_ancestors(name) & core._MODELED_TRAP_NAMES
+    return next(iter(sorted(hits)), None) if hits else None
 
 
 def _oracle_trap_refute(src, requires, repo):
@@ -1667,12 +2145,60 @@ def _oracle_trap_refute(src, requires, repo):
         fn = _fndef(src)
     except Unsupported:
         return None, None
-    if fn.args.vararg or fn.args.kwarg or fn.args.kwonlyargs or fn.args.posonlyargs or not fn.args.args:
+    if fn.args.vararg or fn.args.kwarg or fn.args.kwonlyargs or fn.args.posonlyargs:
         return None, None
     w, _exc = _sandbox_first_trap(fn, src, repo, requires)
     if w is None:
         return None, None
-    return w, ", ".join("%s=%s" % (a.arg, w[a.arg]) for a in fn.args.args)
+    return w, ", ".join("%s=%r" % (a.arg, w[a.arg]) for a in fn.args.args)
+
+
+def _concrete_post_refute(src, ensures, requires, repo, target=None, trials=64):
+    """A concrete counterexample to prove(src, ensures, requires): sampled precondition-satisfying inputs
+    (_typed_samples) run in the isolated sandbox, and the first on which the function raises a modeled trap or
+    returns a plain-data result the postcondition -- evaluated here, over the entry values of the parameters and
+    `result` -- does not hold. Returns ({name: value}, "name=value, ...", what failed) or (None, None, None); None
+    too when execution is disabled. The postcondition is the user's own text, evaluated with a fixed set of
+    builtins (no import, no I/O)."""
+    if not (core.SANDBOX_SUBJECT or core.ALLOW_SUBJECT_EXECUTION):
+        return None, None, None
+    try:
+        mod = _parse(src)
+        fn = next(n for n in mod.body if isinstance(n, ast.FunctionDef) and (target is None or n.name == target))
+    except StopIteration:
+        return None, None, None
+    if fn.args.vararg or fn.args.kwarg or fn.args.kwonlyargs or fn.args.posonlyargs:
+        return None, None, None
+    try:
+        post = compile(textwrap.dedent(ensures), "<ensures>", "eval")
+    except SyntaxError:
+        return None, None, None
+    kept = _typed_samples(fn, requires, trials=trials)
+    if not kept:
+        return None, None, None
+    params = [a.arg for a in fn.args.args]
+    res = _sandbox_runs(core.sandbox_run_batch_values, src, repo, fn.name, kept, params)
+    guessed = any(a.annotation is None for a in fn.args.args)
+    g = {"__builtins__": dict(_SPEC_EVAL_BUILTINS, old=lambda v: v)}
+    import copy as _copy
+    for s, r in zip(kept, res):
+        if r is None:
+            continue
+        what = None
+        if r[0] == "raise" and _modeled_raise(r[1]) and not (guessed and _modeled_raise(r[1]) == "TypeError"):
+            what = "the function raises %s" % r[1]
+        elif r[0] == "ok":
+            env = _copy.deepcopy(s)
+            env["result"] = r[1]
+            try:
+                held = bool(eval(post, g, env))
+            except Exception:
+                continue                                          # a postcondition not evaluable on this input
+            if not held:
+                what = "the postcondition is false (result = %r)" % (r[1],)
+        if what is not None:
+            return dict(s), ", ".join("%s=%r" % (a, s[a]) for a in params), what
+    return None, None, None
 
 
 class _RaiseStripper(ast.NodeTransformer):
@@ -1847,6 +2373,8 @@ def check(src, requires="True", repo=None, total=False, prop="implicit", target=
         finally:
             core.BEST_EFFORT = saved
     v = _escalate_budget(lambda: _check_core(src, requires, repo, total, prop, target))
+    if v.status != REFUTED and requires.strip() == "True":
+        v = _check_default_variants(v, src, repo, total, prop, target)   # an omitted None / [] default argument
     if v.status == PROVED:
         # a materialized nested generator, or a constructed same-module class's raising __new__/__init__, runs a
         # body the trap-free engines above treat as an opaque value; gate the proof on those bodies being trap
@@ -1863,6 +2391,132 @@ def check(src, requires="True", repo=None, total=False, prop="implicit", target=
         if note and note not in (v.reason or ""):
             v.reason = (v.reason + "; " + note) if v.reason else note
     return v
+
+
+def _default_variants(src, target):
+    """[(variant source, omitted names)] for the parameters of `target` whose default is None or a mutable literal
+    ([] / {} / set()): each non-empty subset of them omitted at the call, i.e. dropped from the signature and bound
+    to its default at the top of the body. The engines model a parameter by its annotation (an unannotated one as an
+    int), which never includes None, so the omitted call -- always a valid call -- is checked as its own function.
+    None when there are more than three such parameters (the variants are not enumerated)."""
+    try:
+        mod = ast.parse(textwrap.dedent(src))
+    except SyntaxError:
+        return []
+    fn = next((n for n in mod.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and (target is None or n.name == target)), None)
+    if fn is None:
+        return []
+    a = fn.args
+    pos = list(a.posonlyargs) + list(a.args)
+    pairs = list(zip(pos[len(pos) - len(a.defaults):], a.defaults)) + [
+        (k, d) for k, d in zip(a.kwonlyargs, a.kw_defaults) if d is not None]
+
+    def special(d):
+        return ((isinstance(d, ast.Constant) and d.value is None)
+                or (isinstance(d, (ast.List, ast.Dict, ast.Set)) and not getattr(d, "elts", getattr(d, "keys", [])))
+                or (isinstance(d, ast.Call) and isinstance(d.func, ast.Name) and d.func.id in ("list", "dict", "set")
+                    and not d.args and not d.keywords))
+    cands = [(p, d) for p, d in pairs if special(d)]
+    if not cands:
+        return []
+    if len(cands) > 3:
+        return None
+    import itertools as _it
+    out = []
+    for r in range(1, len(cands) + 1):
+        for sub in _it.combinations(cands, r):
+            names = {p.arg for p, _ in sub}
+            m2 = ast.parse(textwrap.dedent(src))
+            f2 = next(n for n in m2.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fn.name)
+            a2 = f2.args
+            keep_pos = [p for p in list(a2.posonlyargs) + list(a2.args)]
+            defaults = list(a2.defaults)
+            dmap = dict(zip([p.arg for p in keep_pos[len(keep_pos) - len(defaults):]], defaults))
+            a2.posonlyargs = [p for p in a2.posonlyargs if p.arg not in names]
+            a2.args = [p for p in a2.args if p.arg not in names]
+            rest = list(a2.posonlyargs) + list(a2.args)
+            a2.defaults = [dmap[p.arg] for p in rest if p.arg in dmap]
+            kw = [(k, d) for k, d in zip(a2.kwonlyargs, a2.kw_defaults) if k.arg not in names]
+            a2.kwonlyargs, a2.kw_defaults = [k for k, _ in kw], [d for _, d in kw]
+            binds = [ast.Assign(targets=[ast.Name(id=p.arg, ctx=ast.Store())], value=d) for p, d in sub]
+            body = f2.body
+            doc = body[:1] if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None),
+                                                                                     ast.Constant) else []
+            f2.body = doc + binds + body[len(doc):]
+            ast.fix_missing_locations(m2)
+            out.append((ast.unparse(m2), sorted(names)))
+    return out
+
+
+def _check_default_variants(v, src, repo, total, prop, target):
+    """Combine the verdict over the declared parameters with the verdicts of the omitted-default calls
+    (_default_variants): any refuted variant refutes (its witness omits those arguments), PROVED needs every
+    variant proved, otherwise UNKNOWN."""
+    vs = _default_variants(src, target)
+    if not vs:
+        return v if vs == [] else Verdict(UNKNOWN, prop, v.target, v.technique,
+                                          reason="more than three None / mutable defaults (omitted calls not enumerated)")
+    all_proved = v.status == PROVED
+    for vsrc, names in vs:
+        r = repo
+        try:
+            w = _escalate_budget(lambda: _check_core(vsrc, "True", r, total, prop, target))
+        except Exception:
+            w = Verdict(UNKNOWN, prop, v.target, v.technique, reason="omitted-default call not modeled")
+        if w.status == REFUTED:
+            note = "with %s omitted (the default)" % ", ".join(names)
+            inputs = w.counterexample_inputs
+            if inputs is None:
+                try:
+                    vf = next(n for n in ast.parse(vsrc).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+                    if not (vf.args.args or vf.args.posonlyargs or vf.args.kwonlyargs):
+                        inputs = {}                          # nothing left to pass: the call f() is the witness
+                except (SyntaxError, StopIteration):
+                    pass
+            return Verdict(REFUTED, prop, w.target, w.technique, counterexample=((w.counterexample + "; ") if
+                           w.counterexample else "") + note, counterexample_inputs=inputs, reason=w.reason)
+        all_proved = all_proved and w.status == PROVED
+    if v.status == PROVED and not all_proved:
+        return Verdict(UNKNOWN, prop, v.target, v.technique,
+                       reason="the call omitting a None / mutable default argument is not proved trap free")
+    return v
+
+
+def _renders_in_loop(src):
+    """Whether a loop body renders a value as text (str / repr / print / format / an f-string field)."""
+    try:
+        tree = ast.parse(textwrap.dedent(src))
+    except SyntaxError:
+        return False
+    for loop in ast.walk(tree):
+        if isinstance(loop, (ast.For, ast.While)):
+            for n in ast.walk(loop):
+                if isinstance(n, ast.FormattedValue) or (
+                        isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                        and n.func.id in ("str", "repr", "print", "format", "ascii")):
+                    return True
+    return False
+
+
+def _with_param_domains(pre, src, target):
+    """`pre` conjoined with the value range of each `bool`-annotated parameter of `target`: the integer engines
+    carry every parameter as an Int, and a bool is 0 or 1 there (b + 1 is never 0)."""
+    try:
+        fn = next(n for n in _parse(src).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and (target is None or n.name == target))
+    except StopIteration:
+        return pre
+    bools = [a.arg for a in fn.args.args + fn.args.kwonlyargs
+             if isinstance(a.annotation, ast.Name) and a.annotation.id == "bool"]
+    if not bools:
+        return pre
+
+    def wrapped(S):
+        dom = [z3.And(S[p] >= 0, S[p] <= 1) for p in bools
+               if p in S and z3.is_expr(S[p]) and z3.is_int(S[p])]
+        return z3.And(pre(S), *dom) if dom else pre(S)
+    return wrapped
 
 
 def _check_core(src, requires, repo, total, prop, target):
@@ -1894,8 +2548,15 @@ def _check_core(src, requires, repo, total, prop, target):
     except SyntaxError as e:
         return Verdict(UNKNOWN, prop, target, "implicit contracts", reason=f"precondition syntax: {e}")
     pre_node = _strip_old(pre_node)
-    pre_fn = lambda S: ev_bool(pre_node, dict(S), spec)
-    safe = verify_no_raise(prop, target, src, pre_fn, repo)        # asserts and traps are escaping raises
+    pre_fn = _with_param_domains(lambda S: ev_bool(pre_node, dict(S), spec), src, target)
+    safe = None
+    if _renders_in_loop(src):                                     # an int rendered inside a loop carries the 4300-digit
+        _fast = _check_trapfree_symexec(prop, target, src, pre_node, spec, repo,   # threshold, which the Horn engine
+                                        requires.strip() != "True")               # handles slowly: when the value
+        if _fast.status == PROVED:                                # engine already proves it (sound), take that
+            safe = _fast
+    if safe is None:
+        safe = verify_no_raise(prop, target, src, pre_fn, repo)    # asserts and traps are escaping raises
     if safe.status == UNKNOWN and _mentions_none(src):            # carry None through the loop as an Opt value, so
         opt = verify_no_raise_optional(prop, target, src, pre_node, repo)   # a None reaching arithmetic refutes
         if opt.status != UNKNOWN:                                 # instead of abstaining (and a havoc cannot
@@ -1932,7 +2593,8 @@ def _check_core(src, requires, repo, total, prop, target):
         # symbolically (a reachable base-case or recursive-step trap is an Err under the call's path condition),
         # so it refutes even with a leading import that would block the sandbox oracle. Take only its REFUTED;
         # a container recursion it int-models could vacuously "prove", so a PROVED there is left to the flow.
-        _rpre = (lambda P: z3.BoolVal(True)) if requires.strip() == "True" else pre_fn
+        _rpre = (_with_param_domains(lambda P: z3.BoolVal(True), src, target)
+                 if requires.strip() == "True" else pre_fn)
         try:
             _rrec = verify_recursive(prop, target, src, _rpre, lambda S, r: z3.BoolVal(True))
         except Exception:
@@ -1948,15 +2610,16 @@ def _check_core(src, requires, repo, total, prop, target):
             safe = Verdict(REFUTED, prop, target, "implicit contracts (interprocedural unrolling)",
                            counterexample=_icex, counterexample_inputs=_iin,
                            reason="a modeled trap is reachable through an un-inlinable callee (bounded symbolic unrolling)")
-    if safe.status == UNKNOWN and (_called_names() or _self_rec()):
-        # every symbolic engine abstained on a function whose callee the inliner could not resolve (a recursive
-        # callee, e.g. f's `// gcd(...)`, or self-recursion): the isolated sandbox decides a reachable trap the
-        # engines could not. Silent when execution is disabled, so a symbolic run still never runs the subject.
+    if safe.status == UNKNOWN:
+        # every symbolic engine abstained: inputs of the parameters' types, run in the isolated sandbox, decide a
+        # reachable trap the engines could not (an un-inlinable callee, an unmodeled construct). Only a real raise
+        # on a real input refutes; nothing found leaves the verdict UNKNOWN. Silent when execution is disabled, so a
+        # symbolic run still never runs the subject.
         tin, tcex = _oracle_trap_refute(src, requires, repo)
         if tin is not None:
-            safe = Verdict(REFUTED, prop, target, "implicit contracts (interprocedural concrete trap)",
+            safe = Verdict(REFUTED, prop, target, "implicit contracts (concrete trap)",
                            counterexample=tcex, counterexample_inputs=tin,
-                           reason="a modeled trap is reachable through an un-inlinable callee on a concrete input")
+                           reason="a modeled trap is reachable on a concrete input (run in the sandbox)")
     if safe.status == UNKNOWN and not repo and any(isinstance(n, ast.ClassDef) for n in _parse(_heap_src).body):
         # object state across the method lifecycle: a function that constructs a local object and calls
         # value-returning methods on it (which the object rewrite declines) is triaged by the heap engine, which
@@ -1976,6 +2639,8 @@ def _check_core(src, requires, repo, total, prop, target):
             cex_in, cex, trap_info = _trap_witness(src, pre_node, spec, repo)   # the trapping input and its trap (type, line)
             if not cex_in:                                        # a loop the value engine havocs: unroll it instead
                 cex_in, cex = _bmc_trap_witness(src, pre_node, spec, repo)
+            if not cex_in:                                        # a construct with no exact model: a real input,
+                cex_in, cex = _oracle_trap_refute(src, requires, repo)   # run in the sandbox, that raises
         if safe.status == REFUTED and cex_in and trap_info is None:   # a witness from another engine: name its trap too
             trap_info = _trap_info_for_witness(src, pre_node, spec, repo, cex_in)
         reason = safe.reason
@@ -1984,7 +2649,8 @@ def _check_core(src, requires, repo, total, prop, target):
             if trap_info:                                         # name the exception type and offending line, symbolically
                 reason = "%s (%s)" % (reason, trap_info)
         return Verdict(safe.status, prop, target, "implicit contracts (asserts + trap freedom)",
-                       counterexample=cex, reason=reason, counterexample_inputs=cex_in)
+                       counterexample=cex, reason=reason, counterexample_inputs=cex_in,
+                       certificate=safe.certificate if safe.status == PROVED else None)
     term = verify_termination(prop, target, src, repo)
     if term.status == PROVED:
         return Verdict(PROVED, prop, target, "implicit contracts + termination", reason=term.reason)
@@ -4631,7 +5297,7 @@ def verify_no_raise_optional(prop, target, src, pre_node=None, repo=None, timeou
     return _solve_horn(prop, target, "exception safety (optional)",
                        "exception safety (optional: None as a value, CFG/CHC)",
                        list(R.values()) + [Err], [*declvars, *auxv], rules, Err(), corroborate=False,
-                       on_error=lambda m: "engine error",
+                       on_error=_horn_error_reason,
                        proved_reason="no uncaught raise or None-in-arithmetic reachable",
                        refuted_reason="a None reaches arithmetic (or an uncaught raise) on some path")
 
@@ -5386,32 +6052,61 @@ def verify_chc(prop, target, src, pre, post, repo=None) -> Verdict:
 
 def _verify_chc_core(prop, target, src, pre, post, repo=None) -> Verdict:
     src = _lower_list_lengths(src)                            # a list grown by append -> an integer length
+    try:
+        lists = _readonly_int_lists(_fndef(src))              # a read-only int list: a length and an array in the
+    except Unsupported:                                       # state, iterated by an index loop
+        lists = set()
+    if lists:
+        src = _lower_list_for(src, lists)
     fn, args, init, loop, ret = _parse_single_loop(src)
     if loop is None or ret is None:
         return Verdict(UNKNOWN, prop, target, "CHC/Spacer", reason="not a single-loop function")
+    if isinstance(fn, ast.FunctionDef):
+        _why = _int_chc_param_guard(fn, lists, repo)         # a parameter the integer relation cannot carry
+        if _why is not None:
+            return Verdict(UNKNOWN, prop, target, "CHC/Spacer", reason=_why)
     ctx = Ctx(repo or {})
     try:
         ctx.traps = []; ctx.pc = z3.BoolVal(True)
-        init0 = _apply_assigns(init, {a: z3.Int(a) for a in args}, ctx)
-        order = args + sorted(set(init0) - set(args))
-        Inv = z3.Function("Inv", *([z3.IntSort()] * len(order)), z3.BoolSort())
-        cur = {v: z3.Int("c_" + v) for v in order}
-        argcur = {a: cur[a] for a in args}
-        init_state = _apply_assigns(init, argcur, ctx)
-        guard = ev_bool(loop.test, cur, ctx)
+        sargs = [a for a in args if a not in lists]
+        lnames, lterms0 = _list_state(lists, "")
+        init0 = _apply_assigns(init, _bind_lists({**{a: z3.Int(a) for a in sargs}, **lterms0}, lists), ctx)
+        locs = sorted(v for v in set(init0) - set(args) - set(lnames))
+        order = sargs + lnames + locs
+        _, lterms = _list_state(lists, "c_")
+        cur = _bind_lists({**{v: z3.Int("c_" + v) for v in order if v not in lterms}, **lterms}, lists)
+        sorts = [lterms[v].sort() if v in lterms else z3.IntSort() for v in order]
+        Inv = z3.Function("Inv", *sorts, z3.BoolSort())
+        Err = z3.Function("ChcErr", z3.BoolSort())
+        argcur = _bind_lists({v: cur[v] for v in sargs + lnames}, lists)
+        lfacts = [z3.And(cur["__len_" + p] >= 0, cur["__len_" + p] <= sys.maxsize) for p in sorted(lists)]
+        P = pre({a: argcur[a] for a in args})
+        ctx.traps = []
+        init_state = _apply_assigns(init, dict(argcur), ctx)  # the traps of each phase are an error edge under
+        init_traps, ctx.traps = list(ctx.traps), []           # the state that reaches it: before the loop, at the
+        guard = ev_bool(loop.test, cur, ctx)                  # test, in the body (guard held), at the return
+        guard_traps, ctx.traps = list(ctx.traps), []
         nxt = _apply_assigns(loop.body, cur, ctx)
-        rules = [(Inv(*[init_state[v] for v in order]), [pre(argcur)]),
-                 (Inv(*[nxt[v] for v in order]), [Inv(*[cur[v] for v in order]), guard])]
+        body_traps, ctx.traps = list(ctx.traps), []
         ret_expr = ev(ret.value, cur, ctx)
-        if ctx.traps:
-            return Verdict(UNKNOWN, prop, target, "CHC/Spacer",
-                           reason="division in loop is outside the CHC encoding")
+        ret_traps = list(ctx.traps)
         ctx.traps = None
-        bad = z3.And(Inv(*[cur[v] for v in order]), z3.Not(guard), z3.Not(post(cur, ret_expr)))
-    except Unsupported as u:
+        here = Inv(*[cur[v] for v in order])
+        for st in (init_state, nxt):
+            for v in order:
+                if v in lterms and not st[v].eq(cur[v] if st is nxt else argcur[v]):
+                    raise Unsupported("a read-only list's state changed")
+        rules = [(Inv(*[init_state[v] for v in order]), [P] + lfacts),
+                 (Inv(*[nxt[v] for v in order]), [here, guard])]
+        rules += [(Err(), [P] + lfacts + [t]) for t in init_traps]
+        rules += [(Err(), [here, t]) for t in guard_traps]
+        rules += [(Err(), [here, guard, t]) for t in body_traps]
+        rules += [(Err(), [here, z3.Not(guard), t]) for t in ret_traps]
+        rules.append((Err(), [here, z3.Not(guard), z3.Not(post(cur, ret_expr))]))
+    except (Unsupported, KeyError, z3.Z3Exception) as u:
         return Verdict(UNKNOWN, prop, target, "CHC/Spacer", reason=str(u))
     return _solve_horn(prop, target, "CHC/Spacer", "CHC/Spacer (invariant synthesis)",
-                       [Inv], list(cur.values()), rules, bad,
+                       [Inv, Err], [v for v in cur.values() if z3.is_expr(v)], rules, Err(),
                        on_error=lambda m: "engine timeout (nonlinear?)", timeout=core.CHC_FAST_MS, retry=0)
 
 
@@ -5596,6 +6291,102 @@ def _build_cfg(body, user_bases=None):
     if tail is not None:
         tail.term = ("return", None)     # fall off the end -> return None
     return blocks, entry.id
+
+
+def _readonly_int_lists(fn):
+    """The parameters of fn annotated as a sequence of ints (list, list[int], Sequence[int], tuple[int, ...]) that the
+    body only reads: len(p), p[i] with a plain index, and `for x in p`. A parameter the body stores into, mutates,
+    reassigns, slices, tests membership in, or passes anywhere else is excluded, as is every parameter of a function
+    with a try statement (the CFG engines route only a division's raise through a handler, so an IndexError inside
+    a try would read as uncaught). A loop engine carries such a list as its length and an Int -> Int array in its
+    state, both unchanged by every step."""
+    if any(isinstance(n, ast.Try) or type(n).__name__ == "TryStar" for n in ast.walk(fn)):
+        return set()
+    cands = set()
+    for a in fn.args.args:
+        ann = a.annotation
+        if isinstance(ann, ast.Name) and ann.id == "list":
+            cands.add(a.arg)                                 # the int reading of a bare list
+        elif isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name):
+            base, sl = ann.value.id, ann.slice
+            if base in ("list", "List", "Sequence", "MutableSequence") and core._ann_scalar_kind(sl) == "int":
+                cands.add(a.arg)
+            elif base in ("tuple", "Tuple") and isinstance(sl, ast.Tuple) and len(sl.elts) == 2 \
+                    and core._ann_scalar_kind(sl.elts[0]) == "int" \
+                    and isinstance(sl.elts[1], ast.Constant) and sl.elts[1].value is Ellipsis:
+                cands.add(a.arg)
+    if not cands:
+        return cands
+    parent = {}
+    for n in ast.walk(fn):
+        for c in ast.iter_child_nodes(n):
+            parent[id(c)] = n
+    for n in ast.walk(fn):
+        if not (isinstance(n, ast.Name) and n.id in cands):
+            continue
+        p = parent.get(id(n))
+        ok = isinstance(n.ctx, ast.Load) and (
+            (isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.func.id == "len" and p.args == [n]
+             and not p.keywords)
+            or (isinstance(p, ast.Subscript) and p.value is n and isinstance(p.ctx, ast.Load)
+                and not isinstance(p.slice, ast.Slice))
+            or (isinstance(p, ast.For) and p.iter is n and isinstance(p.target, ast.Name)))
+        if not ok:
+            cands.discard(n.id)
+    return cands
+
+
+class _ListForLower(ast.NodeTransformer):
+    """`for x in xs` over a read-only list parameter -> `i = 0; while i < len(xs): x = xs[i]; i = i + 1; <body>`, the
+    counter advanced before the body so a `continue` moves on; an else clause keeps its meaning (run on exhaustion,
+    skipped by break)."""
+    def __init__(self, lists):
+        self.lists = lists
+        self.k = 0
+
+    def visit_FunctionDef(self, node):
+        self.generic_visit(node)
+        return node
+
+    def visit_For(self, node):
+        self.generic_visit(node)
+        if not (isinstance(node.iter, ast.Name) and node.iter.id in self.lists and isinstance(node.target, ast.Name)):
+            return node
+        i = "__lfi%d" % self.k
+        self.k += 1
+        xs, x = node.iter.id, node.target.id
+        init = ast.parse("%s = 0" % i).body[0]
+        test = ast.parse("%s < len(%s)" % (i, xs), mode="eval").body
+        bind = ast.parse("%s = %s[%s]" % (x, xs, i)).body[0]
+        step = ast.parse("%s = %s + 1" % (i, i)).body[0]
+        loop = ast.While(test=test, body=[bind, step] + node.body, orelse=node.orelse)
+        return [ast.copy_location(init, node), ast.copy_location(loop, node)]
+
+
+def _lower_list_for(src, lists):
+    """src with every `for x in xs` over a list in `lists` lowered to an index loop (_ListForLower)."""
+    tree = ast.parse(textwrap.dedent(src))
+    tree = _ListForLower(lists).visit(tree)
+    return ast.unparse(ast.fix_missing_locations(tree))
+
+
+def _list_state(lists, prefix):
+    """(the state variable names a loop engine adds for read-only lists, {name: term}, {param: array-backed list}):
+    each list's length and element array, named with `prefix`."""
+    names, terms = [], {}
+    for p in sorted(lists):
+        ln, ar = "__len_" + p, "__arr_" + p
+        terms[ln] = z3.Int(prefix + ln)
+        terms[ar] = z3.Array(prefix + ar, z3.IntSort(), z3.IntSort())
+        names += [ln, ar]
+    return names, terms
+
+
+def _bind_lists(env, lists):
+    """env with each read-only list parameter bound to its array-backed sequence over env's length / array terms."""
+    for p in lists:
+        env[p] = core._SafeContainer(p, length=env["__len_" + p], arr=env["__arr_" + p])
+    return env
 
 
 def _cfg_vars(fn, blocks):
@@ -5953,30 +6744,45 @@ def verify_function(prop, target, src, pre, post, repo=None, timeout=4000) -> Ve
     gated = _definite_assignment_guard(prop, target, "CFG/CHC", [src])
     if gated is not None:
         return gated
+    try:
+        lists = _readonly_int_lists(_fndef(src))              # a read-only int list: its length and array in the
+    except Unsupported:                                       # state, iterated by an index loop
+        lists = set()
+    if lists:
+        src = _lower_list_for(src, lists)
     fn = _fndef(src)
     params = [a.arg for a in fn.args.args]
+    _why = _int_chc_param_guard(fn, lists, repo)             # a parameter the integer relation cannot carry
+    if _why is not None:
+        return Verdict(UNKNOWN, prop, target, "CFG/CHC", reason=_why)
     try:
         blocks, entry = _build_cfg(fn.body)
     except Unsupported as u:
         return Verdict(UNKNOWN, prop, target, "CFG/CHC", reason=str(u))
-    order = _cfg_vars(fn, blocks)
+    order = [v for v in _cfg_vars(fn, blocks) if v not in lists]
+    lnames, lterms = _list_state(lists, "s_")
+    order += lnames
     ctx = Ctx(repo or {}); ctx.divvars = []
-    cur = {v: z3.Int("s_" + v) for v in order}
-    R = {bid: z3.Function(f"R{bid}", *([z3.IntSort()] * len(order)), z3.BoolSort())
-         for bid in blocks}
+    cur = _bind_lists({**{v: z3.Int("s_" + v) for v in order if v not in lterms}, **lterms}, lists)
+    sorts = [lterms[v].sort() if v in lterms else z3.IntSort() for v in order]
+    R = {bid: z3.Function(f"R{bid}", *sorts, z3.BoolSort()) for bid in blocks}
     Err = z3.Function("Err", z3.BoolSort())
     rules = []
 
     def tup(state):
         vals = [state[v] for v in order]
-        for x in vals:                                       # the relations are Int-sorted, so a non-integer value
-            if not (z3.is_expr(x) and z3.is_int(x)):          # (a float, string, or None) crossing a block cannot be
-                raise Unsupported("a non-integer value crosses a block")   # passed into one -- abstain, do not crash
+        for v, x in zip(order, vals):                        # the relations are Int-sorted (a list's array aside), so
+            if v in lterms:                                  # a non-integer value (a float, string, or None) crossing a
+                if not (z3.is_expr(x) and x.sort() == lterms[v].sort()):   # block cannot be passed into one --
+                    raise Unsupported("a read-only list's state changed")  # abstain, do not crash
+            elif not (z3.is_expr(x) and z3.is_int(x)):
+                raise Unsupported("a non-integer value crosses a block")
         return vals
 
     try:
-        init = {v: (cur[v] if v in params else z3.IntVal(0)) for v in order}
-        rules.append((R[entry](*tup(init)), [pre({p: cur[p] for p in params})]))
+        init = {v: (cur[v] if v in params or v in lterms else z3.IntVal(0)) for v in order}
+        lfacts = [z3.And(cur["__len_" + p] >= 0, cur["__len_" + p] <= sys.maxsize) for p in sorted(lists)]
+        rules.append((R[entry](*tup(init)), [pre({p: cur[p] for p in params})] + lfacts))
 
         for bid, b in blocks.items():
             ctx.traps = []; ctx.pc = z3.BoolVal(True); ctx.divaux = []
@@ -6005,7 +6811,7 @@ def verify_function(prop, target, src, pre, post, repo=None, timeout=4000) -> Ve
 
     return _annotate_machine_overflow(
         _solve_horn(prop, target, "CFG/CHC", "CFG/CHC (whole-function Horn)",
-                    list(R.values()) + [Err], [*cur.values(), *ctx.divvars], rules, Err(),
+                    list(R.values()) + [Err], [*(v for v in cur.values() if z3.is_expr(v)), *ctx.divvars], rules, Err(),
                     on_error=lambda m: "engine timeout (nonlinear?)" if ("canceled" in m or "timeout" in m) else f"engine: {m}"),
         src, pre, repo)
 
@@ -6196,6 +7002,76 @@ def _rewrite_object_attrs(src):
     return ast.unparse(mod)
 
 
+def _int_chc_param_guard(fn, lists, repo):
+    """The reason fn's parameters put it outside the integer CHC model (where every variable is a z3.Int relation),
+    or None. A str / bytes parameter bound as an integer would read int(s) / s + 1 / floor division as total integer
+    ops though they trap on the real value; a float one loses IEEE-754 semantics (NaN, signed zero, the infinities);
+    a method call on a number-typed parameter reads as a trap-free opaque call though a number has no such method
+    (AttributeError); float() of an integer OverflowErrors past 2**1024, a threshold the integer model cannot carry;
+    and a container parameter not carried as a read-only int list (`lists`) used as a scalar (a + 1, -a, int(a),
+    a == x, a < 1, str(a)) reads as a total integer op though it is a TypeError or a comparison of the container's
+    own value. Each defers to the value engine, which models the real types. A container used as a container, or
+    a class-annotated receiver, is sound here and stays."""
+    strparams = {a.arg for a in fn.args.args
+                 if isinstance(a.annotation, ast.Name) and a.annotation.id in ("str", "bytes")}
+    if strparams and any(isinstance(n, ast.Name) and n.id in strparams for n in ast.walk(fn)):
+        return "a str/bytes-typed parameter is outside the integer CHC model (value engine decides)"
+    floatparams = {a.arg for a in fn.args.args
+                   if isinstance(a.annotation, ast.Name) and a.annotation.id == "float"}
+    if floatparams and any(isinstance(n, ast.Name) and n.id in floatparams for n in ast.walk(fn)):
+        return "a float-typed parameter is outside the integer CHC model (value engine decides)"
+    numparams = {a.arg for a in fn.args.args
+                 if isinstance(a.annotation, ast.Name) and a.annotation.id in ("int", "float", "bool")}
+    if numparams and any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                         and isinstance(n.func.value, ast.Name) and n.func.value.id in numparams
+                         for n in ast.walk(fn)):
+        return "a method call on a number-typed parameter is outside the integer CHC model (value engine decides)"
+    intparams = {a.arg for a in fn.args.args
+                 if isinstance(a.annotation, ast.Name) and a.annotation.id == "int"}
+
+    def _floats_an_int(n):
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "float"
+                and "float" not in (repo or {}) and len(n.args) == 1):
+            return False
+        a = n.args[0]
+        return ((isinstance(a, ast.Name) and a.id in intparams)
+                or (isinstance(a, ast.Constant) and isinstance(a.value, int) and not isinstance(a.value, bool))
+                or isinstance(a, ast.BinOp))
+    if any(_floats_an_int(n) for n in ast.walk(fn)):
+        return "float() of an integer may OverflowError, outside the integer CHC model (value engine decides)"
+
+    def _ctnr_ann(ann):                                      # a container annotation, bare (list) or parameterized
+        if isinstance(ann, ast.Name):                        # (list[int], dict[str, int], or a typing alias)
+            return ann.id in ("list", "dict", "set", "frozenset", "tuple")
+        if isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name):
+            return ann.value.id in ("list", "dict", "set", "frozenset", "tuple", "List", "Dict", "Set",
+                                    "FrozenSet", "Tuple", "Sequence", "MutableSequence", "MutableSet",
+                                    "Mapping", "MutableMapping")
+        return False
+    ctnrparams = {a.arg for a in fn.args.args if _ctnr_ann(a.annotation) and a.arg not in lists}
+    if ctnrparams:
+        def _scalar_operand(n):
+            if isinstance(n, ast.BinOp):
+                return [n.left, n.right]
+            if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.USub, ast.UAdd, ast.Invert)):
+                return [n.operand]
+            if isinstance(n, ast.Compare) and any(isinstance(o, (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq,
+                                                                  ast.Is, ast.IsNot)) for o in n.ops):
+                return [n.left, *n.comparators]   # a < 1 / 1 < a: ordering a container against a number is a TypeError;
+                #                                   a == x / a == b reads the container's value, which an integer
+                #                                   relation does not carry (a list never equals a number)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in (
+                    "int", "float", "abs", "str", "repr", "ascii", "format", "print", "hash"):
+                return list(n.args)                  # a rendering / hash reads the container's own value
+            if isinstance(n, ast.FormattedValue):
+                return [n.value]
+            return []
+        if any(isinstance(op, ast.Name) and op.id in ctnrparams
+               for node in ast.walk(fn) for op in _scalar_operand(node)):
+            return "a container-typed parameter is used as a scalar, outside the integer CHC model (value engine decides)"
+    return None
+
+
 def verify_no_raise(prop, target, src, pre, repo=None, timeout=4000) -> Verdict:
     src = _rewrite_object_attrs(src)                         # model a simple object's attribute stores as locals
     src = _lower_list_lengths(src)                            # a list grown by append -> an integer length
@@ -6204,6 +7080,9 @@ def verify_no_raise(prop, target, src, pre, repo=None, timeout=4000) -> Verdict:
     gated = _definite_assignment_guard(prop, target, "exception safety", [src])
     if gated is not None:
         return gated
+    _lists = _readonly_int_lists(_fndef(src))                 # read-only int lists: a length and an array in the
+    if _lists:                                                # state, iterated by an index loop
+        src = _lower_list_for(src, _lists)
     fn = _fndef(src)
     # an in-place augmented assignment on an aliased list (b = a; a += [x]) mutates the ONE object -- the
     # alias's length grows too -- which a per-name integer length relation would read as stale (b[1] a
@@ -6234,98 +7113,44 @@ def verify_no_raise(prop, target, src, pre, repo=None, timeout=4000) -> Verdict:
                        reason="an in-place augmented assignment on an aliased list is outside the integer "
                               "CHC model (the alias-aware engines decide)")
     params = [a.arg for a in fn.args.args]
-    # a str/bytes parameter bound as an integer relation would read int(s) / s + 1 / floor division as total
-    # integer ops, though they trap on the real value; abstain so the value engine (which models strings) decides.
-    _strparams = {a.arg for a in fn.args.args
-                  if isinstance(a.annotation, ast.Name) and a.annotation.id in ("str", "bytes")}
-    if _strparams and any(isinstance(n, ast.Name) and n.id in _strparams for n in ast.walk(fn)):
-        return Verdict(UNKNOWN, prop, target, "exception safety",
-                       reason="a str/bytes-typed parameter is outside the integer CHC model (value engine decides)")
+    _why = _int_chc_param_guard(fn, _lists, repo)            # a parameter the integer relation cannot carry: the
+    if _why is not None:                                      # value engine, which models its real type, decides
+        return Verdict(UNKNOWN, prop, target, "exception safety", reason=_why)
     # an object-typed parameter is carried as an opaque receiver (core._param_term, below) rather than bound as a
     # z3.Int: it stays out of the integer Horn state, a scalar op on it (100 // proto) makes ev abstain so the
     # construction declines, and a function that references the object but reasons over its integer state is decided
     # here instead of bailing. (A non-integer value that would cross a block still abstains via tup, so the object's
     # own values never enter the Int relations -- soundness is unchanged.)
     _objparams = {a.arg for a in fn.args.args if core._is_object_annotation(a.annotation)}
-    # a float parameter bound as a z3.Int loses IEEE-754 semantics (NaN non-reflexivity, signed zero, the
-    # infinities), so a trap guarded by them reads as unreachable; abstain so the value engine decides it over z3.FP.
-    _floatparams = {a.arg for a in fn.args.args
-                    if isinstance(a.annotation, ast.Name) and a.annotation.id == "float"}
-    if _floatparams and any(isinstance(n, ast.Name) and n.id in _floatparams for n in ast.walk(fn)):
-        return Verdict(UNKNOWN, prop, target, "exception safety",
-                       reason="a float-typed parameter is outside the integer CHC model (value engine decides)")
-    # a method call on a number-typed (int/float/bool) parameter (n.append(...)) reads as a trap-free opaque
-    # call though a number has no such method (AttributeError), and a list/dict/set/tuple parameter used as a
-    # scalar (a + 1, -a, int(a)) reads as a total integer op though it is a TypeError; abstain on both so the
-    # value engine decides. A container used as a container, or a class-annotated receiver, is sound and stays.
-    _numparams = {a.arg for a in fn.args.args
-                  if isinstance(a.annotation, ast.Name) and a.annotation.id in ("int", "float", "bool")}
-    if _numparams and any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                          and isinstance(n.func.value, ast.Name) and n.func.value.id in _numparams
-                          for n in ast.walk(fn)):
-        return Verdict(UNKNOWN, prop, target, "exception safety",
-                       reason="a method call on a number-typed parameter is outside the integer CHC model "
-                              "(value engine decides)")
-    _intparams = {a.arg for a in fn.args.args               # float() of an integer argument OverflowErrors when the int
-                  if isinstance(a.annotation, ast.Name) and a.annotation.id == "int"}   # exceeds the largest a double
-    def _floats_an_int(n):                                   # holds -- a 2**1024 threshold the integer CHC model cannot
-        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "float"   # carry; defer such a
-                and "float" not in (repo or {}) and len(n.args) == 1):   # float() to the value engine, which does model it
-            return False
-        a = n.args[0]
-        return ((isinstance(a, ast.Name) and a.id in _intparams)
-                or (isinstance(a, ast.Constant) and isinstance(a.value, int) and not isinstance(a.value, bool))
-                or isinstance(a, ast.BinOp))
-    if any(_floats_an_int(n) for n in ast.walk(fn)):
-        return Verdict(UNKNOWN, prop, target, "exception safety",
-                       reason="float() of an integer may OverflowError, outside the integer CHC model (value engine decides)")
-    def _ctnr_ann(ann):                                      # a container annotation, bare (list) or parameterized
-        if isinstance(ann, ast.Name):                        # (list[int], dict[str, int], or a typing alias)
-            return ann.id in ("list", "dict", "set", "frozenset", "tuple")
-        if isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name):
-            return ann.value.id in ("list", "dict", "set", "frozenset", "tuple", "List", "Dict", "Set",
-                                    "FrozenSet", "Tuple", "Sequence", "MutableSequence", "MutableSet",
-                                    "Mapping", "MutableMapping")
-        return False
-    _ctnrparams = {a.arg for a in fn.args.args if _ctnr_ann(a.annotation)}
-    if _ctnrparams:
-        def _scalar_operand(n):
-            if isinstance(n, ast.BinOp):
-                return [n.left, n.right]
-            if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.USub, ast.UAdd, ast.Invert)):
-                return [n.operand]
-            if isinstance(n, ast.Compare) and any(isinstance(o, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)) for o in n.ops):
-                return [n.left, *n.comparators]   # a < 1 / 1 < a: ordering a container against a number is a TypeError
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("int", "float", "abs"):
-                return list(n.args)
-            return []
-        if any(isinstance(op, ast.Name) and op.id in _ctnrparams
-               for node in ast.walk(fn) for op in _scalar_operand(node)):
-            return Verdict(UNKNOWN, prop, target, "exception safety",
-                           reason="a container-typed parameter is used as a scalar, outside the integer CHC model "
-                                  "(value engine decides)")
     try:
         _ub = {n.name: [b.id for b in n.bases if isinstance(b, ast.Name)]   # the module's class hierarchy, so an
                for n in _parse(src).body if isinstance(n, ast.ClassDef)}     # `except Base` catches a `raise Sub`
         blocks, entry = _build_cfg(fn.body, _ub)
     except Unsupported as u:
         return Verdict(UNKNOWN, prop, target, "exception safety", reason=str(u))
-    order = [v for v in _cfg_vars(fn, blocks) if v not in _objparams]   # object params carried opaque, not Int state
+    order = [v for v in _cfg_vars(fn, blocks) if v not in _objparams and v not in _lists]   # object params opaque
+    _lnames, _lterms = _list_state(_lists, "s_")              # a read-only list: its length and array, carried
+    order += _lnames                                          # through every relation unchanged
     ctx = Ctx(repo or {}); ctx.divvars = []
     _const_env = {a.arg: core._param_term(a) for a in fn.args.args if a.arg in _objparams}   # opaque receivers
-    cur = {**_const_env, **{v: z3.Int("s_" + v) for v in order}}
-    R = {bid: z3.Function(f"R{bid}", *([z3.IntSort()] * len(order)), z3.BoolSort()) for bid in blocks}
+    cur = _bind_lists({**_const_env, **{v: z3.Int("s_" + v) for v in order if v not in _lterms}, **_lterms}, _lists)
+    _sorts = [_lterms[v].sort() if v in _lterms else z3.IntSort() for v in order]
+    R = {bid: z3.Function(f"R{bid}", *_sorts, z3.BoolSort()) for bid in blocks}
     Err = z3.Function("ErrRaise", z3.BoolSort())
     rules = []
     def tup(state):
         vals = [state[v] for v in order]
-        for x in vals:                                        # the relations are Int-sorted, so a None, float, or
-            if not (z3.is_expr(x) and z3.is_int(x)):           # other non-integer value crossing a block cannot be
-                raise Unsupported("a non-integer value crosses a block")   # passed into one -- abstain, do not crash
+        for v, x in zip(order, vals):                         # the relations are Int-sorted (a list's array aside),
+            if v in _lterms:                                  # so a None, float, or other non-integer value crossing
+                if not (z3.is_expr(x) and x.sort() == _lterms[v].sort()):   # a block cannot be passed into one --
+                    raise Unsupported("a read-only list's state changed")   # abstain, do not crash
+            elif not (z3.is_expr(x) and z3.is_int(x)):
+                raise Unsupported("a non-integer value crosses a block")
         return vals
     try:
-        init = {v: (cur[v] if v in params else z3.IntVal(0)) for v in order}
-        rules.append((R[entry](*tup(init)), [pre({p: cur[p] for p in params})]))
+        init = {v: (cur[v] if v in params or v in _lterms else z3.IntVal(0)) for v in order}
+        _lfacts = [z3.And(cur["__len_" + p] >= 0, cur["__len_" + p] <= sys.maxsize) for p in sorted(_lists)]
+        rules.append((R[entry](*tup(init)), [pre({p: cur[p] for p in params})] + _lfacts))
         for bid, b in blocks.items():
             # division is linearized in-encoding; a reachable zero divisor is itself an
             # (uncaught) ZeroDivisionError, so it is an edge to Err like any escaping raise.
@@ -6338,9 +7163,9 @@ def verify_no_raise(prop, target, src, pre, repo=None, timeout=4000) -> Verdict:
             elif term and term[0] == "return" and term[1] is not None:
                 ev(term[1], after, ctx)                  # surface division traps in the return
             body_rel = R[bid](*tup(cur))
-            aux = list(ctx.divaux)
-            for t in ctx.traps:                          # a reachable division by zero raises
-                rules.append((Err(), [body_rel] + aux + [t]))
+            aux = list(ctx.divaux) + core._counter_bound_facts(cur)   # a range counter within 2**63 steps of its
+            for t in ctx.traps:                          # start (the bounded-execution model); a reachable
+                rules.append((Err(), [body_rel] + aux + [t]))   # division by zero raises
             if term is None:
                 continue
             if term[0] == "goto":
@@ -6354,8 +7179,10 @@ def verify_no_raise(prop, target, src, pre, repo=None, timeout=4000) -> Verdict:
         return Verdict(UNKNOWN, prop, target, "exception safety", reason=str(u))
     return _solve_horn(prop, target, "exception safety", "exception safety (CFG/CHC)",
                        list(R.values()) + [Err], [v for v in cur.values() if z3.is_expr(v)] + list(ctx.divvars), rules, Err(),
-                       on_error=lambda m: "engine error", proved_reason="no uncaught raise reachable",
-                       refuted_reason="an uncaught raise is reachable")
+                       on_error=_horn_error_reason, proved_reason="no uncaught raise reachable",
+                       refuted_reason="an uncaught raise is reachable",
+                       overapprox=(ctx.overapprox_reason or "an over-approximated value reaches a trap")
+                       if ctx.overapprox else None)
 
 
 def verify_recursive(prop, target, src, pre, post, timeout=4000) -> Verdict:
@@ -6885,9 +7712,14 @@ def _concrete_refute(src, pre, post, args, repo, trials=400, bound=64, seed=2024
     if not args or not (core.SANDBOX_SUBJECT or core.ALLOW_SUBJECT_EXECUTION):
         return None
     try:
-        fname = next(n for n in _parse(src).body if isinstance(n, ast.FunctionDef)).name
+        fn = next(n for n in _parse(src).body if isinstance(n, ast.FunctionDef))
     except StopIteration:
         return None
+    fname = fn.name
+    for a in fn.args.args:                                        # an integer sample for a parameter annotated as
+        if a.arg in args and a.annotation is not None and not (   # anything else (a list, a str, a float) runs the
+                isinstance(a.annotation, ast.Name) and a.annotation.id == "int"):   # function outside its contract,
+            return None                                           # so what it returns witnesses nothing
     rng = random.Random(seed)
     pool = [0, 1, -1, 2, -2, 3, bound, -bound, bound - 1]      # boundary values plus random spread
     samples = []

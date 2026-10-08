@@ -38,7 +38,7 @@ EXAMPLES = [
      lambda: t.verify_contracts('@ensure("result == x")\ndef f(x):\n    return x + 1\n'),
      "REFUTED"),
     ("square root is nonnegative on its domain",
-     lambda: t.prove("import math\ndef f(x):\n    return math.sqrt(x)\n", "result >= 0.0", requires="x >= 0.0"),
+     lambda: t.prove("import math\ndef f(x: float):\n    return math.sqrt(x)\n", "result >= 0.0", requires="x >= 0.0"),
      "PROVED"),
     ("two implementations agree on every input",
      lambda: t.verify_equiv("equiv", "f", "def f(a):\n    return a + a\n", "def g(a):\n    return 2 * a\n", {}),

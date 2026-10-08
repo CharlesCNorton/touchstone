@@ -13,7 +13,7 @@ fail=0
 for f in touchstone_encoding touchstone_functor touchstone_domains touchstone_encoders \
          touchstone_floats touchstone_seplogic touchstone_relyguarantee touchstone_lowering touchstone_heap \
          touchstone_strings touchstone_listmodel touchstone_setmodel touchstone_bitwise touchstone_ndshape \
-         touchstone_partial; do
+         touchstone_partial touchstone_bridge; do
   echo "=== ${f}.v ==="
   out="$(${COQC} "${f}.v" 2>&1 || true)"
   if echo "${out}" | grep -iqE "error|admitted|\bAxiom\b"; then
