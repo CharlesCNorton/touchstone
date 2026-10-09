@@ -8278,6 +8278,11 @@ def run_self_tests(fast=False):
     assert prove(_T + "def f():\n    return torch.zeros(2, 3).to_sparse().to_dense().conj().real.shape[1]\n", "result == 3", target="f").status == PROVED
     # the broader stdlib registry: bisect / heapq / itertools and a magnitude-bounded math ldexp / nextafter decide trap free.
     assert check("import bisect\ndef f(xs: list, x):\n    return bisect.bisect(xs, x)\n", target="f").status == PROVED
+    # bisect's insertion point lies in [lo, hi] (hi defaulting to len(a)), so an index guarded by i < len(a) is in range; the point itself is a function of the arguments the engine does not compute, so a trap conditioned on it is never a refutation
+    assert check("import bisect\ndef f(token_list: list[str], new_token: str):\n    i = bisect.bisect_left(token_list, new_token)\n"
+                 "    if i < len(token_list) and token_list[i] == new_token:\n        return 1\n    return 0\n", target="f").status == PROVED
+    assert check("import bisect\ndef g(xs: list[int], x: int):\n    i = bisect.bisect_left(xs, x)\n    return xs[i]\n", target="g").status != PROVED
+    assert check("import bisect\ndef m(y: int):\n    if bisect.bisect_left([1, 2, 3], 2) != 1:\n        return 1 // 0\n    return y\n", target="m").status != REFUTED
     assert check("import heapq\ndef f(xs: list):\n    heapq.heapify(xs)\n    return 0\n", target="f").status == PROVED
     assert check("import math\ndef f(x: float):\n    if -1e50 <= x <= 1e50:\n        return math.ldexp(x, 2)\n    return 0.0\n", target="f").status == PROVED   # ldexp overflows unbounded; bounded proves
     # SOUNDNESS: a slice of a bare opaque value is a sub-sequence, never a scalar, so an arithmetic op on it abstains rather than fabricate a scalar trap. The ndarray idiom a[1:] / a[:-1] raises nothing in numpy, so it must not refute as a ZeroDivisionError; a slice divisor is never a zero scalar.

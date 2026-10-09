@@ -1903,6 +1903,7 @@ class _TFCall:
     """One allowlisted stdlib call's evaluated arguments, and the channel its argument-dependent traps go into."""
     def __init__(self, qual, args, kws, ctx, starred):
         self.qual, self.args, self.kws, self.ctx, self.starred = qual, args, kws, ctx, starred
+        self.result_bounds = None    # (lo, hi) int terms the call's int result provably lies within (bisect: [lo, hi])
 
     def arg(self, i, name=None, default=None):
         if i is not None and i < len(self.args):
@@ -2051,17 +2052,21 @@ def _tf_bisect(c):
         else:
             c.trap(c.int_arg(lo) < 0, "ValueError")              # "lo must be non-negative"
     hi = c.arg(3, "hi")
+    loi = c.int_arg(lo) if lo is not None and c.int_arg(lo) is not None else z3.IntVal(0)
+    n = (_container_len(a, c.ctx) if isinstance(a, _SafeContainer)
+         else z3.IntVal(len(a)) if isinstance(a, tuple) else None)
     if hi is not None and not isinstance(hi, _NoneVal):
         if c.int_arg(hi) is None:
             raise Unsupported("bisect hi of an unmodeled value")
-        if not isinstance(a, (_SafeContainer, tuple)):
+        if n is None:
             raise Unsupported("bisect hi against a sequence of unknown length")
-        n = _container_len(a, c.ctx)
-        loi = c.int_arg(lo) if lo is not None and c.int_arg(lo) is not None else z3.IntVal(0)
         hv = c.int_arg(hi)
         # a hi past the end probes a[mid] beyond it only for some data: a possible IndexError
         _note_overapprox(c.ctx, "bisect with hi > len(a)")
         c.trap(z3.And(hv > n, hv != -1, loi < hv, z3.FreshConst(z3.BoolSort(), "bisect_oob")), "IndexError")
+        c.result_bounds = (loi, hv)                              # the insertion point lies in [lo, hi]
+    elif n is not None:
+        c.result_bounds = (loi, n)                               # [lo, len(a)]: a[i] guarded by i < len(a) is in range
 
 
 def _tf_collections(c):
@@ -2485,9 +2490,18 @@ def _stdlib_tf_call(qual, args, kws, ctx, starred=False):
     if qual not in _STDLIB_TF or not _stdlib_exists(qual):
         return None
     model = _TF_TRAP_MODELS.get(qual)
+    call = _TFCall(qual, list(args), dict(kws), ctx, starred)
     if model is not None:
-        model(_TFCall(qual, list(args), dict(kws), ctx, starred))
-    return _safe_stdlib_result(qual, ctx)
+        model(call)
+    res = _safe_stdlib_result(qual, ctx)
+    if call.result_bounds is not None and z3.is_expr(res) and z3.is_int(res):
+        lo, hi = call.result_bounds                              # the result clamped into the bounds the call
+        res = z3.If(res < lo, lo, z3.If(res > hi, hi, res))     # guarantees: exact by construction, no fact channel needed
+    if (args or kws) and z3.is_expr(res) and ctx is not None:
+        # the result of a call WITH arguments is a function of them the engine does not compute (bisect's insertion
+        # point, a path's basename): a fresh value stands in, so a trap conditioned on it is not a refutation
+        _note_overapprox(ctx, "%s yields a result the engine does not compute" % qual)
+    return res
 
 
 _CLOCK_SECONDS = 2 ** 63 / 1e9   # CPython's clocks are int64 nanoseconds: every reading lies within +-2**63 ns
