@@ -19,7 +19,7 @@ WORKDIR /home/coq
 # SMTCoq phase finds it. veriT (stable2016) supplies the LIA certificates; its 2016 sources predate gcc's
 # -fno-common default, so they compile with -fcommon.
 RUN opam switch rename "$(opam switch show)" certicoq-8.20 || true
-RUN wget -q https://verit.loria.fr/distrib/veriT-stable2016.tar.gz \
+RUN wget -q https://www.verit-solver.org/distrib/veriT-stable2016.tar.gz \
  && tar xzf veriT-stable2016.tar.gz \
  && cd veriT-stable2016 && autoconf && ./configure && make CC="gcc -fcommon" \
  && mkdir -p /home/coq/.local/bin && cp veriT /home/coq/.local/bin/veriT \

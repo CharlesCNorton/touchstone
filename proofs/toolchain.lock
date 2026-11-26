@@ -10,7 +10,7 @@ ocaml         = 4.14-flambda
 [smtcoq]                     # touchstone_smtcoq.v  (a separate switch; not Rocq 9.0)
 coq           = 8.20.1
 coq-smtcoq    = 2.3+8.20
-verit         = stable2016   # LIA proofs; https://verit.loria.fr/distrib/veriT-stable2016.tar.gz
+verit         = stable2016   # LIA proofs; https://www.verit-solver.org/distrib/veriT-stable2016.tar.gz
 cvc4          = 1.6          # QF_UF/BV/arrays; https://cvc4.cs.stanford.edu/downloads/builds/x86_64-linux-opt/cvc4-1.6-x86_64-linux-opt
 # build:  opam switch create certicoq-8.20 ocaml-base-compiler.4.14.2 && opam install coq.8.20.1 coq-smtcoq.2.3+8.20
 #         veriT-stable2016 builds with autoconf/flex/bison/libgmp-dev (a Docker ubuntu:20.04 container
