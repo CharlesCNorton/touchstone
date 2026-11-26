@@ -126,6 +126,15 @@ generated modules from triage; `scan --fail-on {bug,suspected,any,none}` sets th
 emits Actions workflow commands that annotate the PR diff inline — and a `# touchstone: ignore` comment in a
 function drops its finding (marking that trap intentional in source).
 
+`scan` ranks each finding by what its context says about the trap: it re-checks the function under a
+precondition and demotes the finding to rank 0 when the trap goes, and a precondition the function's own
+model cannot satisfy never demotes. A private helper, or a function of a script (a module that runs as one and
+that no other module imports, its top-level code counted as a caller), is `context-unreachable` when every
+in-repo call site rules the trap out: the call's constant arguments re-checked, or the caller proved trap free.
+A trap reachable only outside the parameter range the docstring states (`q in [0, 1]`, `0 <= p < 1`) is
+`documented-domain`. A trap that needs an integer input beyond 64 bits, such as an int-to-float overflow,
+keeps its class at rank 0. Ranking never changes a verdict.
+
 `touchstone init` scaffolds the config block, a GitHub Actions workflow, and a baseline in one step; here are
 the pieces it writes, which you can also add by hand:
 

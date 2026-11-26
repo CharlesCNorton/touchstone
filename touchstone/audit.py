@@ -7904,6 +7904,57 @@ def run_self_tests(fast=False):
         _ur = {f["location"]: f for f in scan(_uf, execute=False)["findings"]}
         assert _ur["_recip"]["classification"] != "context-unreachable", _ur.get("_recip")
         assert "_recip" in _ur and _ur["_recip"]["classification"] == "unconfirmed", _ur.get("_recip")
+        # a pinned constant that misses the witness does not demote a trap still reachable at that constant: the call site's constants are re-checked, not compared with one witness.
+        _pk = _osx.path.join(_dx, "ctx_pinned.py")
+        with open(_pk, "w", encoding="utf-8") as _fh:                                # k == 3 still traps on ys == []
+            _fh.write("def _first(xs, k):\n    return xs[0] + k\n\ndef pub(ys):\n    return _first(ys, 3)\n")
+        _pr = {f["location"]: f for f in scan(_pk, execute=False)["findings"]}
+        assert _pr["_first"]["classification"] == "unconfirmed", _pr.get("_first")
+        # a re-check under a precondition proves only when the precondition is satisfiable in the function's model; a vacuous one is UNKNOWN, never a demotion.
+        from .engines import _scan_recheck as _srk, _doc_domain as _ddm
+        _rsrc = "def f(x):\n    return 10 // x\n"
+        assert _srk(_rsrc, None, "f", False, "x == 5").status == PROVED
+        assert _srk(_rsrc, None, "f", False, "x == 0.5").status == UNKNOWN              # unsatisfiable for an int x
+        assert _srk(_rsrc, None, "f", False, "x > 3 and x < 2").status == UNKNOWN
+        assert _srk(_rsrc, None, "f", False, "x == 0").status == REFUTED
+        # the docstring's parameter range is read as a precondition: interval and chained forms, a parameter's name only.
+        assert _ddm('def f(xs, q):\n    """q in [0, 1]."""\n    return q\n') == "0 <= q <= 1"
+        assert _ddm('def f(p):\n    """p in (0, 100]."""\n    return p\n') == "0 < p <= 100"
+        assert _ddm('def f(p):\n    """0 <= p < 1, the share."""\n    return p\n') == "0 <= p < 1"
+        assert _ddm('def f(x):\n    """Returns a value in [0, 1]."""\n    return x\n') is None   # names no parameter
+        # a trap reachable only outside the documented range is `documented-domain` (rank 0); one without a documented range keeps its class.
+        _df = _osx.path.join(_dx, "doc_range.py")
+        with open(_df, "w", encoding="utf-8") as _fh:
+            _fh.write('def pct(xs, q):\n    """The rounded index; q in [0, 1]."""\n    xs = sorted(xs)\n'
+                      '    return xs[min(len(xs) - 1, int(q * (len(xs) - 1) + 0.5))] if xs else None\n\n'
+                      'def pct2(xs, q):\n    xs = sorted(xs)\n'
+                      '    return xs[min(len(xs) - 1, int(q * (len(xs) - 1) + 0.5))] if xs else None\n')
+        _drep = scan(_df, execute=False)
+        _dr = {f["location"]: f for f in _drep["findings"]}
+        assert _dr["pct"]["classification"] == "documented-domain" and _dr["pct"]["rank"] == 0, _dr.get("pct")
+        assert _dr["pct2"]["classification"] == "unconfirmed" and _dr["pct2"]["rank"] > 0, _dr.get("pct2")
+        assert _drep["documented_domain"] == 1, _drep["documented_domain"]
+        # a trap that needs an integer input beyond 64 bits (an int-to-float overflow) drops to rank 0, its class kept; one reachable at 64 bits (math.exp) keeps its rank.
+        _bf = _osx.path.join(_dx, "big_int.py")
+        with open(_bf, "w", encoding="utf-8") as _fh:
+            _fh.write('import math\n\ndef fmt(v):\n    return "%.2f" % v\n\ndef grow(x):\n    return math.exp(x)\n')
+        _br = {f["location"]: f for f in scan(_bf, execute=False)["findings"]}
+        assert _br["fmt"]["rank"] == 0 and "beyond 64 bits" in _br["fmt"]["label"], _br.get("fmt")
+        assert _br["fmt"]["classification"] == "unconfirmed", _br.get("fmt")
+        assert _br["grow"]["rank"] > 0 and "beyond 64 bits" not in _br["grow"]["label"], _br.get("grow")
+        # a script's top-level code counts as a caller, and a script function (a module that runs as a script and nothing imports) is judged by its call sites like a private helper; an imported module's function is not.
+        _sd = _osx.path.join(_dx, "scripts")
+        _osx.makedirs(_sd)
+        for _nm, _body in (("scr.py", "def div(n):\n    return 100 // (n + 2)\n\nprint(div(5))\nprint(div(7))\n"),
+                           ("bad.py", "def div2(n):\n    return 100 // (n + 2)\n\nprint(div2(-2))\n"),
+                           ("lib.py", "def div3(n):\n    return 100 // (n + 2)\n\nif __name__ == '__main__':\n    print(div3(5))\n"),
+                           ("user.py", "from lib import div3\n\ndef use(n):\n    return div3(n)\n")):
+            with open(_osx.path.join(_sd, _nm), "w", encoding="utf-8") as _fh:
+                _fh.write(_body)
+        _sr = {f["location"]: f for f in scan(_sd, execute=False, jobs=1)["findings"]}
+        assert _sr["scr.div"]["classification"] == "context-unreachable", _sr.get("scr.div")
+        assert _sr["bad.div2"]["classification"] == "unconfirmed", _sr.get("bad.div2")     # its top-level call passes -2
+        assert _sr["lib.div3"]["classification"] == "unconfirmed", _sr.get("lib.div3")     # imported by user.py
     finally:
         _shx.rmtree(_dx, ignore_errors=True)
 

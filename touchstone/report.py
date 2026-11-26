@@ -3,7 +3,7 @@ list) and GitHub Actions workflow commands (inline PR annotations). SARIF lives 
 plain-text side. Pure data transformation -- no solver, no I/O."""
 
 _GH_LEVEL = {"bug": "error", "suspected": "warning", "unconfirmed": "warning",
-             "input-validation": "notice", "context-unreachable": "notice"}
+             "input-validation": "notice", "context-unreachable": "notice", "documented-domain": "notice"}
 
 
 def _md_cell(s):

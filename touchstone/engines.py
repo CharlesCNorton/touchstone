@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import os
 import random
+import re
 import sys
 import textwrap
 import math as _math
@@ -3378,6 +3379,20 @@ def _rewrite_decorator(dec, this_mod, modfuncs, name_imports, mod_imports):
     return ast.copy_location(ast.Name(id=nm, ctx=ast.Load()), dec) if nm is not None else dec
 
 
+def _module_imports(m, tree, trees, modfuncs):
+    """Module `m`'s program-internal imports as load_program resolves them for call rewriting: a function
+    import in {local_name: (module, function)} and a module import in {alias: module}."""
+    name_imports, mod_imports = {}, {}
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):                 # absolute / relative / dotted / star from-import
+            _resolve_from(m, node, trees, modfuncs, name_imports, mod_imports)
+        elif isinstance(node, ast.Import):
+            for al in node.names:                            # import m [as mm]; import pkg.sub [as x]
+                if al.name in trees:
+                    mod_imports[al.asname or al.name] = al.name
+    return name_imports, mod_imports
+
+
 def load_program(modules, on_collision="raise"):
     """Build a repo from a multi-module program {module_name: source}, resolving imports across the
     modules so a cross-module call inlines instead of being assumed well-behaved. Each function is
@@ -3393,14 +3408,7 @@ def load_program(modules, on_collision="raise"):
     for m, tree in trees.items():
         glob = {a.targets[0].id: a for a in tree.body
                 if isinstance(a, ast.Assign) and len(a.targets) == 1 and isinstance(a.targets[0], ast.Name)}
-        name_imports, mod_imports = {}, {}
-        for node in tree.body:
-            if isinstance(node, ast.ImportFrom):             # absolute / relative / dotted / star from-import
-                _resolve_from(m, node, trees, modfuncs, name_imports, mod_imports)
-            elif isinstance(node, ast.Import):
-                for al in node.names:                        # import m [as mm]; import pkg.sub [as x]
-                    if al.name in trees:
-                        mod_imports[al.asname or al.name] = al.name
+        name_imports, mod_imports = _module_imports(m, tree, trees, modfuncs)
         resolver = _CallResolver(m, modfuncs, name_imports, mod_imports)
         mathpfx = _math_import_prefix(tree)
         for fn in tree.body:
@@ -3592,7 +3600,8 @@ def _empty_scan_report(target, execute):
     """The no-op report scan() returns when re-entered inside a pool worker (the footgun guard)."""
     return {"target": target, "fetched": False, "executed": bool(execute), "functions": 0, "proved": 0,
             "refuted": 0, "unknown": 0, "bugs": 0, "input_validation": 0, "unconfirmed": 0,
-            "context_unreachable": 0, "suspected": 0, "suppressed_in_source": 0, "findings": []}
+            "context_unreachable": 0, "documented_domain": 0, "suspected": 0, "suppressed_in_source": 0,
+            "findings": []}
 
 
 def _run_triage(work, repo, jobs, progress=None):
@@ -4433,14 +4442,18 @@ def _calls_to(key, repo):
     return out
 
 
-def _context_unreachable(key, repo, witness, verdict_by_key):
-    """Whether a private function `key`'s standalone trap is unreachable in its real repo context, so a scan
-    demotes the finding rather than presenting it as a candidate. SCAN RANKING ONLY, never a verdict. True when
-    `key` has in-repo callers and EITHER (a) every call site pins a witnessing parameter to a constant that
-    misses the witness, OR (b) every caller's own trap-freedom check is PROVED (so the inlined call cannot reach
-    the trap). A symbolic / keyword / starred call argument, a call passing exactly the witness, or any caller
-    left UNKNOWN or REFUTED keeps the finding (surface, do not hide)."""
-    calls = _calls_to(key, repo)
+def _context_unreachable(key, repo, witness, verdict_by_key, recheck=None, calls=None):
+    """Whether function `key`'s standalone trap is unreachable in its real repo context, so a scan demotes the
+    finding rather than presenting it as a candidate. SCAN RANKING ONLY, never a verdict. True when `key` has
+    in-repo callers and EITHER (a) every call site pins parameters to constants that rule the trap out, OR (b)
+    every caller's own trap-freedom check is PROVED (so the inlined call cannot reach the trap). With `recheck`
+    (requires -> status), (a) re-checks the function under each call's pinned constants (`p == c and ...`): a
+    PROVED call is ruled out, a REFUTED one reaches the trap. Without it, (a) compares the pinned constants with
+    the one witness. A symbolic / keyword / starred call argument, a call that reaches the trap, or any caller
+    left UNKNOWN or REFUTED keeps the finding (surface, do not hide). `calls`, the (caller_key, ast.Call) pairs
+    naming `key`, is computed from `repo` when not given."""
+    if calls is None:
+        calls = _calls_to(key, repo)
     callers = {ck for ck, _ in calls if ck != key}
     if not calls or not callers:
         return False                                          # no in-repo caller: the standalone finding stands
@@ -4448,7 +4461,25 @@ def _context_unreachable(key, repo, witness, verdict_by_key):
         params = [a.arg for a in _fndef(repo[key]).args.args]
     except Unsupported:
         params = []
-    if witness and params:                                    # (a) constant-call-site exclusion
+    if recheck is not None and params:                        # (a) re-checked under each call's constants
+        excluded_all = True
+        for _ck, c in calls:
+            if c.keywords or any(isinstance(a, ast.Starred) for a in c.args) or len(c.args) > len(params):
+                excluded_all = False                          # an argument the analysis cannot pin
+                continue
+            pins = ["%s == %r" % (params[i], cval) for i, a in enumerate(c.args)
+                    for cval in [_const_arg_value(a)] if cval is not None]
+            if not pins:
+                excluded_all = False                          # nothing pinned: the call may pass the witness
+                continue
+            status = recheck(" and ".join(pins))
+            if status == REFUTED:
+                return False                                  # the trap is reachable at this call's constants
+            if status != PROVED:
+                excluded_all = False
+        if excluded_all:
+            return True
+    elif witness and params:                                  # (a) constant-call-site exclusion
         excluded_all, reachable = True, False
         for _ck, c in calls:
             if c.keywords or any(isinstance(a, ast.Starred) for a in c.args) or len(c.args) > len(params):
@@ -4473,6 +4504,257 @@ def _context_unreachable(key, repo, witness, verdict_by_key):
             return True
     cv = [verdict_by_key.get(ck) for ck in callers]           # (b) every caller verified trap free
     return bool(cv) and all(s == PROVED for s in cv)
+
+
+# Scan ranking under a precondition: a finding is re-checked with what its context states (a call site's
+# constants, a documented parameter range, a 64-bit integer bound) and demoted when the trap goes. Ranking only.
+_SCAN_INT_BOUND = 2 ** 63                                     # "a 64-bit integer": inputs within [-2^63, 2^63)
+_MODULE_BODY = "__module_body__"                              # the pseudo caller holding a module's top-level code
+_DOC_NUM = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+_DOC_INTERVAL = re.compile(r"\b([A-Za-z_]\w*)(?:\s+(?:is\s+)?in\s*|\s*∈\s*)([\[(])\s*(%s)\s*,\s*(%s)\s*([\])])"
+                           % (_DOC_NUM, _DOC_NUM))
+_DOC_CHAIN = re.compile(r"(%s)\s*(<=|<|≤)\s*([A-Za-z_]\w*)\s*(<=|<|≤)\s*(%s)" % (_DOC_NUM, _DOC_NUM))
+
+
+_PROBE_ANNOTATION = {"seq": "list", "container": "list", "str": "str", "float": "float"}
+
+
+def _vacuity_probe(src):
+    """A function with `src`'s parameters, each annotated with the kind the trap-freedom engine models it as
+    (its own annotation, else `_infer_param_kinds`'s kind, else int), whose whole body is `assert False`.
+    Checked under a precondition it refutes exactly when some input of those kinds satisfies the precondition,
+    which separates a real PROVED from a vacuous one (an unsatisfiable precondition proves anything)."""
+    from .domains import _infer_param_kinds
+    fn = _fndef(src)
+    kinds = _infer_param_kinds(fn)
+
+    def one(p):
+        ann = ast.unparse(p.annotation) if p.annotation is not None else _PROBE_ANNOTATION.get(kinds.get(p.arg), "int")
+        return "%s: %s" % (p.arg, ann)
+    a = fn.args
+    parts = [one(p) for p in a.posonlyargs] + (["/"] if a.posonlyargs else []) + [one(p) for p in a.args]
+    if a.kwonlyargs:
+        parts += ["*"] + [one(p) for p in a.kwonlyargs]
+    return "def %s(%s):\n    assert False\n" % (fn.name, ", ".join(parts))
+
+
+def _scan_recheck(src, repo, key, total, requires):
+    """The scan's bounded trap-freedom re-check of one function under `requires`. A PROVED stands only when the
+    precondition is satisfiable in the same model (its `_vacuity_probe` refutes); a vacuous one, a failure or a
+    budget overrun is UNKNOWN."""
+    def run(s, r, t):
+        try:
+            with _unit_deadline(core.SCAN_UNIT_TIMEOUT_S):
+                return check(s, requires=requires, repo=r, target=t, total=total)
+        except (Exception, _UnitBudgetExceeded) as e:
+            return Verdict(UNKNOWN, key or "f", key or "f", "scan", reason="re-check failed: %s" % type(e).__name__)
+    v = run(src, repo or None, key)
+    if v.status == PROVED:
+        try:
+            probe = run(_vacuity_probe(src), None, None)
+        except Exception:
+            probe = None
+        if probe is None or probe.status != REFUTED:
+            return Verdict(UNKNOWN, key or "f", key or "f", "scan", reason="precondition not shown satisfiable")
+    return v
+
+
+def _doc_domain(src):
+    """The parameter ranges a function's docstring states, as a precondition: `q in [0, 1]` (`(` / `)` for an
+    open end, `is in` and `∈` read the same) and `0 <= q <= 1` (`<` for a strict end), each for a name that is
+    one of the function's parameters. Returns the conjunction, or None when the docstring states no range."""
+    try:
+        fn = _fndef(src)
+    except Exception:
+        return None
+    doc = ast.get_docstring(fn) or ""
+    params = {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}
+    conds = []
+    for m in _DOC_INTERVAL.finditer(doc):
+        name, lb, lo, hi, rb = m.groups()
+        if name in params and float(lo) <= float(hi):
+            conds.append("%s %s %s %s %s" % (lo, "<=" if lb == "[" else "<", name, "<=" if rb == "]" else "<", hi))
+    for m in _DOC_CHAIN.finditer(doc):
+        lo, o1, name, o2, hi = m.groups()
+        if name in params and float(lo) <= float(hi):
+            conds.append("%s %s %s %s %s" % (lo, o1.replace("≤", "<="), name, o2.replace("≤", "<="), hi))
+    conds = list(dict.fromkeys(conds))
+    return " and ".join(conds) if conds else None
+
+
+def _huge_int_params(witness):
+    """The witness parameters holding an integer outside 64 bits (|x| >= 2^63), in witness order."""
+    return [k for k, x in (witness or {}).items()
+            if isinstance(x, int) and not isinstance(x, bool) and not -_SCAN_INT_BOUND <= x < _SCAN_INT_BOUND]
+
+
+def _int_bounds(names):
+    """The precondition holding each of `names` to a 64-bit integer."""
+    return " and ".join("%d <= %s <= %d" % (-_SCAN_INT_BOUND, n, _SCAN_INT_BOUND - 1) for n in names)
+
+
+def _parse_modules(modules):
+    """{module: tree} for the modules that parse (a scan skips the rest)."""
+    trees = {}
+    for m, src in modules.items():
+        try:
+            trees[m] = ast.parse(textwrap.dedent(src))
+        except SyntaxError:
+            continue
+    return trees
+
+
+def _module_body_callers(modules, mangle=True):
+    """Each module's top-level code as a pseudo caller {key: source}: the statements outside any def, class or
+    import, wrapped in a function named for the module (`<module>____module_body__`, or `__module_body__` with
+    mangle=False for a single file), with calls resolved as load_program resolves a function body. For a
+    scan's context-confirmation only (`_calls_to`); never triaged, so it never counts as a PROVED caller."""
+    trees = _parse_modules(modules)
+    modfuncs = {m: {f.name for f in t.body if isinstance(f, ast.FunctionDef)} for m, t in trees.items()}
+    out = {}
+    for m, tree in trees.items():
+        stmts = [s for s in tree.body
+                 if not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom))]
+        if not any(isinstance(n, ast.Call) for s in stmts for n in ast.walk(s)):
+            continue
+        name = _mangle(m, _MODULE_BODY) if mangle else _MODULE_BODY
+        fn = ast.parse("def %s():\n    pass\n" % name).body[0]
+        fn.body = stmts
+        if mangle:
+            _CallResolver(m, modfuncs, *_module_imports(m, tree, trees, modfuncs)).visit(fn)
+        out[name] = ast.unparse(ast.fix_missing_locations(fn))
+    return out
+
+
+def _is_main_guard(test):
+    """Whether an `if` test is `__name__ == "__main__"` (either way round)."""
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq)):
+        return False
+    sides = [test.left, test.comparators[0]]
+    return (any(isinstance(s, ast.Name) and s.id == "__name__" for s in sides)
+            and any(isinstance(s, ast.Constant) and s.value == "__main__" for s in sides))
+
+
+def _runs_as_script(tree):
+    """Whether a module runs as a script: a top-level `if __name__ == "__main__":`, a top-level loop, a top-level
+    expression statement that calls one of its own functions (`main()`, `print(f(5))`), or a top-level read of
+    `sys.argv`."""
+    own = {f.name for f in tree.body if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for s in tree.body:
+        if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(s, ast.If) and _is_main_guard(s.test):
+            return True
+        if isinstance(s, (ast.For, ast.AsyncFor, ast.While)):
+            return True
+        if isinstance(s, ast.Expr) and any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                                           and n.func.id in own for n in ast.walk(s)):
+            return True
+        if any(isinstance(n, ast.Attribute) and n.attr == "argv" and isinstance(n.value, ast.Name)
+               and n.value.id == "sys" for n in ast.walk(s)):
+            return True
+    return False
+
+
+def _script_modules(modules):
+    """The modules that run as scripts (`_runs_as_script`) and that no other module of the program imports, so
+    their functions serve the script's own code rather than an importer's: a scan judges their findings by
+    their in-repo call sites, as it does a private helper's."""
+    trees = _parse_modules(modules)
+    importers = {}
+    for m, tree in trees.items():
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                names = [al.name for al in n.names]
+            elif isinstance(n, ast.ImportFrom):
+                base = (".".join(m.split(".")[:-n.level] + ([n.module] if n.module else [])) if n.level
+                        else (n.module or ""))
+                names = [base] + [(base + "." + al.name) if base else al.name for al in n.names]
+            else:
+                continue
+            for full in names:                                # importing a.b.c also imports packages a and a.b
+                parts = full.split(".")
+                for i in range(1, len(parts) + 1):
+                    importers.setdefault(".".join(parts[:i]), set()).add(m)
+    return {m for m, tree in trees.items() if _runs_as_script(tree) and not (importers.get(m, set()) - {m})}
+
+
+def _rank_scan_findings(findings, rows, locmap, path, single_src, total):
+    """Scan ranking only, never a verdict: demote a finding whose trap its context rules out, re-checking under
+    a precondition with `_scan_recheck` (a vacuous precondition never demotes). In order: (1) a private helper's,
+    or a script function's (`_script_modules`), whose in-repo callers -- the script's top-level code included
+    (`_module_body_callers`) -- never reach the trap becomes `context-unreachable` (`_context_unreachable`);
+    (2) one reachable only outside the parameter range its docstring states (`_doc_domain`) becomes
+    `documented-domain`; (3) one that needs an integer input beyond 64 bits keeps its class at rank 0. A demoted
+    finding keeps its witness and repro; a re-check that still refutes appends its own witness to the label. Any
+    failure leaves the finding as triaged."""
+    try:
+        modules = {"": single_src} if single_src is not None else repo_modules(path)
+        scripts = _script_modules(modules)
+        if single_src is not None:                            # a single file's locmap names no module
+            scripts = {None} if scripts else set()
+        body_callers = _module_body_callers(modules, mangle=single_src is None)
+    except Exception:
+        scripts, body_callers = set(), {}
+    vbk = {r[4]: r[1].status for r in rows if r[5] == "function"}
+    crepo = next((r[3] for r in rows if r[5] == "function" and r[3]), {})
+    ctx_repo = {**body_callers, **crepo}
+    calls_by_callee = {}                                      # one pass over the program: every call by callee name
+    for ck, src in ctx_repo.items():
+        try:
+            tree = _parse(src)
+        except Exception:
+            continue
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                calls_by_callee.setdefault(n.func.id, []).append((ck, n))
+    row_by_label = {r[0]: r for r in rows}
+    for f in findings:
+        r = row_by_label.get(f["location"])
+        if f["kind"] != "function" or f["classification"] not in ("bug", "unconfirmed") or r is None:
+            continue
+        try:
+            change = _rank_one_finding(f, r, locmap, scripts, ctx_repo, calls_by_callee, vbk, total)
+        except Exception:
+            change = None
+        if change:
+            f.update(change)
+
+
+def _rank_one_finding(f, row, locmap, scripts, ctx_repo, calls_by_callee, vbk, total):
+    """The ranking change `_rank_scan_findings` makes to one function finding: {classification?, rank?, label},
+    or None when its context rules nothing out."""
+    v, fsrc, frepo, fname = row[1], row[2], row[3], row[4]
+    recheck = lambda req: _scan_recheck(fsrc, frepo, fname, total, req)
+    leaf = f["location"].split(".")[-1]
+    private = leaf.startswith("_") and not leaf.startswith("__")
+    script = locmap.get(f["location"], (None, None))[0] in scripts
+    witness = f["witness"] or v.counterexample_inputs
+    if (private or script) and _context_unreachable(fname, ctx_repo, witness, vbk,
+                                                    recheck=lambda req: recheck(req).status,
+                                                    calls=calls_by_callee.get(fname, [])):
+        return {"classification": "context-unreachable", "rank": 0,
+                "label": "trap unreachable through its in-repo callers (caller-maintained precondition); " + f["label"]}
+    label = f["label"]
+    domain = _doc_domain(fsrc)
+    if domain is not None:
+        dv = recheck(domain)
+        if dv.status == PROVED:
+            return {"classification": "documented-domain", "rank": 0,
+                    "label": "trap reachable only outside the range its docstring states (%s); %s" % (domain, label)}
+        if dv.status == REFUTED:
+            label += "; also reachable inside its documented range (%s): %s" % (domain, dv.counterexample)
+            witness = dv.counterexample_inputs or witness
+        else:
+            domain = None                                     # undecided under the range: bound the integers alone
+    huge = _huge_int_params(witness)
+    if huge:
+        bv = recheck(_int_bounds(huge) + (" and " + domain if domain else ""))
+        if bv.status == PROVED:
+            return {"rank": 0, "label": "trap needs an integer input beyond 64 bits (%s); %s" % (", ".join(huge), label)}
+        if bv.status == REFUTED:
+            label += "; also reachable with %s within 64 bits: %s" % (", ".join(huge), bv.counterexample)
+    return {"label": label} if label != f["label"] else None
 
 
 def _build_finding(label, v, src, repo, fname, kind, execute, classinfo=None):
@@ -4738,10 +5020,14 @@ def scan(target, execute=False, total=False, jobs=None, cache=None, progress=Non
     them for call resolution.
 
     An inline `# touchstone: ignore` comment anywhere in a unit's body drops that unit's finding (marking the
-    trap intentional in source), counted as `suppressed_in_source`. Returns {target, fetched, executed,
-    functions, proved, refuted, unknown, bugs, input_validation, unconfirmed, suppressed_in_source, findings},
-    each finding {location, module, line, kind, classification, exception, counterexample, witness, reason,
-    repro, source, severity, label}."""
+    trap intentional in source), counted as `suppressed_in_source`. A finding its context rules out is demoted
+    to rank 0 (`_rank_scan_findings`, re-checked under a precondition): `context-unreachable` when its in-repo
+    callers never reach the trap (a private helper, or a function of a script, whose top-level code counts as a
+    caller), `documented-domain` when the trap needs an input outside the parameter range its docstring states,
+    and unchanged in class when the trap needs an integer input beyond 64 bits. Returns {target, fetched,
+    executed, functions, proved, refuted, unknown, bugs, input_validation, unconfirmed, context_unreachable,
+    documented_domain, suspected, suppressed_in_source, findings}, each finding {location, module, line, kind,
+    classification, exception, counterexample, witness, reason, repro, source, severity, label}."""
     if _in_pool_worker():                                       # a worker re-importing an unguarded __main__:
         return _empty_scan_report(target, execute)              # no-op rather than recurse into a nested pool
     import shutil
@@ -4786,28 +5072,14 @@ def scan(target, execute=False, total=False, jobs=None, cache=None, progress=Non
                         n_suppressed += 1
                     elif sf is not None:
                         findings.append(sf)
+        # context-confirmation and the precondition re-checks (`_rank_scan_findings`): demote a finding whose trap
+        # its callers, its documented parameter range or a 64-bit integer bound rules out. Ranking only; never
+        # changes a verdict. Inside the try, so the re-checks run under this scan's execution flags.
+        _rank_scan_findings(findings, rows, locmap, path, single_src, total)
     finally:
         core.SANDBOX_SUBJECT, core.ALLOW_SUBJECT_EXECUTION = saved
         if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)
-    # context-confirmation: demote a private helper's finding whose trap is unreachable through its real in-repo
-    # callers (constant arguments that miss the witness, or callers all verified trap free) -- a caller-maintained
-    # precondition, not a candidate reachable from the public surface. Ranking only; never changes a verdict.
-    vbk = {r[4]: r[1].status for r in rows if r[5] == "function"}
-    crepo = next((r[3] for r in rows if r[5] == "function" and r[3]), {})
-    row_by_label = {r[0]: r for r in rows}
-    for f in findings:
-        if f["kind"] != "function" or f["classification"] not in ("bug", "unconfirmed"):
-            continue
-        leaf = f["location"].split(".")[-1]
-        if not (leaf.startswith("_") and not leaf.startswith("__")):
-            continue
-        r = row_by_label.get(f["location"])
-        wit = (f["witness"] or r[1].counterexample_inputs) if r is not None else None
-        if r is not None and _context_unreachable(r[4], crepo, wit, vbk):
-            f["classification"] = "context-unreachable"
-            f["rank"] = 0
-            f["label"] = "trap unreachable through its in-repo callers (caller-maintained precondition); " + f["label"]
     proved = sum(1 for r in rows if r[1].status == PROVED)
     unknown = sum(1 for r in rows if r[1].status == UNKNOWN)
     findings.sort(key=lambda f: (-f["rank"], f["location"]))
@@ -4817,7 +5089,8 @@ def scan(target, execute=False, total=False, jobs=None, cache=None, progress=Non
     return {"target": target, "fetched": fetched, "executed": bool(execute),
             "functions": len(rows), "proved": proved, "refuted": n_refuted, "unknown": unknown,
             "bugs": cls("bug"), "input_validation": cls("input-validation"), "unconfirmed": cls("unconfirmed"),
-            "context_unreachable": cls("context-unreachable"), "suspected": cls("suspected"),
+            "context_unreachable": cls("context-unreachable"), "documented_domain": cls("documented-domain"),
+            "suspected": cls("suspected"),
             "suppressed_in_source": n_suppressed, "findings": findings}
 
 

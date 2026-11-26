@@ -467,7 +467,7 @@ def _cmd_repo(a):
 
 
 _SCAN_TAG = {"bug": "BUG", "input-validation": "VALIDATION", "unconfirmed": "UNCONFIRMED",
-             "suspected": "SUSPECTED", "context-unreachable": "UNCONFIRMED"}
+             "suspected": "SUSPECTED", "context-unreachable": "UNCONFIRMED", "documented-domain": "UNCONFIRMED"}
 
 
 def _cmd_scan(a):

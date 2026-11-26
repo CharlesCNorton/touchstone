@@ -9,9 +9,10 @@ _SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
 _TOOL_URI = "https://pypi.org/project/touchstone-prover/"
 
 # A finding's classification to a SARIF result level. A confirmed crashing bug is an error; an unconfirmed or
-# suspected trap is a warning; an intended raise or an unreachable helper is a note, not a failure signal.
+# suspected trap is a warning; an intended raise, an unreachable helper, or a trap only outside a documented
+# parameter range is a note, not a failure signal.
 _LEVEL = {"bug": "error", "suspected": "warning", "unconfirmed": "warning",
-          "input-validation": "note", "context-unreachable": "note"}
+          "input-validation": "note", "context-unreachable": "note", "documented-domain": "note"}
 
 
 def _module_uri(module):
